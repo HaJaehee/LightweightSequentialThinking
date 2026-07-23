@@ -1,0 +1,51 @@
+{
+  "_README": [
+    "AnythingLLM MCP 서버 등록 예시.",
+    "",
+    "1. AnythingLLM의 Agent Skills -> MCP Servers 화면에서 설정 파일의 실제 경로를 확인합니다.",
+    "   (일반적으로 storage/plugins/anythingllm_mcp_servers.json)",
+    "2. 아래 mcpServers 블록을 그 파일에 넣습니다. 이미 다른 서버가 있으면 planning 항목만 추가합니다.",
+    "3. _ 로 시작하는 키(_README, _alternatives)는 설명용이므로 지워도 되고 두어도 됩니다.",
+    "   mcpServers 안에는 실제 서버만 있으므로 그대로 두어도 오작동하지 않습니다.",
+    "4. 저장 후 AnythingLLM을 완전히 종료했다가 다시 실행합니다.",
+    "",
+    "경로 규칙: 슬래시는 / 를 쓰십시오. JSON에서 \\ 는 이스케이프 문자라 \\\\ 로 써야 하며 실수가 잦습니다.",
+    "command 는 반드시 절대 경로로 쓰십시오. AnythingLLM이 상속하는 PATH는 터미널과 다를 수 있습니다.",
+    "아래 D:/planning-mcp 부분을 실제 설치 경로로 바꾸십시오."
+  ],
+
+  "mcpServers": {
+    "planning": {
+      "command": "D:/planning-mcp/runtime/python.exe",
+      "args": ["-u", "D:/planning-mcp/server.py"],
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PLANNING_MCP_LOG_LEVEL": "INFO"
+      },
+      "anythingLLMAware": true
+    }
+  },
+
+  "_alternatives": {
+    "_comment": "위 planning 항목을 아래 중 하나로 바꿔 쓸 수 있습니다. 이 _alternatives 블록 자체는 AnythingLLM이 읽지 않습니다.",
+
+    "system_python": {
+      "_when": "인터프리터를 동봉하지 않고 사내 PC에 이미 설치된 Python을 쓸 때. tools/setup_runtime.py 는 실행할 필요 없습니다.",
+      "_hint": "python.exe 절대 경로는 PowerShell에서 (Get-Command python).Source 로 확인하십시오.",
+      "command": "C:/Program Files/Python312/python.exe",
+      "args": ["-u", "D:/planning-mcp/server.py"],
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "anythingLLMAware": true
+    },
+
+    "sse": {
+      "_when": "서버를 직접 띄워 AnythingLLM 재시작과 무관하게 유지하고 싶을 때.",
+      "_start": "D:/planning-mcp/runtime/python.exe D:/planning-mcp/server.py --transport sse",
+      "url": "http://127.0.0.1:8931/sse"
+    }
+  }
+}

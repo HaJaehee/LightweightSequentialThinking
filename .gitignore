@@ -1,0 +1,10 @@
+state/
+dist/
+runtime/
+MANIFEST.txt
+python-*embed*.zip
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
