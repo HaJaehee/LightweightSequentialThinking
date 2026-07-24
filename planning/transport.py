@@ -39,16 +39,18 @@ class StdioNotifier:
         self._out = out
         self._lock = threading.Lock()
 
-    def send(self, method: str, params: dict[str, Any]) -> None:
-        frame = json.dumps(
-            {"jsonrpc": "2.0", "method": method, "params": params}, ensure_ascii=False
-        )
+    def send_obj(self, payload: Any) -> None:
+        """Write one complete JSON-RPC frame. Serialized against every other writer."""
+        frame = json.dumps(payload, ensure_ascii=False)
         try:
             with self._lock:
                 self._out.write(frame + "\n")
                 self._out.flush()
         except (BrokenPipeError, ValueError):
             pass  # client went away; the handler will unblock on its own timeout
+
+    def send(self, method: str, params: dict[str, Any]) -> None:
+        self.send_obj({"jsonrpc": "2.0", "method": method, "params": params})
 
     def progress(self, token: Any, progress: float, message: str | None = None) -> None:
         params: dict[str, Any] = {"progressToken": token, "progress": progress}
@@ -65,6 +67,13 @@ def serve_stdio(protocol: McpProtocol) -> None:
     sys.stdout = sys.stderr
     protocol.notifier = StdioNotifier(out)
 
+    notifier = protocol.notifier
+
+    def handle(msg: Any) -> None:
+        response = protocol.handle_message(msg)
+        if response is not None:
+            notifier.send_obj(response)
+
     log.info("planning-mcp listening on stdio")
     try:
         for line in sys.stdin:
@@ -76,11 +85,12 @@ def serve_stdio(protocol: McpProtocol) -> None:
             except json.JSONDecodeError:
                 log.warning("Discarded unparseable line from client")
                 continue
-            response = protocol.handle_message(msg)
-            if response is None:
-                continue
-            out.write(json.dumps(response, ensure_ascii=False) + "\n")
-            out.flush()
+            # Handle off the read loop. A blocking approval occupies its handler for up
+            # to the whole wait; doing that inline stalled every later request behind it
+            # (measured: a second session waited 52s for an unrelated get_current_plan).
+            # JSON-RPC matches responses by id, so out-of-order completion is fine.
+            # Daemon threads so a closed stdin still exits the process immediately.
+            threading.Thread(target=handle, args=(msg,), daemon=True).start()
     except (KeyboardInterrupt, BrokenPipeError):
         pass
     log.info("planning-mcp stdio stream closed")

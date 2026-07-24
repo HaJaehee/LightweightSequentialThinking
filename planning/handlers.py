@@ -58,11 +58,11 @@ class PlanningHandlers:
     ) -> dict[str, Any]:
         clean, notes = normalize(tool_name, raw_args)
         try:
-            # The store lock is held for the whole call, including a blocking approval
-            # wait. That is deliberate: while a human is deciding, no other tool call
-            # may mutate plan state. The approval UI runs on its own thread and never
-            # touches the store, so it cannot deadlock against this lock.
-            with self.store.lock:
+            # Serialized against other threads AND other server processes on the same
+            # state directory. The blocking approval wait explicitly gives this up
+            # (see _wait_for_human) so one pending approval cannot freeze every other
+            # session for the length of the wait.
+            with self.store.transaction():
                 # A human may have clicked approve after the previous call timed out.
                 # Collect that first so every handler below sees the true state.
                 self._apply_late_decision()
@@ -471,9 +471,31 @@ class PlanningHandlers:
             display = f"{display}\n\n승인/거절: {approval_url}"
 
         if self.approval_ui is not None:
+            fingerprint = self._fingerprint(plan)
             decided = self._wait_for_human(plan, display, progress_token, notifier, notes)
             if decided is not None:
                 decision, comment = decided
+                # The transaction was released while waiting, so another session may
+                # have moved the plan on. Re-read and re-verify before honouring a
+                # decision the human made about what was on screen back then.
+                state = self.store.load()
+                plan = state.active_plan
+                if plan is None or self._fingerprint(plan) != fingerprint:
+                    self.store.audit(
+                        "approval_discarded_plan_changed",
+                        plan_id=plan.plan_id if plan else None,
+                        decision=decision,
+                    )
+                    notes.append(
+                        "The plan changed while the user was deciding, so that decision "
+                        "was discarded. Show the current plan and ask again."
+                    )
+                    return build(
+                        plan,
+                        notes=notes,
+                        tasks=plan.tasks_brief() if plan else None,
+                        approval_url=approval_url,
+                    )
                 # Reuse the already-tested transitions so the blocking path and the
                 # two-phase path can never diverge.
                 forwarded = {"user_comment": comment} if comment else {}
@@ -547,7 +569,9 @@ class PlanningHandlers:
             "on" if can_heartbeat else "off - no progressToken from client",
         )
         try:
-            pending.wait(timeout)
+            # Let every other session through while this one waits on a person.
+            with self.store.paused():
+                pending.wait(timeout)
         finally:
             stop.set()
 

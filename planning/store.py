@@ -8,13 +8,33 @@ and replaced with an empty one, not raised.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
+
+if os.name == "nt":
+    import msvcrt
+
+    def _lock_file(fh) -> None:
+        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+
+    def _unlock_file(fh) -> None:
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _lock_file(fh) -> None:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+
+    def _unlock_file(fh) -> None:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 from .models import Plan, PlanStatus, TERMINAL_PLAN_STATUSES, now_iso
 
@@ -24,6 +44,8 @@ SCHEMA_VERSION = 1
 STATE_FILENAME = "plan_state.json"
 AUDIT_FILENAME = "audit.jsonl"
 LOCK_FILENAME = ".lock"
+TXN_LOCK_FILENAME = ".txnlock"
+TXN_LOCK_TIMEOUT = 20.0
 
 
 class State:
@@ -62,8 +84,95 @@ class Store:
         self.state_dir = Path(state_dir)
         self.max_plans = max_plans
         self.lock = threading.Lock()
+        self._txn_handle = None
+        self._txn_depth = 0
         self._ensure_dir()
         self._write_lock_file()
+
+    # ---- transactions --------------------------------------------------
+    @contextlib.contextmanager
+    def transaction(self):
+        """Serialize a load-mutate-save cycle against every other writer.
+
+        `self.lock` only covers threads inside one process. AnythingLLM (and Claude
+        Code) can leave several server processes alive on the same state directory, and
+        two of them doing load-mutate-save concurrently silently lose a whole plan:
+        both read the same file, both allocate the same plan_id, and the second write
+        overwrites the first. Measured, not theoretical. So the cycle also takes an
+        OS-level lock on a sidecar file.
+        """
+        self._enter()
+        try:
+            yield
+        finally:
+            self._exit()
+
+    @contextlib.contextmanager
+    def paused(self):
+        """Give the transaction up while waiting on a human, then take it back.
+
+        Holding the lock across a blocking approval froze every other session for the
+        whole wait (measured at 52s, and up to the full timeout with heartbeats). The
+        caller MUST reload state afterwards - anything may have changed meanwhile.
+        """
+        depth = self._txn_depth
+        for _ in range(depth):
+            self._exit()
+        try:
+            yield
+        finally:
+            for _ in range(depth):
+                self._enter()
+
+    def _enter(self) -> None:
+        if self._txn_depth == 0:
+            self.lock.acquire()
+            self._txn_handle = self._acquire_file_lock()
+        self._txn_depth += 1
+
+    def _exit(self) -> None:
+        self._txn_depth -= 1
+        if self._txn_depth == 0:
+            self._release_file_lock(self._txn_handle)
+            self._txn_handle = None
+            self.lock.release()
+
+    def _acquire_file_lock(self):
+        path = self.state_dir / TXN_LOCK_FILENAME
+        deadline = time.monotonic() + TXN_LOCK_TIMEOUT
+        while True:
+            try:
+                fh = open(path, "a+b")
+            except OSError as exc:
+                log.warning("No cross-process lock (%s); concurrent writers may clash", exc)
+                return None
+            try:
+                _lock_file(fh)
+                return fh
+            except OSError:
+                fh.close()
+                if time.monotonic() >= deadline:
+                    # Blocking the user's workflow is worse than a rare race, so we
+                    # proceed - but loudly, because a plan really can be lost here.
+                    log.error(
+                        "Could not take the cross-process lock within %.0fs. Proceeding "
+                        "UNSERIALIZED - another planning-mcp instance may be running on "
+                        "this state directory.",
+                        TXN_LOCK_TIMEOUT,
+                    )
+                    return None
+                time.sleep(0.05)
+
+    @staticmethod
+    def _release_file_lock(fh) -> None:
+        if fh is None:
+            return
+        try:
+            _unlock_file(fh)
+        except OSError:
+            pass
+        finally:
+            fh.close()
 
     # ---- paths ---------------------------------------------------------
     @property

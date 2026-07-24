@@ -145,8 +145,20 @@ to prevent.
 
 ### 2.4 Concurrency
 
-One AnythingLLM workspace spawns one process, and the model is instructed to call exactly one
-tool per turn (R5), so real concurrency is near-zero. Still, cheap defenses:
+Concurrency is real, not theoretical: restarts leave old server processes alive on the same
+state directory, and a blocking approval occupies one handler for up to the whole wait. Three
+measured failures drove the current design (1.6.0):
+
+| Failure | Cause | Fix |
+|---|---|---|
+| Two processes each created `plan_20260724_0001` and the second write erased the first plan entirely | `threading.Lock` only covers one process | `Store.transaction()` also takes an OS-level lock on `state/.txnlock` (`msvcrt.locking` / `flock`) |
+| An unrelated `get_current_plan` waited **52s** behind a pending approval | The store lock was held across the human wait | `Store.paused()` releases the transaction for the duration; the caller re-reads and re-verifies the plan fingerprint afterwards |
+| Same 52s wait even after releasing the lock | The stdio read loop handled each request inline, so nothing else was even *read* | Each message is handled on its own daemon thread; responses are matched by JSON-RPC id and serialized through one write lock |
+
+If the cross-process lock cannot be taken within 20s the server proceeds unserialized rather
+than failing the user's call — but logs an error, because a plan really can be lost there.
+
+Remaining cheap defenses:
 
 > **Session isolation caveat:** there is ONE active-plan slot per state directory. Approved /
 > in-execution plans cannot be hijacked by a second conversation (the redirect leniency in §4

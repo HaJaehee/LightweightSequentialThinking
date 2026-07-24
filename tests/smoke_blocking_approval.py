@@ -254,6 +254,29 @@ def main() -> int:
         finally:
             s.close()
 
+    print("\n== 6) 승인 대기가 다른 세션을 막지 않는가 ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        s = Server(tmp, timeout=900)
+        try:
+            draft(s)
+            s.call_async("request_user_approval",
+                         {"decision": "ASK_USER", "plan_summary": "요약"},
+                         progress_token="tok-block")
+            time.sleep(3)   # 승인 대기 진입 확인
+            started = time.monotonic()
+            other = s.request("tools/call",
+                              {"name": "get_current_plan", "arguments": {"plan_id": "current"}},
+                              wait=30)
+            elapsed = time.monotonic() - started
+            check("승인 대기 중에도 다른 호출이 응답됨", other is not None, "타임아웃")
+            check("지연 없음 (head-of-line blocking 없음)", elapsed < 5, f"{elapsed:.1f}s")
+            if other:
+                payload = json.loads(other["result"]["content"][0]["text"])
+                check("계획은 여전히 잠김", payload["plan_status"] == "AWAITING_APPROVAL",
+                      payload["plan_status"])
+        finally:
+            s.close()
+
     print()
     if _failures:
         print(f"FAILED: {len(_failures)} - {', '.join(_failures)}")
