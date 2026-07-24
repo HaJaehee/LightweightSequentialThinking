@@ -52,6 +52,19 @@ conversation. It returns the full current plan and tells you exactly what to do 
 It changes nothing - it is always safe to call."""
 
 
+# Shared by the tools that act on an existing plan. Optional on purpose: with one plan
+# in flight the server resolves it, so a model that never learns about plan_id behaves
+# exactly as before. It is only needed when several sessions are planning at once, and
+# then the server puts the value straight into next_action_hint.
+_PLAN_ID_PARAM: dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "OPTIONAL. Leave this out unless the server asks for it. If several plans are "
+        "active at the same time, set it to the plan_id this conversation has been "
+        'receiving in every response. Example: "plan_20260724_0002"'
+    ),
+}
+
 PLAN_AND_THINK_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -143,6 +156,7 @@ REQUEST_USER_APPROVAL_SCHEMA: dict[str, Any] = {
                 "Example: 'Do not send the email, just show me the summary.'"
             ),
         },
+        "plan_id": _PLAN_ID_PARAM,
     },
     "required": ["decision"],
 }
@@ -175,6 +189,7 @@ UPDATE_TASK_PROGRESS_SCHEMA: dict[str, Any] = {
                 "/reports.'"
             ),
         },
+        "plan_id": _PLAN_ID_PARAM,
     },
     "required": ["task_id", "status"],
 }

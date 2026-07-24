@@ -299,6 +299,37 @@ model prints display_to_user, ENDS TURN
      next_task: {task_id: 1, ...}         (must re-approve afterwards)
 ```
 
+### Concurrent plans, one per session (1.8.0)
+
+There used to be a single `active_plan_id`, so two conversations could not both hold a
+plan: the second either got redirected onto the first's plan or evicted it. Plans are now
+concurrent, and a call is routed to one of three ways, in order:
+
+1. **Explicit `plan_id`** on `request_user_approval` / `update_task_progress` /
+   `get_current_plan`. Optional on purpose — see below.
+2. **By goal**, for `plan_and_think`. The system prompt already tells the model to repeat
+   the same `goal` on every step, so a matching active plan *is* this session's plan. A
+   different goal gets its own new plan and never touches anybody else's.
+3. **The only active plan**, when there is exactly one. This is the ordinary case, and it
+   means a model that never learns `plan_id` exists behaves exactly as before.
+
+When several plans are active and no `plan_id` was given, the call is refused with
+`PLAN_AMBIGUOUS` and the response carries an `active_plans` directory. Two things make
+that recoverable for a weak model: it only ever saw *its own* plan_id in previous
+responses, and while multiple plans are live every `next_action_hint` spells out the
+plan_id to include (`qualify=True`), so copying the hint is enough.
+
+`PLANNING_MCP_MAX_ACTIVE_PLANS` (default 5) caps how many can be in flight; beyond that
+new plans are refused rather than silently piling up.
+
+Approval is a **queue**, not a slot: two sessions waiting at once both appear on the page,
+each with its own buttons. Publishing for a plan replaces that plan's earlier entry (the
+plan was revised) and never another plan's.
+
+Two places had to stop resolving "the active plan": after a blocking wait the handler
+re-reads *its own* plan by id (resolving generically would pick up a concurrent session's
+plan), and the late-decision collector tries every active plan rather than just one.
+
 ### One approval surface per state directory (1.7.0)
 
 Approval used to live in process memory, and that was the last structural hole in the

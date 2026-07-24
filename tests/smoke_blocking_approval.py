@@ -162,9 +162,10 @@ def main() -> int:
             check("3초 후에도 응답 없음 (에이전트 루프는 여기서 멈춘다)",
                   s.reply_for(mid) is None)
 
-            pending = http_json("/api/pending")
+            queue = http_json("/api/pending")["requests"]
+            pending = queue[0] if queue else {}
             check("승인 페이지가 계획을 노출", pending.get("plan_id", "").startswith("plan_"),
-                  json.dumps(pending, ensure_ascii=False)[:200])
+                  json.dumps(queue, ensure_ascii=False)[:200])
             check("계획 본문이 페이지에 포함", "작업 하나" in pending.get("display", ""))
 
             print("\n== 2) progressToken 이 있으면 하트비트로 60초 타임아웃을 리셋하는가 ==")
@@ -234,9 +235,10 @@ def main() -> int:
                 time.sleep(0.2)
             check("타임아웃으로 반환", payload is not None and payload["plan_status"] == "AWAITING_APPROVAL")
 
-            pending = http_json("/api/pending")
+            queue = http_json("/api/pending")["requests"]
+            pending = queue[0] if queue else {}
             check("승인 요청이 페이지에 그대로 남아 있음", bool(pending.get("id")),
-                  json.dumps(pending, ensure_ascii=False)[:160])
+                  json.dumps(queue, ensure_ascii=False)[:160])
             check("아직 미결정 상태", pending.get("decided") in (None, ""))
 
             http_json("/api/decide",

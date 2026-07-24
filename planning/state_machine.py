@@ -82,6 +82,14 @@ def _error_action(plan: Plan | None, code: ErrorCode) -> tuple[str, str]:
             "idle, so it no longer authorizes execution. Call request_user_approval "
             "with decision='ASK_USER' and get the user to approve it again now.",
         )
+    if code is ErrorCode.PLAN_AMBIGUOUS:
+        return (
+            NextAction.CALL_GET_CURRENT_PLAN.value,
+            "Several plans are active at once, so the server cannot tell which one you "
+            "mean. Repeat your call with plan_id set to the plan you are working on - "
+            "it is the plan_id this conversation has been receiving in every response. "
+            "Call get_current_plan with plan_id='current' if you need the list.",
+        )
     if code is ErrorCode.INVALID_STATUS:
         return (
             NextAction.CALL_UPDATE_TASK_PROGRESS.value,
@@ -189,11 +197,27 @@ def _status_action(plan: Plan | None) -> tuple[str, str]:
     )
 
 
-def resolve_next_action(plan: Plan | None, error_code: ErrorCode | None = None) -> tuple[str, str]:
-    """The single source of truth for (next_action, next_action_hint)."""
+def resolve_next_action(
+    plan: Plan | None,
+    error_code: ErrorCode | None = None,
+    qualify: bool = False,
+) -> tuple[str, str]:
+    """The single source of truth for (next_action, next_action_hint).
+
+    `qualify` is set when more than one plan is active. The hint then names the
+    plan_id in the call it tells the model to make, so a model that copies the hint
+    verbatim - which weak ones do - routes to the right plan without understanding why.
+    """
     if error_code is not None:
-        return _error_action(plan, error_code)
-    return _status_action(plan)
+        action, hint = _error_action(plan, error_code)
+    else:
+        action, hint = _status_action(plan)
+    if qualify and plan is not None and action.startswith("CALL_"):
+        hint = (
+            f"{hint} Several plans are active, so include plan_id='{plan.plan_id}' "
+            "in this call."
+        )
+    return action, hint
 
 
 # ---------------------------------------------------------------------------

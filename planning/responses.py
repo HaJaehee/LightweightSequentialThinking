@@ -20,9 +20,10 @@ def build(
     error_code: ErrorCode | None = None,
     message: str | None = None,
     notes: list[str] | None = None,
+    qualify: bool = False,
     **extra: Any,
 ) -> dict[str, Any]:
-    action, hint = resolve_next_action(plan, error_code)
+    action, hint = resolve_next_action(plan, error_code, qualify=qualify)
     payload: dict[str, Any] = {
         "ok": ok,
         "plan_id": plan.plan_id if plan else None,
@@ -47,9 +48,12 @@ def error(
     message: str,
     *,
     notes: list[str] | None = None,
+    qualify: bool = False,
     **extra: Any,
 ) -> dict[str, Any]:
-    return build(plan, ok=False, error_code=code, message=message, notes=notes, **extra)
+    return build(
+        plan, ok=False, error_code=code, message=message, notes=notes, qualify=qualify, **extra
+    )
 
 
 def render_plan_for_user(plan: Plan, plan_summary: str | None = None) -> str:

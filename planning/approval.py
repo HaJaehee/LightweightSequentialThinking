@@ -92,6 +92,9 @@ class ApprovalStore:
             log.error("Could not persist approval state: %s", exc)
 
     # ---- operations ---------------------------------------------------
+    def _requests(self, record: dict[str, Any]) -> list[dict[str, Any]]:
+        return list(record.get("requests") or [])
+
     def publish(
         self,
         plan_id: str,
@@ -100,9 +103,14 @@ class ApprovalStore:
         tasks: list[dict[str, Any]],
         fingerprint: str,
     ) -> str:
-        """Put a request in front of the human. Returns its id."""
+        """Queue a request for the human. Returns its id.
+
+        Concurrent sessions each get their own entry: one queue slot per plan would make
+        two sessions asking at once hide each other. A new request for the SAME plan
+        replaces that plan's old entry (the plan was revised), never another plan's.
+        """
         request_id = uuid.uuid4().hex
-        record = {
+        entry = {
             "id": request_id,
             "plan_id": plan_id,
             "goal": goal,
@@ -116,41 +124,55 @@ class ApprovalStore:
             "decided_at": None,
         }
         with exclusive(self.lock_path) as got:
-            previous = self.read()
-            if previous.get("id") and previous.get("decision") is None:
-                log.warning(
-                    "Superseding an undecided approval request for %s", previous.get("plan_id")
-                )
-            self._write(record)
+            record = self.read()
+            queue = [r for r in self._requests(record) if r.get("plan_id") != plan_id]
+            queue.append(entry)
+            self._write({"requests": queue})
         if not got:
             log.warning("Published an approval request without the write lock")
         return request_id
 
     def record_decision(self, request_id: str, decision: str, comment: str) -> bool:
-        """Called by the page. Only applies to the request currently on screen."""
+        """Called by the page, for one specific queued request."""
         if decision not in DECISIONS:
             return False
         with exclusive(self.lock_path):
             record = self.read()
-            if record.get("id") != request_id or record.get("decision") is not None:
-                return False
-            record["decision"] = decision
-            record["comment"] = comment or ""
-            record["decided_at"] = time.time()
-            self._write(record)
-            return True
+            queue = self._requests(record)
+            for entry in queue:
+                if entry.get("id") == request_id and entry.get("decision") is None:
+                    entry["decision"] = decision
+                    entry["comment"] = comment or ""
+                    entry["decided_at"] = time.time()
+                    self._write({"requests": queue})
+                    return True
+            return False
 
-    def peek(self) -> dict[str, Any]:
-        return self.read()
+    def peek(self) -> list[dict[str, Any]]:
+        """Everything currently queued, oldest first."""
+        return sorted(self._requests(self.read()), key=lambda r: r.get("created_at", 0))
+
+    def _take(self, match) -> tuple[str, str] | None:
+        with exclusive(self.lock_path):
+            queue = self._requests(self.read())
+            for entry in queue:
+                verdict = match(entry)
+                if verdict is None:
+                    continue
+                queue = [r for r in queue if r.get("id") != entry.get("id")]
+                self._write({"requests": queue})
+                return verdict if verdict != "drop" else None
+            return None
 
     def claim(self, request_id: str) -> tuple[str, str] | None:
         """Consume the decision for a specific request. Used by the blocking waiter."""
-        with exclusive(self.lock_path):
-            record = self.read()
-            if record.get("id") != request_id or not record.get("decision"):
+
+        def match(entry):
+            if entry.get("id") != request_id or not entry.get("decision"):
                 return None
-            self._write({})
-            return record["decision"], record.get("comment", "")
+            return entry["decision"], entry.get("comment", "")
+
+        return self._take(match)
 
     def claim_for_plan(self, plan_id: str, fingerprint: str) -> tuple[str, str] | None:
         """Consume a decision made after the tool call already returned.
@@ -158,23 +180,20 @@ class ApprovalStore:
         Only honoured for the exact plan version that was on screen - the human agreed
         to what they saw, not to whatever the plan became afterwards.
         """
-        with exclusive(self.lock_path):
-            record = self.read()
-            if not record.get("decision"):
+
+        def match(entry):
+            if entry.get("plan_id") != plan_id or not entry.get("decision"):
                 return None
-            if record.get("plan_id") != plan_id or record.get("fingerprint") != fingerprint:
-                log.warning(
-                    "Discarding a decision for a plan that has since changed (%s)",
-                    record.get("plan_id"),
-                )
-                self._write({})
-                return None
-            self._write({})
-            return record["decision"], record.get("comment", "")
+            if entry.get("fingerprint") != fingerprint:
+                log.warning("Discarding a decision for a plan that has since changed (%s)", plan_id)
+                return "drop"
+            return entry["decision"], entry.get("comment", "")
+
+        return self._take(match)
 
     def clear(self) -> None:
         with exclusive(self.lock_path):
-            self._write({})
+            self._write({"requests": []})
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +233,7 @@ button:disabled{opacity:.5;cursor:default}
 </style></head><body><div class="card" id="root">
 <div class="idle">연결 중…</div></div>
 <script>
-let currentId=null,busy=false,flash=null;
+let seen='',busy=false,flash=null,pendingCount=0;
 const IDLE_TITLE='planning-mcp 승인';
 // A popup can be blocked, land on another monitor, or open behind other windows.
 // So the page makes itself noticeable instead: the tab title flashes and a short tone
@@ -222,7 +241,8 @@ const IDLE_TITLE='planning-mcp 승인';
 function alertOn(){
   if(flash)return;
   let on=false;
-  flash=setInterval(()=>{on=!on;document.title=on?'\\u26A0 승인 대기 중':IDLE_TITLE;},700);
+  flash=setInterval(()=>{on=!on;document.title=on?
+    '\\u26A0 승인 대기 '+pendingCount+'건':IDLE_TITLE;},700);
   try{
     const C=window.AudioContext||window.webkitAudioContext;if(!C)return;
     const ctx=new C();const o=ctx.createOscillator();const g=ctx.createGain();
@@ -239,40 +259,51 @@ async function poll(){
   if(busy)return;
   try{
     const r=await fetch('/api/pending');const d=await r.json();
-    if(!d.id){currentId=null;alertOff();render(null);return;}
-    if(d.id!==currentId||d.decided){currentId=d.id;render(d);if(!d.decided)alertOn();else alertOff();}
+    const list=d.requests||[];
+    const sig=list.map(x=>x.id+':'+(x.decided||'')).join('|');
+    if(sig===seen)return;
+    seen=sig;
+    const undecided=list.filter(x=>!x.decided);
+    pendingCount=undecided.length;
+    render(list);
+    if(undecided.length)alertOn();else alertOff();
   }catch(e){}
 }
 function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
-function render(d){
+function render(list){
   const root=document.getElementById('root');
-  if(!d){root.innerHTML='<div class="idle">대기 중인 승인 요청이 없습니다.<br>'+
+  if(!list.length){root.innerHTML='<div class="idle">대기 중인 승인 요청이 없습니다.<br>'+
     '<span style="font-size:.85rem">에이전트가 계획을 제출하면 여기에 표시됩니다.</span></div>';return;}
-  if(d.decided){
-    const label={APPROVED:'승인함',REJECTED:'거절함',REVISE:'수정 요청함'}[d.decided]||d.decided;
-    root.innerHTML='<div class="done">'+label+
-      '<br><span style="font-weight:400;opacity:.6;font-size:.9rem">'+
-      '에이전트가 이 결정을 반영합니다.</span></div>';return;}
-  root.innerHTML='<h1>승인 요청 · '+esc(d.plan_id)+'</h1>'+
-    '<p class="goal">'+esc(d.goal)+'</p>'+
-    '<pre>'+esc(d.display)+'</pre>'+
-    '<textarea id="c" placeholder="수정 요청 시 내용을 적어주세요 (거절 사유도 여기에)"></textarea>'+
-    '<div class="row">'+
-    '<button class="ok" onclick="decide(\\'APPROVED\\')">승인</button>'+
-    '<button class="rev" onclick="decide(\\'REVISE\\')">수정 요청</button>'+
-    '<button class="no" onclick="decide(\\'REJECTED\\')">거절</button></div>'+
-    '<p class="hint">결정하기 전까지 에이전트는 아무것도 실행하지 못합니다. '+
-    '이 요청은 응답하실 때까지 사라지지 않으니 천천히 검토하셔도 됩니다.</p>';
+  // 여러 세션이 동시에 승인을 기다릴 수 있으므로 큐 전체를 보여준다.
+  root.innerHTML=list.map(d=>{
+    if(d.decided){
+      const label={APPROVED:'승인함',REJECTED:'거절함',REVISE:'수정 요청함'}[d.decided]||d.decided;
+      return '<div class="done">'+esc(d.plan_id)+' — '+label+
+        '<br><span style="font-weight:400;opacity:.6;font-size:.9rem">'+
+        '에이전트가 이 결정을 반영합니다.</span></div>';
+    }
+    return '<h1>승인 요청 · '+esc(d.plan_id)+'</h1>'+
+      '<p class="goal">'+esc(d.goal)+'</p>'+
+      '<pre>'+esc(d.display)+'</pre>'+
+      '<textarea id="c-'+d.id+'" placeholder="수정 요청 시 내용을 적어주세요 (거절 사유도 여기에)"></textarea>'+
+      '<div class="row">'+
+      '<button class="ok" onclick="decide(\\''+d.id+'\\',\\'APPROVED\\')">승인</button>'+
+      '<button class="rev" onclick="decide(\\''+d.id+'\\',\\'REVISE\\')">수정 요청</button>'+
+      '<button class="no" onclick="decide(\\''+d.id+'\\',\\'REJECTED\\')">거절</button></div>';
+  }).join('<hr style="border:0;border-top:1px solid #ccd0d5;margin:1.75rem 0">')+
+    '<p class="hint">결정하기 전까지 해당 에이전트는 아무것도 실행하지 못합니다. '+
+    '요청은 응답하실 때까지 사라지지 않으니 천천히 검토하셔도 됩니다.</p>';
 }
-async function decide(dec){
-  if(busy||!currentId)return;busy=true;alertOff();
+async function decide(id,dec){
+  if(busy)return;busy=true;alertOff();
   document.querySelectorAll('button').forEach(b=>b.disabled=true);
-  const c=(document.getElementById('c')||{}).value||'';
+  const box=document.getElementById('c-'+id);
+  const c=box?box.value:'';
   try{
     await fetch('/api/decide',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({id:currentId,decision:dec,comment:c})});
+      body:JSON.stringify({id:id,decision:dec,comment:c})});
   }catch(e){}
-  busy=false;currentId=null;poll();
+  busy=false;seen='';poll();
 }
 poll();setInterval(poll,1500);
 </script></body></html>"""
@@ -472,18 +503,16 @@ class ApprovalServer:
                         {"server": SERVER_SIGNATURE, "state_dir": str(server.store.state_dir)}
                     )
                 elif path == "/api/pending":
-                    record = server.store.peek()
-                    if not record.get("id"):
-                        self._json({"id": None})
-                    else:
-                        self._json({
-                            "id": record["id"],
-                            "plan_id": record.get("plan_id"),
-                            "goal": record.get("goal"),
-                            "display": record.get("display"),
-                            "tasks": record.get("tasks", []),
-                            "decided": record.get("decision"),
-                        })
+                    self._json({"requests": [
+                        {
+                            "id": e["id"],
+                            "plan_id": e.get("plan_id"),
+                            "goal": e.get("goal"),
+                            "display": e.get("display"),
+                            "decided": e.get("decision"),
+                        }
+                        for e in server.store.peek()
+                    ]})
                 else:
                     self.send_error(404)
 

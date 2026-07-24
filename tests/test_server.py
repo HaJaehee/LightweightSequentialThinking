@@ -384,19 +384,24 @@ class TestStateMachine(HandlerTestCase):
         approval must NOT unlock plan B - the human never saw B."""
         self.think(goal="A: 보고서 요약", need_more_thinking=False, task_list=["찾기", "요약"])
         self.h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
-        self.think(goal="B: 전 직원 메일 발송", step_number=1,
-                   need_more_thinking=False, task_list=["초안", "발송"])
+        b = self.think(goal="B: 전 직원 메일 발송", step_number=1,
+                       need_more_thinking=False, task_list=["초안", "발송"])
+        pid = b["plan_id"]
         res = self.h.dispatch(
-            "request_user_approval", {"decision": "APPROVED", "user_comment": "승인"}
+            "request_user_approval",
+            {"decision": "APPROVED", "user_comment": "승인", "plan_id": pid},
         )
         self.assertFalse(res["ok"])
         self.assertEqual(res["error_code"], "APPROVAL_NOT_REQUESTED")
         self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")  # still locked
-        blocked = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        blocked = self.h.dispatch(
+            "update_task_progress", {"task_id": 1, "status": "IN_PROGRESS", "plan_id": pid}
+        )
         self.assertEqual(blocked["error_code"], "PLAN_NOT_APPROVED")
         # Re-asking (showing the CURRENT plan) and then approving works.
-        self.h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s2"})
-        res = self.h.dispatch("request_user_approval", {"decision": "APPROVED"})
+        self.h.dispatch("request_user_approval",
+                        {"decision": "ASK_USER", "plan_summary": "s2", "plan_id": pid})
+        res = self.h.dispatch("request_user_approval", {"decision": "APPROVED", "plan_id": pid})
         self.assertEqual(res["plan_status"], "APPROVED")
 
     def test_revise_then_approve_without_reask_is_refused(self):
@@ -409,36 +414,72 @@ class TestStateMachine(HandlerTestCase):
         self.assertFalse(res["ok"])
         self.assertEqual(res["error_code"], "APPROVAL_NOT_REQUESTED")
 
-    def test_draft_replacement_by_different_goal_is_flagged(self):
-        """A second 'session' overwriting an unfinished draft must leave evidence."""
-        self.think(goal="A세션: 회의실 예약", need_more_thinking=False, task_list=["a1", "a2"])
-        res = self.think(goal="B세션: 보고서 요약", need_more_thinking=False, task_list=["b1"])
-        self.assertTrue(res["ok"])
-        self.assertTrue(
-            any("replaced" in n for n in res.get("input_notes", [])),
-            f"no replacement warning in {res.get('input_notes')}",
-        )
-        audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
-        self.assertIn("goal_replaced", audit)
+    def test_concurrent_sessions_keep_separate_plans(self):
+        """Two goals in flight must coexist, not evict one another (1.8.0)."""
+        a = self.think(goal="A세션: 회의실 예약", need_more_thinking=False, task_list=["a1", "a2"])
+        b = self.think(goal="B세션: 보고서 요약", need_more_thinking=False, task_list=["b1"])
+        self.assertNotEqual(a["plan_id"], b["plan_id"])
         raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
-        plan = next(iter(raw["plans"].values()))
-        self.assertEqual(
-            [t["title"] for t in plan["superseded_tasks"][0]], ["a1", "a2"]
-        )  # A's tasks archived, not destroyed
+        self.assertEqual(len(raw["plans"]), 2)
+        goals = sorted(p["goal"] for p in raw["plans"].values())
+        self.assertEqual(goals, ["A세션: 회의실 예약", "B세션: 보고서 요약"])
+        # Each session's own tasks survive intact.
+        by_goal = {p["goal"]: [t["title"] for t in p["tasks"]] for p in raw["plans"].values()}
+        self.assertEqual(by_goal["A세션: 회의실 예약"], ["a1", "a2"])
+        self.assertEqual(by_goal["B세션: 보고서 요약"], ["b1"])
+
+    def test_same_goal_continues_the_same_plan(self):
+        """Repeating the goal - which the prompt tells the model to do - routes back."""
+        first = self.think(goal="같은 목표", step_number=1, need_more_thinking=True)
+        second = self.think(goal="같은 목표", step_number=2, need_more_thinking=False,
+                            task_list=["x"])
+        self.assertEqual(first["plan_id"], second["plan_id"])
+
+    def test_ambiguous_calls_are_refused_with_a_directory(self):
+        self.think(goal="A", need_more_thinking=False, task_list=["a"])
+        self.think(goal="B", need_more_thinking=False, task_list=["b"])
+        res = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "PLAN_AMBIGUOUS")
+        self.assertEqual(len(res["active_plans"]), 2)
+
+    def test_plan_id_routes_to_the_right_plan(self):
+        a = self.think(goal="A", need_more_thinking=False, task_list=["a작업"])
+        b = self.think(goal="B", need_more_thinking=False, task_list=["b작업"])
+        for pid in (a["plan_id"], b["plan_id"]):
+            self.h.dispatch("request_user_approval",
+                            {"decision": "ASK_USER", "plan_summary": "s", "plan_id": pid})
+            self.h.dispatch("request_user_approval", {"decision": "APPROVED", "plan_id": pid})
+        res = self.h.dispatch("update_task_progress",
+                              {"task_id": 1, "status": "IN_PROGRESS", "plan_id": b["plan_id"]})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["plan_id"], b["plan_id"])
+        self.assertEqual(res["tasks"][0]["title"], "b작업")
+        # A is untouched.
+        a_now = self.h.dispatch("get_current_plan", {"plan_id": a["plan_id"]})
+        self.assertEqual(a_now["tasks"][0]["status"], "PENDING")
+
+    def test_hints_name_the_plan_id_when_several_are_active(self):
+        """A model that copies the hint verbatim must still route correctly."""
+        self.think(goal="A", need_more_thinking=False, task_list=["a"])
+        b = self.think(goal="B", need_more_thinking=False, task_list=["b"])
+        self.assertIn(b["plan_id"], b["next_action_hint"])
 
     def test_new_goal_never_inherits_an_approval(self):
         """A different goal must not ride on an approved plan's execution licence.
 
-        Until 1.4.0 this was enforced by refusing the new goal outright and redirecting
-        to the approved plan - safe, but it silently discarded the user's new request
-        AND let a stale approval keep authorizing work. The plan is now superseded and
-        the new goal starts locked instead.
+        1.4.0 enforced this by superseding the approved plan; since 1.8.0 the two plans
+        simply coexist and the new one starts locked, so a concurrent session no longer
+        loses its work either way.
         """
         self.approve_flow(["a", "b"])
         res = self.think(goal="다른 세션의 새 목표", step_number=1,
                          need_more_thinking=False, task_list=["hijack"])
         self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
-        blocked = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        blocked = self.h.dispatch(
+            "update_task_progress",
+            {"task_id": 1, "status": "IN_PROGRESS", "plan_id": res["plan_id"]},
+        )
         self.assertEqual(blocked["error_code"], "PLAN_NOT_APPROVED")
 
     def test_separate_state_dirs_are_fully_isolated(self):
@@ -612,10 +653,11 @@ class TestStaleApproval(HandlerTestCase):
         )
         self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
         self.assertEqual([t["title"] for t in res["tasks"]], ["배포 스크립트 실행"])
-        blocked = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        blocked = self.h.dispatch(
+            "update_task_progress",
+            {"task_id": 1, "status": "IN_PROGRESS", "plan_id": res["plan_id"]},
+        )
         self.assertEqual(blocked["error_code"], "PLAN_NOT_APPROVED")
-        audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
-        self.assertIn("plan_superseded_by_new_goal", audit)
 
     def test_same_goal_mid_execution_still_redirects(self):
         """The original leniency must survive: same goal, plan in flight -> redirect."""
@@ -789,7 +831,7 @@ class TestBlockingApproval(HandlerTestCase):
             # A request published by the peer is served by the owner's page.
             req = peer.open_request("plan_p", "목표", "PLAN...", [{"task_id": 1}], "fp")
             with urllib.request.urlopen(owner.url + "api/pending", timeout=5) as r:
-                shown = json.loads(r.read().decode("utf-8"))
+                shown = json.loads(r.read().decode("utf-8"))["requests"][0]
             self.assertEqual(shown["id"], req)
             self.assertEqual(shown["plan_id"], "plan_p")
 
@@ -822,10 +864,10 @@ class TestBlockingApproval(HandlerTestCase):
         d = self.state_dir / "sharedstore"
         a, b = ApprovalStore(d), ApprovalStore(d)
         rid = a.publish("plan_1", "g", "display", [], "fp1")
-        self.assertEqual(b.peek()["id"], rid)
+        self.assertEqual(b.peek()[0]["id"], rid)
         self.assertTrue(b.record_decision(rid, "APPROVED", "예"))
         self.assertEqual(a.claim_for_plan("plan_1", "fp1"), ("APPROVED", "예"))
-        self.assertEqual(a.peek(), {})
+        self.assertEqual(a.peek(), [])
 
     def test_heartbeat_only_with_progress_token(self):
         notifier = RecordingNotifier()
@@ -925,7 +967,7 @@ class TestBlockingApproval(HandlerTestCase):
             req = srv.open_request("plan_x", "목표", "PLAN...", [{"task_id": 1}], "fp")
             self.assertIsNotNone(req)
             with urllib.request.urlopen(srv.url + "api/pending", timeout=5) as r:
-                payload = json.loads(r.read().decode("utf-8"))
+                payload = json.loads(r.read().decode("utf-8"))["requests"][0]
             self.assertEqual(payload["plan_id"], "plan_x")
             body = json.dumps(
                 {"id": payload["id"], "decision": "APPROVED", "comment": "ok"}

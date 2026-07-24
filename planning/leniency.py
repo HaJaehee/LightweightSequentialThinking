@@ -23,8 +23,8 @@ _ALLOWED_KEYS: dict[str, set[str]] = {
         "task_list",
         "revises_step",
     },
-    "request_user_approval": {"decision", "plan_summary", "user_comment"},
-    "update_task_progress": {"task_id", "status", "result_log"},
+    "request_user_approval": {"decision", "plan_summary", "user_comment", "plan_id"},
+    "update_task_progress": {"task_id", "status", "result_log", "plan_id"},
     "get_current_plan": {"plan_id"},
 }
 

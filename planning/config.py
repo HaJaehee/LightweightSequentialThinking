@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SERVER_NAME = "planning-mcp"
-SERVER_VERSION = "1.7.0"
+SERVER_VERSION = "1.8.0"
 
 # The state dir is resolved from this file, NOT from the working directory.
 # AnythingLLM spawns the server with its own CWD, which is why plans "disappear"
@@ -56,6 +56,7 @@ class Config:
     approval_timeout: int = 900
     approval_open_browser: bool = True
     approval_ttl: int = 1800
+    max_active_plans: int = 5
 
     @classmethod
     def from_env(cls, state_dir_override: str | None = None) -> "Config":
@@ -73,6 +74,7 @@ class Config:
             approval_timeout=_env_int("PLANNING_MCP_APPROVAL_TIMEOUT", 900),
             approval_open_browser=_env_bool("PLANNING_MCP_APPROVAL_OPEN_BROWSER", True),
             approval_ttl=_env_int("PLANNING_MCP_APPROVAL_TTL", 1800),
+            max_active_plans=_env_int("PLANNING_MCP_MAX_ACTIVE_PLANS", 5),
         )
 
 

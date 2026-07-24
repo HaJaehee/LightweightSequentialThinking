@@ -119,8 +119,9 @@ time.sleep(2)
 check("B의 호출이 아직 블로킹 중", B.reply_for(mid) is None)
 
 print("\n== 3) 사람이 보고 있는 그 페이지에 B의 요청이 뜨는가 ==")
-pending = page("/api/pending")
-check("요청이 페이지에 노출", bool(pending.get("id")), json.dumps(pending, ensure_ascii=False)[:150])
+queue = page("/api/pending")["requests"]
+pending = queue[0] if queue else {}
+check("요청이 페이지에 노출", bool(pending.get("id")), json.dumps(queue, ensure_ascii=False)[:150])
 check("B의 계획 내용이 맞음", "B작업1" in (pending.get("display") or ""),
       (pending.get("display") or "")[:80])
 

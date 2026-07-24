@@ -240,6 +240,7 @@ def main() -> int:
     run_child("stdio end-to-end smoke test", ["tests/smoke_stdio.py"])
     run_child("blocking-approval smoke test", ["tests/smoke_blocking_approval.py"])
     run_child("shared-approval smoke test", ["tests/smoke_shared_approval.py"])
+    run_child("multi-plan smoke test", ["tests/smoke_multi_plan.py"])
 
     failures = [label for label, ok, _ in _results if not ok]
     print("\n" + "=" * 68)

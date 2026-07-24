@@ -23,6 +23,7 @@ from .models import (
     ErrorCode,
     Plan,
     PlanStatus,
+    TERMINAL_PLAN_STATUSES,
     Task,
     TaskStatus,
     ThinkingStep,
@@ -137,11 +138,16 @@ class PlanningHandlers:
         if self.approval_ui is None:
             return
         state = self.store.load()
-        plan = state.active_plan
-        if plan is None:
-            return
-        taken = self.approval_ui.take_decision(plan.plan_id, self._fingerprint(plan))
-        if taken is None:
+        # Any active plan may have a decision waiting - concurrent sessions each have
+        # their own, so checking only "the active plan" would strand the others.
+        for candidate in state.active_plans():
+            taken = self.approval_ui.take_decision(
+                candidate.plan_id, self._fingerprint(candidate)
+            )
+            if taken is not None:
+                plan = candidate
+                break
+        else:
             return
         decision, comment = taken
         if decision == Decision.APPROVED.value:
@@ -155,6 +161,51 @@ class PlanningHandlers:
             "late_decision_applied", plan_id=plan.plan_id, decision=decision, comment=comment
         )
         log.warning("Applied a late human decision for %s: %s", plan.plan_id, decision)
+
+    # ---- plan routing ---------------------------------------------------
+    _AMBIGUOUS = object()
+
+    @staticmethod
+    def _resolve_plan(state: State, plan_id: Any) -> Any:
+        """Which plan does this call mean?
+
+        Explicit plan_id wins. Otherwise, if exactly one plan is in flight it is
+        unambiguous and the model never has to know plan_id exists. Only genuinely
+        concurrent sessions hit the ambiguous case, and the error tells the model
+        exactly what to send.
+        """
+        if isinstance(plan_id, str) and plan_id.strip().lower() not in (
+            "", "current", "active", "latest"
+        ):
+            return state.plans.get(plan_id.strip())
+        actives = state.active_plans()
+        if len(actives) == 1:
+            return actives[0]
+        if not actives:
+            # Nothing live: fall back to the most recent plan so the model is told
+            # "that plan was cancelled/completed" instead of "no plan exists", which
+            # would invite it to quietly start over.
+            if state.plans:
+                return max(state.plans.values(), key=lambda p: p.updated_at)
+            return None
+        return PlanningHandlers._AMBIGUOUS
+
+    @staticmethod
+    def _plan_directory(state: State) -> list[dict[str, Any]]:
+        return [
+            {"plan_id": p.plan_id, "goal": p.goal, "plan_status": p.plan_status,
+             "progress": p.progress()}
+            for p in state.active_plans()
+        ]
+
+    def _ambiguous(self, state: State, notes: list[str]) -> dict[str, Any]:
+        return error(
+            None,
+            ErrorCode.PLAN_AMBIGUOUS,
+            f"{len(state.active_plans())} plans are active; say which one with plan_id.",
+            notes=notes,
+            active_plans=self._plan_directory(state),
+        )
 
     def _expire_stale_approval(self, state: State, plan: Plan | None) -> bool:
         """Revoke an approval that has gone cold, before anything acts on it.
@@ -194,52 +245,57 @@ class PlanningHandlers:
     # ------------------------------------------------------------------
     def _plan_and_think(self, args: dict[str, Any], notes: list[str]) -> dict[str, Any]:
         state = self.store.load()
-        plan = state.active_plan
-        if self._expire_stale_approval(state, plan):
-            notes.append(
-                "The previous plan's approval had expired and was revoked. It no longer "
-                "authorizes any execution."
-            )
-
         goal = (args.get("goal") or "").strip()
         thought = (args.get("thought") or "").strip()
 
-        # A plan already under way: do NOT start a second one - unless this is plainly a
-        # different request. Redirecting a NEW goal onto an old approved plan would hand
-        # the model an execution licence the user never granted for it.
+        # Route by goal. Within one conversation the model repeats the same goal on
+        # every step, so a matching active plan is this session's plan. A different goal
+        # belongs to a different session and gets its own plan - it must never evict
+        # somebody else's work, which is what a single active-plan slot used to do.
+        plan = state.plan_for_goal(goal)
+        if plan is None and not goal:
+            resolved = self._resolve_plan(state, args.get("plan_id"))
+            plan = None if resolved is self._AMBIGUOUS else resolved
+        if plan is not None and plan.status in TERMINAL_PLAN_STATUSES:
+            plan = None  # a finished plan is never resurrected; this starts a new one
+
+        if self._expire_stale_approval(state, plan):
+            notes.append(
+                "This plan's approval had expired and was revoked. It no longer "
+                "authorizes any execution."
+            )
+
         if plan is not None and plan.status in (PlanStatus.APPROVED, PlanStatus.IN_EXECUTION):
-            if goal and goal != plan.goal:
-                self.store.audit(
-                    "plan_superseded_by_new_goal",
-                    plan_id=plan.plan_id,
-                    old_goal=plan.goal,
-                    new_goal=goal,
-                )
-                plan.set_status(PlanStatus.CANCELLED)
-                self.store.save(state)
-                notes.append(
-                    f"An approved plan for a different goal ('{plan.goal}') was still "
-                    "active; it has been closed. This new goal starts from scratch and "
-                    "needs its own approval."
-                )
-                plan = None
-            else:
-                self.store.audit("plan_and_think_redirected", plan_id=plan.plan_id)
-                task = plan.current_task()
-                return build(
-                    plan,
-                    message=(
-                        "A plan is already approved and running. Continue it instead of "
-                        "planning again. Use get_current_plan if you need the details."
-                    ),
-                    notes=notes,
-                    tasks=plan.tasks_brief(),
-                    progress=plan.progress(),
-                    next_task={"task_id": task.task_id, "title": task.title} if task else None,
-                )
+            self.store.audit("plan_and_think_redirected", plan_id=plan.plan_id)
+            task = plan.current_task()
+            return build(
+                plan,
+                message=(
+                    "This plan is already approved and running. Continue it instead of "
+                    "planning again. Use get_current_plan if you need the details."
+                ),
+                notes=notes,
+                qualify=len(state.active_plans()) > 1,
+                tasks=plan.tasks_brief(),
+                progress=plan.progress(),
+                next_task={"task_id": task.task_id, "title": task.title} if task else None,
+            )
+
+        if plan is None and len(state.active_plans()) >= self.config.max_active_plans:
+            return error(
+                None,
+                ErrorCode.PLAN_AMBIGUOUS,
+                f"{len(state.active_plans())} plans are already active "
+                f"(limit {self.config.max_active_plans}).",
+                notes=notes,
+                active_plans=self._plan_directory(state),
+                message_hint=(
+                    "Finish or cancel one of the active plans before starting another."
+                ),
+            )
 
         # Lenient defaults: erroring on a missing scalar costs a turn and teaches nothing.
-        if plan is not None and plan.status not in (PlanStatus.COMPLETED, PlanStatus.CANCELLED):
+        if plan is not None:
             if not goal:
                 goal = plan.goal
                 notes.append("No goal was sent; reused the goal already on record.")
@@ -251,7 +307,7 @@ class PlanningHandlers:
             notes.append("No thought text was sent. Send one short reasoning sentence per step.")
 
         # Start or reuse the plan.
-        if plan is None or plan.status in (PlanStatus.COMPLETED, PlanStatus.CANCELLED):
+        if plan is None:
             plan_id = self.store.next_plan_id(state)
             plan = Plan(plan_id=plan_id, goal=goal, plan_status=PlanStatus.DRAFTING.value)
             state.plans[plan_id] = plan
@@ -262,20 +318,7 @@ class PlanningHandlers:
                 self.store.audit("replan_after_failure", plan_id=plan.plan_id)
             plan.set_status(PlanStatus.DRAFTING)
             plan.approval.reset_request()
-            if goal and goal != plan.goal:
-                # A different goal arriving mid-draft usually means a NEW conversation is
-                # steamrolling an unfinished plan - there is only one active-plan slot.
-                # Allow it (blocking would strand legitimate goal rewording in the same
-                # session), but leave loud evidence for both the model and the audit trail.
-                notes.append(
-                    f"An unfinished plan with a different goal ('{plan.goal}') was active "
-                    "and is being replaced by this one. Its task list is archived. If you "
-                    "did not intend to abandon that plan, call get_current_plan."
-                )
-                self.store.audit(
-                    "goal_replaced", plan_id=plan.plan_id, old_goal=plan.goal, new_goal=goal
-                )
-                plan.goal = goal
+            state.active_plan_id = plan.plan_id
 
         # --- revises_step -------------------------------------------------
         revises_step = args.get("revises_step")
@@ -332,6 +375,7 @@ class PlanningHandlers:
                 total_steps=plan.total_steps,
                 tasks=plan.tasks_brief(),
                 notes=notes,
+                qualify=len(state.active_plans()) > 1,
                 message=f"Thinking step {step_number} recorded.",
             )
 
@@ -372,6 +416,7 @@ class PlanningHandlers:
             total_steps=plan.total_steps,
             tasks=plan.tasks_brief(),
             notes=notes,
+            qualify=len(state.active_plans()) > 1,
             message=(
                 f"Plan created with {len(plan.tasks)} tasks. "
                 "Execution is locked until the user approves."
@@ -389,7 +434,9 @@ class PlanningHandlers:
         notifier: Any = None,
     ) -> dict[str, Any]:
         state = self.store.load()
-        plan = state.active_plan
+        plan = self._resolve_plan(state, args.get("plan_id"))
+        if plan is self._AMBIGUOUS:
+            return self._ambiguous(state, notes)
         if self._expire_stale_approval(state, plan):
             notes.append(
                 "This plan's earlier approval had expired and was revoked. Ask the user "
@@ -476,14 +523,16 @@ class PlanningHandlers:
 
         if self.approval_ui is not None:
             fingerprint = self._fingerprint(plan)
+            waited_plan_id = plan.plan_id
             decided = self._wait_for_human(plan, display, progress_token, notifier, notes)
             if decided is not None:
                 decision, comment = decided
                 # The transaction was released while waiting, so another session may
-                # have moved the plan on. Re-read and re-verify before honouring a
-                # decision the human made about what was on screen back then.
+                # have moved things on. Re-read THIS plan by id - resolving "the active
+                # plan" would pick up a concurrent session's plan instead - and verify
+                # it is still what the human saw.
                 state = self.store.load()
-                plan = state.active_plan
+                plan = state.plans.get(waited_plan_id)
                 if plan is None or self._fingerprint(plan) != fingerprint:
                     self.store.audit(
                         "approval_discarded_plan_changed",
@@ -669,6 +718,7 @@ class PlanningHandlers:
             plan,
             message="Execution is now unlocked.",
             notes=notes,
+            qualify=len(state.active_plans()) > 1,
             tasks=plan.tasks_brief(),
             progress=plan.progress(),
             next_task={"task_id": task.task_id, "title": task.title} if task else None,
@@ -716,7 +766,9 @@ class PlanningHandlers:
     # ------------------------------------------------------------------
     def _update_task_progress(self, args: dict[str, Any], notes: list[str]) -> dict[str, Any]:
         state = self.store.load()
-        plan = state.active_plan
+        plan = self._resolve_plan(state, args.get("plan_id"))
+        if plan is self._AMBIGUOUS:
+            return self._ambiguous(state, notes)
         if self._expire_stale_approval(state, plan):
             self.store.audit("execution_blocked", plan_id=plan.plan_id, reason="APPROVAL_EXPIRED")
             return error(
@@ -818,6 +870,7 @@ class PlanningHandlers:
             progress=plan.progress(),
             tasks=plan.tasks_brief(),
             notes=notes,
+            qualify=len(state.active_plans()) > 1,
             message=f"Task {task.task_id} marked IN_PROGRESS. Do the work now.",
         )
 
@@ -866,6 +919,7 @@ class PlanningHandlers:
             progress=plan.progress(),
             tasks=plan.tasks_brief(),
             notes=notes,
+            qualify=len(state.active_plans()) > 1,
             next_task={"task_id": nxt.task_id, "title": nxt.title} if nxt else None,
         )
 
@@ -922,16 +976,20 @@ class PlanningHandlers:
         state = self.store.load()
         requested = (args.get("plan_id") or "current").strip()
 
-        if requested.lower() in ("current", "active", "latest", ""):
-            plan = state.active_plan
-        else:
-            plan = state.plans.get(requested)
-            if plan is None:
-                plan = state.active_plan
-                notes.append(
-                    f"No plan with id '{requested}'. Returned the active plan instead. "
-                    "Use plan_id='current'."
-                )
+        plan = self._resolve_plan(state, requested)
+        if plan is self._AMBIGUOUS:
+            # Recovery must never fail; hand back the directory so the model can pick.
+            return build(
+                None,
+                notes=notes,
+                message=(
+                    f"{len(state.active_plans())} plans are active. Call again with the "
+                    "plan_id of the one this conversation is working on."
+                ),
+                active_plans=self._plan_directory(state),
+            )
+        if plan is None and requested.lower() not in ("current", "active", "latest", ""):
+            notes.append(f"No plan with id '{requested}'.")
 
         if plan is None:
             return build(None, notes=notes, message="No plan has been created yet.")

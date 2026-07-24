@@ -19,7 +19,7 @@ from typing import Any
 
 from .filelock import exclusive
 
-from .models import Plan, PlanStatus, TERMINAL_PLAN_STATUSES, now_iso
+from .models import Plan, PlanStatus, TERMINAL_PLAN_STATUSES, now_iso  # noqa: F401
 
 log = logging.getLogger("planning-mcp.store")
 
@@ -40,9 +40,42 @@ class State:
 
     @property
     def active_plan(self) -> Plan | None:
-        if not self.active_plan_id:
+        """The single plan in flight, or the most recently touched one.
+
+        Kept for the common case of one conversation. When several sessions each have
+        their own plan, callers must resolve explicitly - see `active_plans`.
+        """
+        actives = self.active_plans()
+        if len(actives) == 1:
+            return actives[0]
+        if self.active_plan_id and self.active_plan_id in self.plans:
+            candidate = self.plans[self.active_plan_id]
+            if PlanStatus(candidate.plan_status) not in TERMINAL_PLAN_STATUSES:
+                return candidate
+        return actives[0] if actives else None
+
+    def active_plans(self) -> list[Plan]:
+        """Every plan still in play, most recently touched first.
+
+        Concurrent sessions each hold their own plan; a single active-plan slot made
+        them evict one another.
+        """
+        live = [
+            p for p in self.plans.values()
+            if PlanStatus(p.plan_status) not in TERMINAL_PLAN_STATUSES
+        ]
+        live.sort(key=lambda p: p.updated_at, reverse=True)
+        return live
+
+    def plan_for_goal(self, goal: str) -> Plan | None:
+        """Route by goal: within one conversation the model repeats it every step."""
+        goal = (goal or "").strip()
+        if not goal:
             return None
-        return self.plans.get(self.active_plan_id)
+        for plan in self.active_plans():
+            if plan.goal.strip() == goal:
+                return plan
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
