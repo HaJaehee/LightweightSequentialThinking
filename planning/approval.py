@@ -130,13 +130,33 @@ button:disabled{opacity:.5;cursor:default}
 </style></head><body><div class="card" id="root">
 <div class="idle">연결 중…</div></div>
 <script>
-let currentId=null,busy=false;
+let currentId=null,busy=false,flash=null;
+const IDLE_TITLE='planning-mcp 승인';
+// A popup can be blocked, land on another monitor, or open behind other windows.
+// So the page makes itself noticeable instead: the tab title flashes and a short tone
+// plays. Leaving this tab open is the reliable way to catch approval requests.
+function alertOn(){
+  if(flash)return;
+  let on=false;
+  flash=setInterval(()=>{on=!on;document.title=on?'\\u26A0 승인 대기 중':IDLE_TITLE;},700);
+  try{
+    const C=window.AudioContext||window.webkitAudioContext;if(!C)return;
+    const ctx=new C();const o=ctx.createOscillator();const g=ctx.createGain();
+    o.connect(g);g.connect(ctx.destination);o.frequency.value=880;g.gain.value=0.08;
+    o.start();o.stop(ctx.currentTime+0.18);
+    setTimeout(()=>{try{ctx.close();}catch(e){}},400);
+  }catch(e){}
+}
+function alertOff(){
+  if(flash){clearInterval(flash);flash=null;}
+  document.title=IDLE_TITLE;
+}
 async function poll(){
   if(busy)return;
   try{
     const r=await fetch('/api/pending');const d=await r.json();
-    if(!d.id){currentId=null;render(null);return;}
-    if(d.id!==currentId){currentId=d.id;render(d);}
+    if(!d.id){currentId=null;alertOff();render(null);return;}
+    if(d.id!==currentId){currentId=d.id;render(d);alertOn();}
   }catch(e){}
 }
 function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
@@ -156,7 +176,7 @@ function render(d){
     '아무것도 실행하지 못하고 멈춰 있습니다.</p>';
 }
 async function decide(dec){
-  if(busy||!currentId)return;busy=true;
+  if(busy||!currentId)return;busy=true;alertOff();
   document.querySelectorAll('button').forEach(b=>b.disabled=true);
   const c=(document.getElementById('c')||{}).value||'';
   try{
@@ -233,6 +253,21 @@ class ApprovalServer:
             self._httpd = None
             return False
 
+    def start(self) -> bool:
+        """Bind the page at server startup rather than at first approval.
+
+        Two reasons. A bind failure then shows up while you are still looking at the
+        logs, instead of silently disarming the gate mid-workflow. And the tab can be
+        opened once, up front, so it is already polling when an approval arrives -
+        which is the only reliable surfacing path when a per-request popup is blocked
+        or lands on another monitor.
+        """
+        if not self._ensure_started():
+            return False
+        if self.open_browser and not self._opened_once:
+            self._open_browser_once()
+        return True
+
     def shutdown(self) -> None:
         with self._lock:
             httpd, self._httpd = self._httpd, None
@@ -263,13 +298,28 @@ class ApprovalServer:
     def _surface(self) -> None:
         """Bring the approval page in front of the human."""
         log.warning("HUMAN APPROVAL NEEDED -> %s", self.url)
-        if not self.open_browser:
-            return
+        if self.open_browser:
+            self._open_browser_once()
+
+    def _open_browser_once(self) -> None:
+        """Best-effort only. Corporate policy, a missing default browser, or a second
+        monitor can all defeat this, which is why the page also polls: an already-open
+        tab lights up on its own."""
         try:
-            webbrowser.open(self.url)
+            if webbrowser.open(self.url):
+                self._opened_once = True
+                return
+        except Exception as exc:  # noqa: BLE001 - never let this break approval
+            log.debug("webbrowser.open failed: %s", exc)
+        try:  # Windows fallback when no browser is registered with webbrowser
+            import os
+
+            os.startfile(self.url)  # type: ignore[attr-defined]
             self._opened_once = True
-        except Exception as exc:  # noqa: BLE001 - a headless box must not break approval
-            log.warning("Could not open a browser (%s). Open %s manually.", exc, self.url)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+        log.warning("Could not open a browser automatically. Open %s manually.", self.url)
 
     # ---- http ----------------------------------------------------------
     def _make_handler(self):

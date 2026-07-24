@@ -345,6 +345,13 @@ class PlanningHandlers:
         self.store.audit("approval_requested", plan_id=plan.plan_id, plan_summary=plan_summary)
         display = render_plan_for_user(plan, plan_summary)
 
+        # The URL only reaches the human through stderr otherwise, which nobody reads in
+        # a desktop app. Putting it in display_to_user means the model prints it in chat,
+        # so a blocked popup or a second monitor no longer hides the approval page.
+        approval_url = self.approval_ui.url if self.approval_ui is not None else None
+        if approval_url:
+            display = f"{display}\n\n승인/거절: {approval_url}"
+
         if self.approval_ui is not None:
             decided = self._wait_for_human(plan, display, progress_token, notifier, notes)
             if decided is not None:
@@ -368,6 +375,7 @@ class PlanningHandlers:
             tasks=plan.tasks_brief(),
             notes=notes,
             display_to_user=display,
+            approval_url=approval_url,
         )
 
     def _wait_for_human(

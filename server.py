@@ -26,9 +26,23 @@ from planning.store import Store  # noqa: E402
 from planning.transport import serve_sse, serve_stdio  # noqa: E402
 
 
-def build_protocol(config: Config) -> McpProtocol:
+def build_protocol(config: Config, log=None) -> McpProtocol:
     store = Store(config.state_dir, max_plans=config.max_plans)
     handlers = PlanningHandlers(store, config)
+    if handlers.approval_ui is not None:
+        # Bind now, not at the first approval: a failure has to be visible at startup
+        # rather than silently disarming the gate mid-workflow.
+        if handlers.approval_ui.start():
+            if log:
+                log.warning(
+                    "APPROVE PLANS AT -> %s   (leave this tab open; it alerts on new requests)",
+                    handlers.approval_ui.url,
+                )
+        elif log:
+            log.error(
+                "Approval UI FAILED TO START - blocking approval is disarmed. "
+                "Free the port range or set PLANNING_MCP_APPROVAL_PORT."
+            )
     return McpProtocol(handlers, TOOL_DEFINITIONS, SERVER_NAME, SERVER_VERSION)
 
 
@@ -65,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
             "wait. A weak model may ignore that and keep executing."
         )
 
-    protocol = build_protocol(config)
+    protocol = build_protocol(config, log=log)
 
     if args.transport == "sse":
         serve_sse(protocol, host=args.host, port=args.port)

@@ -707,6 +707,16 @@ class TestBlockingApproval(HandlerTestCase):
         self.assertEqual(h.effective_timeout(can_heartbeat=False), 5)
         self.assertEqual(h.effective_timeout(can_heartbeat=True), 5)
 
+    def test_approval_url_reaches_the_user_in_chat(self):
+        """A blocked popup must not hide the page: the URL rides in display_to_user."""
+        ui = FakeApprovalUI(decision=None)
+        ui.url = "http://127.0.0.1:8899/"
+        h = self.blocking(ui, timeout=1)
+        self.draft(h)
+        res = self.ask(h)
+        self.assertEqual(res["approval_url"], "http://127.0.0.1:8899/")
+        self.assertIn("http://127.0.0.1:8899/", res["display_to_user"])
+
     def test_out_of_band_decision_is_audited(self):
         h = self.blocking(FakeApprovalUI("APPROVED", "승인"))
         self.draft(h)
