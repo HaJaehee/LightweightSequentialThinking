@@ -89,6 +89,33 @@ class PlanningHandlers:
             notes=notes,
         )
 
+    def _expire_stale_approval(self, state: State, plan: Plan | None) -> bool:
+        """Revoke an approval that has gone cold, before anything acts on it.
+
+        Without this, a plan approved hours ago in a different conversation keeps
+        authorizing execution: plan_and_think redirects to it, request_user_approval
+        short-circuits with "already approved" (so nothing ever blocks and no approval
+        page appears), and update_task_progress sails through. Observed in the field.
+        """
+        if plan is None or not plan.approval_is_stale(self.config.approval_ttl):
+            return False
+        idle = plan.idle_seconds()
+        # An unreadable timestamp yields infinity, which int() cannot represent.
+        idle_field = None if idle == float("inf") else int(idle)
+        plan.set_status(PlanStatus.AWAITING_APPROVAL)
+        plan.approval.reset_request()  # forces a fresh ASK_USER, not a replayed decision
+        self.store.save(state)
+        self.store.audit(
+            "approval_expired", plan_id=plan.plan_id, idle_seconds=idle_field,
+            ttl=self.config.approval_ttl,
+        )
+        log.warning(
+            "Approval for %s expired (%s idle) - re-approval required",
+            plan.plan_id,
+            f"{idle_field}s" if idle_field is not None else "unreadable timestamp",
+        )
+        return True
+
     def _safe_active_plan(self) -> Plan | None:
         try:
             return self.store.load().active_plan
@@ -101,25 +128,48 @@ class PlanningHandlers:
     def _plan_and_think(self, args: dict[str, Any], notes: list[str]) -> dict[str, Any]:
         state = self.store.load()
         plan = state.active_plan
-
-        # A plan already under way: do NOT start a second one. Redirect to the in-flight task.
-        if plan is not None and plan.status in (PlanStatus.APPROVED, PlanStatus.IN_EXECUTION):
-            self.store.audit("plan_and_think_redirected", plan_id=plan.plan_id)
-            task = plan.current_task()
-            return build(
-                plan,
-                message=(
-                    "A plan is already approved and running. Continue it instead of planning "
-                    "again. Use get_current_plan if you need the details."
-                ),
-                notes=notes,
-                tasks=plan.tasks_brief(),
-                progress=plan.progress(),
-                next_task={"task_id": task.task_id, "title": task.title} if task else None,
+        if self._expire_stale_approval(state, plan):
+            notes.append(
+                "The previous plan's approval had expired and was revoked. It no longer "
+                "authorizes any execution."
             )
 
         goal = (args.get("goal") or "").strip()
         thought = (args.get("thought") or "").strip()
+
+        # A plan already under way: do NOT start a second one - unless this is plainly a
+        # different request. Redirecting a NEW goal onto an old approved plan would hand
+        # the model an execution licence the user never granted for it.
+        if plan is not None and plan.status in (PlanStatus.APPROVED, PlanStatus.IN_EXECUTION):
+            if goal and goal != plan.goal:
+                self.store.audit(
+                    "plan_superseded_by_new_goal",
+                    plan_id=plan.plan_id,
+                    old_goal=plan.goal,
+                    new_goal=goal,
+                )
+                plan.set_status(PlanStatus.CANCELLED)
+                self.store.save(state)
+                notes.append(
+                    f"An approved plan for a different goal ('{plan.goal}') was still "
+                    "active; it has been closed. This new goal starts from scratch and "
+                    "needs its own approval."
+                )
+                plan = None
+            else:
+                self.store.audit("plan_and_think_redirected", plan_id=plan.plan_id)
+                task = plan.current_task()
+                return build(
+                    plan,
+                    message=(
+                        "A plan is already approved and running. Continue it instead of "
+                        "planning again. Use get_current_plan if you need the details."
+                    ),
+                    notes=notes,
+                    tasks=plan.tasks_brief(),
+                    progress=plan.progress(),
+                    next_task={"task_id": task.task_id, "title": task.title} if task else None,
+                )
 
         # Lenient defaults: erroring on a missing scalar costs a turn and teaches nothing.
         if plan is not None and plan.status not in (PlanStatus.COMPLETED, PlanStatus.CANCELLED):
@@ -273,6 +323,11 @@ class PlanningHandlers:
     ) -> dict[str, Any]:
         state = self.store.load()
         plan = state.active_plan
+        if self._expire_stale_approval(state, plan):
+            notes.append(
+                "This plan's earlier approval had expired and was revoked. Ask the user "
+                "to approve the current plan again."
+            )
 
         raw_decision = args.get("decision")
         try:
@@ -570,6 +625,15 @@ class PlanningHandlers:
     def _update_task_progress(self, args: dict[str, Any], notes: list[str]) -> dict[str, Any]:
         state = self.store.load()
         plan = state.active_plan
+        if self._expire_stale_approval(state, plan):
+            self.store.audit("execution_blocked", plan_id=plan.plan_id, reason="APPROVAL_EXPIRED")
+            return error(
+                plan,
+                ErrorCode.APPROVAL_EXPIRED,
+                "The approval for this plan expired while it sat idle.",
+                notes=notes,
+                tasks=plan.tasks_brief(),
+            )
 
         guard = execution_guard(plan, autoapprove=self.config.autoapprove)
         if guard is not None:

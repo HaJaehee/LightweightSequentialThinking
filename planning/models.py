@@ -18,6 +18,23 @@ def now_iso() -> str:
     return datetime.datetime.now().astimezone().replace(microsecond=0).isoformat()
 
 
+def seconds_since(stamp: str | None) -> float:
+    """Age of an ISO timestamp in seconds.
+
+    Returns infinity when the value is missing or unparseable: an approval whose age
+    cannot be established must be treated as expired, never as fresh.
+    """
+    if not stamp:
+        return float("inf")
+    try:
+        then = datetime.datetime.fromisoformat(stamp)
+    except ValueError:
+        return float("inf")
+    if then.tzinfo is None:
+        then = then.astimezone()
+    return (datetime.datetime.now().astimezone() - then).total_seconds()
+
+
 class PlanStatus(str, Enum):
     NONE = "NONE"
     DRAFTING = "DRAFTING"
@@ -62,6 +79,7 @@ class ErrorCode(str, Enum):
     MISSING_TASK_LIST = "MISSING_TASK_LIST"
     MISSING_PLAN_SUMMARY = "MISSING_PLAN_SUMMARY"
     APPROVAL_NOT_REQUESTED = "APPROVAL_NOT_REQUESTED"
+    APPROVAL_EXPIRED = "APPROVAL_EXPIRED"
     INVALID_STATUS = "INVALID_STATUS"
     INVALID_DECISION = "INVALID_DECISION"
     INVALID_STEP = "INVALID_STEP"
@@ -229,6 +247,21 @@ class Plan:
 
     def touch(self) -> None:
         self.updated_at = now_iso()
+
+    def idle_seconds(self) -> float:
+        """How long since anything happened to this plan."""
+        return seconds_since(self.updated_at)
+
+    def approval_is_stale(self, ttl_seconds: int) -> bool:
+        """An approval only authorizes work that follows it promptly.
+
+        A plan approved this morning must not silently authorize execution in an
+        unrelated conversation hours later - the human who approved it was agreeing to
+        that plan, then, not to whatever the model decides to do next.
+        """
+        if self.status not in EXECUTABLE_PLAN_STATUSES:
+            return False
+        return self.idle_seconds() > ttl_seconds
 
     def set_status(self, status: PlanStatus) -> None:
         self.plan_status = status.value

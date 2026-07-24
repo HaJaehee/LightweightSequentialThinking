@@ -340,6 +340,22 @@ times across the system prompt and the tool description, and why `revision_count
 means the next `plan_and_think` final step lands in `AWAITING_APPROVAL` again. There is no path
 from `REVISE` directly to execution.
 
+**Approval expires (1.4.0).** An approval authorizes the work that follows it *promptly*.
+A plan left idle longer than `PLANNING_MCP_APPROVAL_TTL` (default 1800s) has its approval
+revoked on the next touch: status returns to `AWAITING_APPROVAL`, the pending request is
+cleared, and the event is audited as `approval_expired`. Without this, a plan approved in
+the morning kept authorizing execution in an unrelated afternoon conversation — observed
+in the field, where `plan_and_think` redirected onto the stale plan,
+`request_user_approval(ASK_USER)` short-circuited with "already approved" so nothing ever
+blocked and no approval page appeared, and `update_task_progress` then sailed through.
+An unreadable `updated_at` counts as expired, never as fresh.
+
+**A different goal never inherits an approval (1.4.0).** `plan_and_think` still refuses to
+start a second plan while one is approved and running — but only when the goal matches.
+A materially different goal closes the old plan (`plan_superseded_by_new_goal`) and starts
+a fresh, locked one, rather than silently redirecting the new request onto an old
+execution licence.
+
 **Approval binds to the exact plan version the human last saw.** Every mutation of the task
 list — finalize, revision, or a different conversation replacing the draft — clears the pending
 approval request (`approval.reset_request()`). `APPROVED` arriving when no request is live is

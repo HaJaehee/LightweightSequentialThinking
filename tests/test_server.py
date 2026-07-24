@@ -7,6 +7,7 @@ Run these before spending corporate-LLM turns on the behavioral matrix.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import sys
@@ -423,15 +424,20 @@ class TestStateMachine(HandlerTestCase):
             [t["title"] for t in plan["superseded_tasks"][0]], ["a1", "a2"]
         )  # A's tasks archived, not destroyed
 
-    def test_approved_plan_cannot_be_replaced_by_new_goal(self):
-        """Once approved, a different-goal plan_and_think must NOT hijack the plan."""
+    def test_new_goal_never_inherits_an_approval(self):
+        """A different goal must not ride on an approved plan's execution licence.
+
+        Until 1.4.0 this was enforced by refusing the new goal outright and redirecting
+        to the approved plan - safe, but it silently discarded the user's new request
+        AND let a stale approval keep authorizing work. The plan is now superseded and
+        the new goal starts locked instead.
+        """
         self.approve_flow(["a", "b"])
         res = self.think(goal="다른 세션의 새 목표", step_number=1,
                          need_more_thinking=False, task_list=["hijack"])
-        self.assertEqual(res["plan_status"], "APPROVED")
-        self.assertEqual(res["tasks"][0]["title"], "a")
-        current = self.h.dispatch("get_current_plan", {"plan_id": "current"})
-        self.assertEqual(current["goal"], "Summarize the Q3 sales report.")
+        self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
+        blocked = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.assertEqual(blocked["error_code"], "PLAN_NOT_APPROVED")
 
     def test_separate_state_dirs_are_fully_isolated(self):
         other_dir = self.state_dir / "other"
@@ -544,6 +550,88 @@ class TestPersistence(HandlerTestCase):
         )
         res = h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
         self.assertTrue(res["ok"])
+
+
+# ===========================================================================
+# Stale approval (observed in the field: a morning approval unlocked afternoon work)
+# ===========================================================================
+
+
+class TestStaleApproval(HandlerTestCase):
+    def approved_plan_aged(self, hours: float, goal="오전 작업: 로그 정리"):
+        """Drive a plan to APPROVED, then backdate it as if it were left overnight."""
+        self.think(goal=goal, need_more_thinking=False, task_list=["오전 A", "오전 B"])
+        self.h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
+        self.h.dispatch("request_user_approval", {"decision": "APPROVED"})
+        raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
+        pid = raw["active_plan_id"]
+        old = (
+            datetime.datetime.now().astimezone() - datetime.timedelta(hours=hours)
+        ).replace(microsecond=0).isoformat()
+        raw["plans"][pid]["updated_at"] = old
+        raw["plans"][pid]["approval"]["decided_at"] = old
+        (self.state_dir / "plan_state.json").write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+        return pid
+
+    def test_stale_approval_does_not_unlock_execution(self):
+        self.approved_plan_aged(hours=5)
+        res = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "APPROVAL_EXPIRED")
+        self.assertEqual(res["next_action"], "CALL_REQUEST_USER_APPROVAL")
+        audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
+        self.assertIn("approval_expired", audit)
+
+    def test_stale_approval_does_not_short_circuit_ask_user(self):
+        """The field symptom: ASK_USER returned 'already approved' and never paused."""
+        self.approved_plan_aged(hours=5)
+        res = self.h.dispatch(
+            "request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"}
+        )
+        self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
+        self.assertEqual(res["next_action"], "STOP_AND_WAIT_FOR_USER")
+        self.assertNotIn("already approved", (res.get("message") or "").lower())
+
+    def test_fresh_approval_still_works(self):
+        """The TTL must not break a plan being executed right now."""
+        self.approve_flow(["a", "b"])
+        res = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["plan_status"], "IN_EXECUTION")
+
+    def test_new_goal_does_not_inherit_an_approved_plan(self):
+        """A different goal must never be redirected onto an approved plan."""
+        self.approve_flow(["오전 A", "오전 B"])
+        res = self.think(
+            goal="오후 작업: 배포 스크립트 실행", step_number=1,
+            need_more_thinking=False, task_list=["배포 스크립트 실행"],
+        )
+        self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
+        self.assertEqual([t["title"] for t in res["tasks"]], ["배포 스크립트 실행"])
+        blocked = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.assertEqual(blocked["error_code"], "PLAN_NOT_APPROVED")
+        audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
+        self.assertIn("plan_superseded_by_new_goal", audit)
+
+    def test_same_goal_mid_execution_still_redirects(self):
+        """The original leniency must survive: same goal, plan in flight -> redirect."""
+        self.approve_flow(["a", "b"])
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        res = self.think(step_number=1, need_more_thinking=False, task_list=["완전히 새 목록"])
+        self.assertEqual(res["plan_status"], "IN_EXECUTION")
+        self.assertEqual(res["tasks"][0]["title"], "a")
+
+    def test_unparseable_timestamp_is_treated_as_expired(self):
+        self.approve_flow(["a"])
+        raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
+        raw["plans"][raw["active_plan_id"]]["updated_at"] = "not-a-date"
+        (self.state_dir / "plan_state.json").write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+        res = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.assertEqual(res["error_code"], "APPROVAL_EXPIRED")
 
 
 # ===========================================================================

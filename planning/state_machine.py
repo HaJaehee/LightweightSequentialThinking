@@ -75,6 +75,13 @@ def _error_action(plan: Plan | None, code: ErrorCode) -> tuple[str, str]:
             "with decision='ASK_USER' and a plan_summary of the current plan, show it to "
             "the user, and wait for their answer. Do not reuse an old approval.",
         )
+    if code is ErrorCode.APPROVAL_EXPIRED:
+        return (
+            NextAction.CALL_REQUEST_USER_APPROVAL.value,
+            "This plan's approval has expired - it was approved a while ago and left "
+            "idle, so it no longer authorizes execution. Call request_user_approval "
+            "with decision='ASK_USER' and get the user to approve it again now.",
+        )
     if code is ErrorCode.INVALID_STATUS:
         return (
             NextAction.CALL_UPDATE_TASK_PROGRESS.value,
