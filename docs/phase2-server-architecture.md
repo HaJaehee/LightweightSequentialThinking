@@ -144,9 +144,18 @@ mutate in memory  →  validate invariants  →  write state/plan_state.json.tmp
 file intact rather than a truncated one. The audit log is written **after** the state file: a
 duplicated audit line is harmless, a lost state write is not.
 
-On startup: if `plan_state.json` is missing → start empty. If it is present but unparseable →
-rename it to `plan_state.corrupt.<timestamp>.json`, start empty, and log to stderr. **Never
-crash on startup** — a server that fails to launch gives AnythingLLM no tools at all, and the
+**A write that does not land is never reported as success (1.8.1).** `save()` used to log an
+`OSError` and return, so the handler happily replied `ok: true` for a mutation the disk never
+received — the model would then execute a plan the server has no record of. It now raises
+`StoreWriteError`, which dispatch turns into `INTERNAL_ERROR` plus a resync hint. The approval
+store propagates the same way: a request that could not be persisted returns no id, so
+`open_request` yields `None` and the handler emits the loud "NOT hard-paused" warning instead
+of pretending the gate is armed.
+
+On startup: if `plan_state.json` is missing → start empty. If it is present but unparseable —
+**or valid JSON of the wrong shape**, which previously raised on every single call and left the
+server permanently stuck on `INTERNAL_ERROR` — rename it to `plan_state.corrupt.<timestamp>.json`,
+start empty, and log to stderr. **Never crash on startup** — a server that fails to launch gives AnythingLLM no tools at all, and the
 model silently reverts to answering from memory, which is the exact failure this project exists
 to prevent.
 
@@ -337,7 +346,9 @@ new plans are refused rather than silently piling up.
 
 Approval is a **queue**, not a slot: two sessions waiting at once both appear on the page,
 each with its own buttons. Publishing for a plan replaces that plan's earlier entry (the
-plan was revised) and never another plan's.
+plan was revised) and never another plan's. A plan's entry is withdrawn as soon as the plan
+is settled — approved, rejected, revised or completed — because a request whose buttons would
+be ignored on the fingerprint check is worse than no request at all.
 
 Two places had to stop resolving "the active plan": after a blocking wait the handler
 re-reads *its own* plan by id (resolving generically would pick up a concurrent session's

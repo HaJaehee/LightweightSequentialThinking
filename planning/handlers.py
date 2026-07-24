@@ -105,27 +105,35 @@ class PlanningHandlers:
         payload = plan.goal + "\x00" + "\x00".join(t.title for t in plan.tasks)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
-    @staticmethod
-    def _mutate_approved(plan: Plan, comment: str | None) -> None:
+    def _withdraw_approval_request(self, plan: Plan) -> None:
+        """Take a plan's request off the page once it has been settled."""
+        if self.approval_ui is not None:
+            try:
+                self.approval_ui.drop_for_plan(plan.plan_id)
+            except Exception:  # noqa: BLE001 - never fail a call over UI housekeeping
+                log.debug("Could not withdraw the approval request for %s", plan.plan_id)
+
+    def _mutate_approved(self, plan: Plan, comment: str | None) -> None:
         plan.approval.decision = Decision.APPROVED.value
         plan.approval.decided_at = now_iso()
         if comment:
             plan.approval.user_comment = comment
         plan.set_status(PlanStatus.APPROVED)
+        self._withdraw_approval_request(plan)
 
-    @staticmethod
-    def _mutate_rejected(plan: Plan, comment: str | None) -> None:
+    def _mutate_rejected(self, plan: Plan, comment: str | None) -> None:
         plan.approval.decision = Decision.REJECTED.value
         plan.approval.decided_at = now_iso()
         plan.approval.user_comment = comment or ""
         plan.set_status(PlanStatus.CANCELLED)
+        self._withdraw_approval_request(plan)
 
-    @staticmethod
-    def _mutate_revise(plan: Plan, comment: str | None) -> None:
+    def _mutate_revise(self, plan: Plan, comment: str | None) -> None:
         plan.approval.revision_count += 1
         plan.approval.user_comment = comment or ""
         plan.approval.reset_request()
         plan.set_status(PlanStatus.DRAFTING)
+        self._withdraw_approval_request(plan)
 
     def _apply_late_decision(self) -> None:
         """Honour a decision the human made after the tool call had already returned.
@@ -901,6 +909,7 @@ class PlanningHandlers:
 
         if plan.all_done():
             plan.set_status(PlanStatus.COMPLETED)
+            self._withdraw_approval_request(plan)
         else:
             plan.set_status(PlanStatus.IN_EXECUTION)
         self.store.save(state)

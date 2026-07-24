@@ -80,7 +80,12 @@ class ApprovalStore:
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return {}
 
-    def _write(self, record: dict[str, Any]) -> None:
+    def _write(self, record: dict[str, Any]) -> bool:
+        """Returns whether the record actually reached disk.
+
+        Callers must propagate a False: a request that was never persisted cannot be
+        answered by anyone, so reporting success would leave the gate silently disarmed.
+        """
         tmp = self.path.with_suffix(".json.tmp")
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -88,8 +93,14 @@ class ApprovalStore:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)
+            return True
         except OSError as exc:
             log.error("Could not persist approval state: %s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
 
     # ---- operations ---------------------------------------------------
     def _requests(self, record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -102,8 +113,8 @@ class ApprovalStore:
         display: str,
         tasks: list[dict[str, Any]],
         fingerprint: str,
-    ) -> str:
-        """Queue a request for the human. Returns its id.
+    ) -> str | None:
+        """Queue a request for the human. Returns its id, or None if it could not be saved.
 
         Concurrent sessions each get their own entry: one queue slot per plan would make
         two sessions asking at once hide each other. A new request for the SAME plan
@@ -127,10 +138,10 @@ class ApprovalStore:
             record = self.read()
             queue = [r for r in self._requests(record) if r.get("plan_id") != plan_id]
             queue.append(entry)
-            self._write({"requests": queue})
+            written = self._write({"requests": queue})
         if not got:
             log.warning("Published an approval request without the write lock")
-        return request_id
+        return request_id if written else None
 
     def record_decision(self, request_id: str, decision: str, comment: str) -> bool:
         """Called by the page, for one specific queued request."""
@@ -144,8 +155,9 @@ class ApprovalStore:
                     entry["decision"] = decision
                     entry["comment"] = comment or ""
                     entry["decided_at"] = time.time()
-                    self._write({"requests": queue})
-                    return True
+                    # If this cannot be saved the click did nothing; say so rather than
+                    # letting the page claim the decision was recorded.
+                    return self._write({"requests": queue})
             return False
 
     def peek(self) -> list[dict[str, Any]]:
@@ -190,6 +202,19 @@ class ApprovalStore:
             return entry["decision"], entry.get("comment", "")
 
         return self._take(match)
+
+    def drop_for_plan(self, plan_id: str) -> None:
+        """Withdraw a plan's request once the plan is settled.
+
+        A cancelled or finished plan that keeps asking for approval is worse than
+        useless: the human sees a live-looking request whose buttons do nothing, because
+        the decision would be discarded on the fingerprint check anyway.
+        """
+        with exclusive(self.lock_path):
+            queue = self._requests(self.read())
+            remaining = [r for r in queue if r.get("plan_id") != plan_id]
+            if len(remaining) != len(queue):
+                self._write({"requests": remaining})
 
     def clear(self) -> None:
         with exclusive(self.lock_path):
@@ -446,6 +471,9 @@ class ApprovalServer:
 
     def take_decision(self, plan_id: str, fingerprint: str) -> tuple[str, str] | None:
         return self.store.claim_for_plan(plan_id, fingerprint)
+
+    def drop_for_plan(self, plan_id: str) -> None:
+        self.store.drop_for_plan(plan_id)
 
     def _surface(self) -> None:
         log.warning("HUMAN APPROVAL NEEDED -> %s", self.url)

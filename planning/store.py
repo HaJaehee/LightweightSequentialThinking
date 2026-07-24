@@ -31,6 +31,10 @@ TXN_LOCK_FILENAME = ".txnlock"
 TXN_LOCK_TIMEOUT = 20.0
 
 
+class StoreWriteError(OSError):
+    """Raised when a mutation could not be persisted, so callers never report success."""
+
+
 class State:
     """In-memory view of the whole state file."""
 
@@ -92,6 +96,7 @@ class State:
                 plans[pid] = Plan.from_dict(praw)
             except Exception:  # one bad plan must not take down the whole file
                 log.warning("Dropping unreadable plan %s", pid)
+                continue
         return cls(active_plan_id=raw.get("active_plan_id"), plans=plans)
 
 
@@ -207,7 +212,14 @@ class Store:
         if not isinstance(raw, dict):
             self._quarantine(path, ValueError("state file root is not an object"))
             return State()
-        return State.from_dict(raw)
+        try:
+            return State.from_dict(raw)
+        except Exception as exc:  # noqa: BLE001
+            # Valid JSON of the wrong shape used to raise on every single call, leaving
+            # the server permanently stuck on INTERNAL_ERROR. Quarantine it like any
+            # other unusable file and carry on.
+            self._quarantine(path, exc)
+            return State()
 
     def _quarantine(self, path: Path, exc: Exception) -> None:
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -230,8 +242,15 @@ class Store:
                 os.fsync(fh.fileno())
             os.replace(tmp, self.state_path)  # atomic on NTFS
         except OSError as exc:
-            # Losing a write is bad, but dying is worse - report and keep serving.
+            # Swallowing this used to return ok:true for a mutation that never reached
+            # disk - the model would go on executing a plan the server has no record of.
+            # Raise instead: dispatch turns it into INTERNAL_ERROR with a resync hint.
             log.error("Failed to persist state: %s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise StoreWriteError(f"could not persist plan state: {exc}") from exc
 
     def _prune(self, state: State) -> None:
         """Keep the newest `max_plans`. The active plan is never pruned."""

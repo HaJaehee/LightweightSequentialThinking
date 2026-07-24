@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import urllib.request
+from unittest import mock
 import tempfile
 import unittest
 from pathlib import Path
@@ -734,6 +735,10 @@ class FakeApprovalUI:
         self.live = None
         return r["decision"], r.get("comment", "")
 
+    def drop_for_plan(self, plan_id):
+        if self.live is not None and self.live["plan_id"] == plan_id:
+            self.live = None
+
 
 class RecordingNotifier:
     def __init__(self):
@@ -1261,6 +1266,148 @@ class TestApprovalQueueEdges(HandlerTestCase):
         self.assertEqual(s.peek(), [])
         s.publish("p", "g", "d", [], "fp")
         self.assertEqual(len(s.peek()), 1)
+
+
+class TestStoreFailureEdges(HandlerTestCase):
+    def test_failed_save_is_not_reported_as_success(self):
+        """A write that never landed must not come back as ok:true."""
+        self.think(need_more_thinking=False, task_list=["a"])
+        with mock.patch("planning.store.os.replace", side_effect=OSError("disk full")):
+            res = self.think(goal="새 목표", need_more_thinking=False, task_list=["b"])
+        self.assertFalse(res["ok"], "a lost write was reported as success")
+        self.assertEqual(res["error_code"], "INTERNAL_ERROR")
+        self.assertEqual(res["next_action"], "CALL_GET_CURRENT_PLAN")
+
+    def test_state_survives_a_failed_save(self):
+        first = self.think(need_more_thinking=False, task_list=["a"])
+        with mock.patch("planning.store.os.replace", side_effect=OSError("disk full")):
+            self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        res = self.h.dispatch("get_current_plan", {"plan_id": "current"})
+        self.assertEqual(res["plan_id"], first["plan_id"])
+        self.assertTrue(res["ok"])
+
+    def test_structurally_wrong_state_file_is_quarantined(self):
+        """Valid JSON of the wrong shape must not wedge every future call."""
+        self.think(need_more_thinking=False, task_list=["a"])
+        (self.state_dir / "plan_state.json").write_text(
+            json.dumps({"schema_version": 1, "plans": [{"plan_id": "x"}]}), encoding="utf-8")
+        fresh = PlanningHandlers(Store(self.state_dir), self.config)
+        res = fresh.dispatch("get_current_plan", {"plan_id": "current"})
+        self.assertTrue(res["ok"], res.get("error_code"))
+        self.assertEqual(res["plan_status"], "NONE")
+        self.assertTrue(list(self.state_dir.glob("plan_state.corrupt.*.json")))
+
+    def test_plans_entry_that_is_not_a_mapping(self):
+        self.think(need_more_thinking=False, task_list=["a"])
+        raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
+        raw["plans"]["broken"] = "not a plan"
+        (self.state_dir / "plan_state.json").write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        fresh = PlanningHandlers(Store(self.state_dir), self.config)
+        res = fresh.dispatch("get_current_plan", {"plan_id": "current"})
+        self.assertTrue(res["ok"], res.get("error_code"))
+
+    def test_audit_failure_does_not_break_the_call(self):
+        with mock.patch("builtins.open", side_effect=OSError("nope")):
+            self.h.store.audit("something", plan_id="x")  # must not raise
+
+
+class TestApprovalStoreFailureEdges(HandlerTestCase):
+    def test_publish_that_cannot_persist_reports_failure(self):
+        s = ApprovalStore(self.state_dir / "ap1")
+        # Patch the approval store's own write, not os.replace: os is a shared module,
+        # so patching it there would also break the plan store and test the wrong thing.
+        with mock.patch.object(ApprovalStore, "_write", return_value=False):
+            request_id = s.publish("p", "g", "d", [], "fp")
+        self.assertIsNone(request_id, "publish must not claim success it did not achieve")
+
+    def test_blocking_degrades_loudly_when_the_queue_cannot_be_written(self):
+        ui = ApprovalServer(ApprovalStore(self.state_dir / "ap2"), port=8799,
+                            open_browser=False)
+        h = PlanningHandlers(
+            Store(self.state_dir),
+            Config(state_dir=self.state_dir, blocking_approval=True, approval_timeout=1),
+            approval_ui=ui,
+        )
+        try:
+            h.dispatch("plan_and_think", {"goal": "g", "thought": "t", "step_number": 1,
+                                          "total_steps": 1, "need_more_thinking": False,
+                                          "task_list": ["a"]})
+            with mock.patch.object(ApprovalStore, "_write", return_value=False):
+                res = h.dispatch("request_user_approval",
+                                 {"decision": "ASK_USER", "plan_summary": "s"})
+            self.assertTrue(
+                any("NOT hard-paused" in n for n in res.get("input_notes", [])),
+                f"degradation must be visible, got {res.get('input_notes')}",
+            )
+        finally:
+            ui.shutdown()
+
+    def test_decision_that_cannot_persist_reports_failure(self):
+        s = ApprovalStore(self.state_dir / "ap3")
+        rid = s.publish("p", "g", "d", [], "fp")
+        with mock.patch.object(ApprovalStore, "_write", return_value=False):
+            self.assertFalse(s.record_decision(rid, "APPROVED", ""))
+
+    def test_only_one_claimer_wins_a_decision(self):
+        s = ApprovalStore(self.state_dir / "ap4")
+        rid = s.publish("p", "g", "d", [], "fp")
+        s.record_decision(rid, "APPROVED", "ok")
+        winners: list[tuple] = []
+
+        def claim():
+            got = s.claim(rid)
+            if got:
+                winners.append(got)
+
+        threads = [threading.Thread(target=claim) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        self.assertEqual(len(winners), 1, f"decision consumed {len(winners)} times")
+
+    def test_concurrent_publishes_all_survive(self):
+        s = ApprovalStore(self.state_dir / "ap5")
+        def pub(i):
+            s.publish(f"plan_{i}", f"g{i}", "d", [], f"fp{i}")
+        threads = [threading.Thread(target=pub, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        self.assertEqual(len(s.peek()), 6, "a concurrent publish was lost")
+
+    def test_entry_is_dropped_when_its_plan_is_cancelled(self):
+        """A dead plan must not keep asking the human for approval."""
+        ui = FakeApprovalUI(decision=None)
+        h = self.blocking_handlers(ui)
+        h.dispatch("plan_and_think", {"goal": "g", "thought": "t", "step_number": 1,
+                                      "total_steps": 1, "need_more_thinking": False,
+                                      "task_list": ["a"]})
+        h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
+        self.assertIsNotNone(ui.live)
+        h.dispatch("request_user_approval", {"decision": "REJECTED", "user_comment": "no"})
+        self.assertIsNone(ui.live, "a cancelled plan left a stale approval on the page")
+
+    def test_entry_is_dropped_when_its_plan_completes(self):
+        ui = FakeApprovalUI(decision=None)
+        h = self.blocking_handlers(ui)
+        h.dispatch("plan_and_think", {"goal": "g", "thought": "t", "step_number": 1,
+                                      "total_steps": 1, "need_more_thinking": False,
+                                      "task_list": ["a"]})
+        h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
+        h.dispatch("request_user_approval", {"decision": "APPROVED"})
+        h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        h.dispatch("update_task_progress", {"task_id": 1, "status": "DONE"})
+        self.assertIsNone(ui.live, "a finished plan left a stale approval on the page")
+
+    def blocking_handlers(self, ui):
+        return PlanningHandlers(
+            Store(self.state_dir),
+            Config(state_dir=self.state_dir, blocking_approval=True, approval_timeout=1),
+            approval_ui=ui,
+        )
 
 
 class TestPlanStateEdges(HandlerTestCase):
