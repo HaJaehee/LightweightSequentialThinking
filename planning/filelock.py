@@ -22,11 +22,19 @@ log = logging.getLogger("planning-mcp.filelock")
 
 DEFAULT_TIMEOUT = 20.0
 
+# Non-blocking attempts plus our own retry loop, deliberately.
+# msvcrt.locking(LK_LOCK) blocks internally for ~10 seconds before it gives up, which
+# made the timeout argument here meaningless and stalled any contended caller for ten
+# seconds even when the holder released immediately.
 if os.name == "nt":
     import msvcrt
 
-    def _acquire(fh) -> None:
-        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+    def _try_acquire(fh) -> bool:
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
 
     def _release(fh) -> None:
         msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
@@ -34,8 +42,12 @@ if os.name == "nt":
 else:
     import fcntl
 
-    def _acquire(fh) -> None:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    def _try_acquire(fh) -> bool:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
 
     def _release(fh) -> None:
         fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
@@ -54,25 +66,36 @@ def exclusive(path: Path, timeout: float = DEFAULT_TIMEOUT) -> Iterator[bool]:
         try:
             fh = open(path, "a+b")
         except OSError as exc:
-            log.warning("Cannot open lock file %s (%s); proceeding unserialized", path, exc)
-            yield False
-            return
-        try:
-            _acquire(fh)
-            break
-        except OSError:
-            fh.close()
-            fh = None
+            # A peer holding the file can make the open itself fail on Windows, which is
+            # transient and worth retrying. A missing directory never becomes writable by
+            # waiting, so that must fail immediately instead of burning the whole timeout.
+            if not path.parent.is_dir():
+                log.warning("Lock directory %s does not exist; proceeding unserialized",
+                            path.parent)
+                yield False
+                return
             if time.monotonic() >= deadline:
-                log.error(
-                    "Could not take %s within %.0fs; proceeding UNSERIALIZED - another "
-                    "planning-mcp instance may be using this state directory",
-                    path.name,
-                    timeout,
+                log.warning(
+                    "Cannot open lock file %s (%s); proceeding unserialized", path, exc
                 )
                 yield False
                 return
             time.sleep(0.05)
+            continue
+        if _try_acquire(fh):
+            break
+        fh.close()
+        fh = None
+        if time.monotonic() >= deadline:
+            log.error(
+                "Could not take %s within %.1fs; proceeding UNSERIALIZED - another "
+                "planning-mcp instance may be using this state directory",
+                path.name,
+                timeout,
+            )
+            yield False
+            return
+        time.sleep(0.05)
     try:
         yield True
     finally:

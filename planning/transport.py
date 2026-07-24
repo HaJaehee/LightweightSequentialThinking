@@ -122,6 +122,32 @@ class _SseSessions:
             self.queues.pop(session_id, None)
 
 
+class _SseNotifier:
+    """Fans server-initiated notifications out to every open SSE stream.
+
+    Progress heartbeats are what keep a client's request timer alive during a blocking
+    approval, so SSE needs them just as much as stdio does.
+    """
+
+    def __init__(self, sessions: "_SseSessions"):
+        self._sessions = sessions
+
+    def send_obj(self, payload: Any) -> None:
+        with self._sessions.lock:
+            queues = list(self._sessions.queues.values())
+        for q in queues:
+            q.put(payload)
+
+    def send(self, method: str, params: dict[str, Any]) -> None:
+        self.send_obj({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def progress(self, token: Any, progress: float, message: str | None = None) -> None:
+        params: dict[str, Any] = {"progressToken": token, "progress": progress}
+        if message:
+            params["message"] = message
+        self.send("notifications/progress", params)
+
+
 def _make_handler(protocol: McpProtocol, sessions: _SseSessions):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -197,13 +223,21 @@ def _make_handler(protocol: McpProtocol, sessions: _SseSessions):
                 self.send_error(400, "Malformed JSON")
                 return
 
-            response = protocol.handle_message(msg)
+            # Acknowledge FIRST, then work. A blocking approval occupies the handler
+            # for as long as the human takes; doing it before the 202 left the POST
+            # hanging until the client gave up. The result reaches the client over the
+            # SSE stream, which is what that stream is for.
             self.send_response(202)
             self._cors()
             self.send_header("Content-Length", "0")
             self.end_headers()
-            if response is not None:
-                q.put(response)
+
+            def work() -> None:
+                response = protocol.handle_message(msg)
+                if response is not None:
+                    q.put(response)
+
+            threading.Thread(target=work, daemon=True).start()
 
     return Handler
 
@@ -214,6 +248,9 @@ def serve_sse(protocol: McpProtocol, host: str = "127.0.0.1", port: int = 8931) 
         log.warning("Refusing to bind %s; falling back to 127.0.0.1", host)
         host = "127.0.0.1"
     sessions = _SseSessions()
+    # Without this, a blocking approval cannot send progress heartbeats over SSE and the
+    # wait silently falls back to the short no-token ceiling.
+    protocol.notifier = _SseNotifier(sessions)
     httpd = ThreadingHTTPServer((host, port), _make_handler(protocol, sessions))
     log.info("planning-mcp listening on http://%s:%d/sse", host, port)
     try:

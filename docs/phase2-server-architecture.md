@@ -38,6 +38,13 @@ important on a locked-down corporate laptop. AnythingLLM spawns and owns the lif
 outlive AnythingLLM restarts or to be shared by several workspaces. Same handlers, different
 entry point; selected by `--transport sse`. Bind to loopback only — never `0.0.0.0`.
 
+> Two SSE-only defects, found once the transport got its own smoke test (1.8.1). The POST
+> handler ran `handle_message` *before* replying 202, so a blocking approval left the POST
+> hanging until the client gave up — it now acknowledges first and answers over the stream,
+> which is what the stream is for. And no notifier was wired for SSE, so progress
+> heartbeats were silently unavailable and every approval fell back to the short
+> no-token ceiling; `_SseNotifier` fans them out to the open streams.
+
 ### Suggested file layout
 
 ```

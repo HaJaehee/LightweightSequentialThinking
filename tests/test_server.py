@@ -27,6 +27,7 @@ logging.disable(logging.CRITICAL)
 
 from planning.approval import ApprovalServer, ApprovalStore  # noqa: E402
 from planning.config import SDK_REQUEST_TIMEOUT_SEC, Config  # noqa: E402
+from planning.filelock import exclusive  # noqa: E402
 from planning.handlers import PlanningHandlers  # noqa: E402
 from planning.leniency import normalize  # noqa: E402
 from planning.protocol import McpProtocol  # noqa: E402
@@ -1382,6 +1383,145 @@ class TestProtocol(HandlerTestCase):
     def test_unknown_method(self):
         res = self.p.handle_message({"jsonrpc": "2.0", "id": 6, "method": "nope/nope"})
         self.assertEqual(res["error"]["code"], -32601)
+
+    # ---- malformed / hostile input -------------------------------------
+    def test_tools_call_without_params(self):
+        res = self.p.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call"})
+        payload = json.loads(res["result"]["content"][0]["text"])
+        self.assertFalse(payload["ok"])
+        self.assertIn("next_action", payload)
+
+    def test_arguments_of_the_wrong_shape(self):
+        for bad in ([1, 2, 3], "plain text", 42, None, True):
+            res = self.p.handle_message({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "get_current_plan", "arguments": bad}})
+            self.assertIn("result", res, f"arguments={bad!r} produced no result")
+            payload = json.loads(res["result"]["content"][0]["text"])
+            for field in REQUIRED_FIELDS:
+                self.assertIn(field, payload)
+
+    def test_message_that_is_not_an_object(self):
+        for bad in ("string", 5, None, True):
+            res = self.p.handle_message(bad)
+            self.assertEqual(res["error"]["code"], -32600)
+
+    def test_batch_request_returns_a_batch(self):
+        res = self.p.handle_message([
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        ])
+        self.assertIsInstance(res, list)
+        self.assertEqual(sorted(r["id"] for r in res), [1, 2])  # the notification is silent
+
+    def test_batch_of_only_notifications_is_silent(self):
+        self.assertIsNone(self.p.handle_message([
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        ]))
+
+    def test_null_id_is_still_answered(self):
+        res = self.p.handle_message({"jsonrpc": "2.0", "id": None, "method": "ping"})
+        self.assertIsNotNone(res)
+        self.assertIsNone(res["id"])
+
+    def test_unknown_notification_is_ignored(self):
+        self.assertIsNone(self.p.handle_message({"jsonrpc": "2.0", "method": "nope/nope"}))
+
+    def test_unparseable_string_arguments(self):
+        res = self.p.handle_message({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "get_current_plan", "arguments": "{not json"}})
+        payload = json.loads(res["result"]["content"][0]["text"])
+        self.assertIn("next_action", payload)
+
+    def test_oversized_payload_is_survivable(self):
+        huge = "가" * 200_000
+        res = self.p.handle_message({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "plan_and_think", "arguments": {
+                "goal": huge, "thought": huge, "step_number": 1, "total_steps": 1,
+                "need_more_thinking": True}}})
+        payload = json.loads(res["result"]["content"][0]["text"])
+        self.assertTrue(payload["ok"])
+        # And the state file must still be readable afterwards.
+        again = self.h.dispatch("get_current_plan", {"plan_id": "current"})
+        self.assertTrue(again["ok"])
+
+    def test_progress_token_is_forwarded(self):
+        seen = {}
+
+        class Spy:
+            def dispatch(self, name, args, progress_token=None, notifier=None):
+                seen["token"] = progress_token
+                return {"ok": True, "plan_status": "NONE", "next_action": "ANSWER_USER",
+                        "next_action_hint": "-"}
+
+        p = McpProtocol(Spy(), TOOL_DEFINITIONS, "x", "1")
+        p.handle_message({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                          "params": {"name": "get_current_plan", "arguments": {},
+                                     "_meta": {"progressToken": "tok-9"}}})
+        self.assertEqual(seen["token"], "tok-9")
+
+
+class TestFileLockEdges(HandlerTestCase):
+    def test_lock_is_exclusive_and_released(self):
+        path = self.state_dir / "l1"
+        with exclusive(path) as got:
+            self.assertTrue(got)
+        with exclusive(path) as got:  # must be reusable after release
+            self.assertTrue(got)
+
+    def test_timeout_yields_false_rather_than_raising(self):
+        """A contended lock must degrade loudly, never wedge the user's call."""
+        path = self.state_dir / "l2"
+        holder_in = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with exclusive(path):
+                holder_in.set()
+                release.wait(20)
+
+        t = threading.Thread(target=holder, daemon=True)
+        t.start()
+        try:
+            self.assertTrue(holder_in.wait(5))
+            started = time.monotonic()
+            with exclusive(path, timeout=0.5) as got:
+                self.assertFalse(got, "should report that it gave up")
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 3, "must honour its own timeout, not the OS default")
+        finally:
+            release.set()
+            t.join(timeout=10)
+
+    def test_contention_clears_quickly_once_released(self):
+        """A brief holder must not stall the next caller for seconds."""
+        path = self.state_dir / "l3"
+        holder_in = threading.Event()
+
+        def holder():
+            with exclusive(path):
+                holder_in.set()
+                time.sleep(0.3)
+
+        t = threading.Thread(target=holder, daemon=True)
+        t.start()
+        try:
+            self.assertTrue(holder_in.wait(5))
+            started = time.monotonic()
+            with exclusive(path, timeout=10) as got:
+                elapsed = time.monotonic() - started
+                self.assertTrue(got)
+            self.assertLess(elapsed, 2.0, f"waited {elapsed:.1f}s for a 0.3s holder")
+        finally:
+            t.join(timeout=10)
+
+    def test_unwritable_lock_path_degrades(self):
+        missing = self.state_dir / "no" / "such" / "dir" / "lock"
+        with exclusive(missing) as got:
+            self.assertFalse(got)
 
 
 if __name__ == "__main__":
