@@ -26,12 +26,22 @@ PARSE_ERROR = -32700
 
 
 class McpProtocol:
-    def __init__(self, handlers: Any, tools: list[dict[str, Any]], name: str, version: str):
+    def __init__(
+        self,
+        handlers: Any,
+        tools: list[dict[str, Any]],
+        name: str,
+        version: str,
+        notifier: Any = None,
+    ):
         self.handlers = handlers
         self.tools = tools
         self.name = name
         self.version = version
         self.tool_names = {t["name"] for t in tools}
+        # Set by the transport once it owns the output stream. Lets a blocking handler
+        # emit progress heartbeats that keep the client's request timer alive.
+        self.notifier = notifier
 
     # ---- JSON-RPC plumbing ---------------------------------------------
     @staticmethod
@@ -125,7 +135,16 @@ class McpProtocol:
                 ),
             }
         else:
-            payload = self.handlers.dispatch(name, arguments)
+            # MCP only permits progress notifications for a request that supplied a
+            # token. Its presence decides whether a blocking handler may wait past the
+            # client's 60s request timeout.
+            meta = params.get("_meta") or {}
+            payload = self.handlers.dispatch(
+                name,
+                arguments,
+                progress_token=meta.get("progressToken"),
+                notifier=self.notifier,
+            )
 
         text = json.dumps(payload, ensure_ascii=False, indent=2)
         return {"content": [{"type": "text", "text": text}], "isError": False}

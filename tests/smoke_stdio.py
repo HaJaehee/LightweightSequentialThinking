@@ -12,6 +12,7 @@ the model would actually receive.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,9 @@ class Client:
             text=True,
             encoding="utf-8",
             cwd=str(tempfile.gettempdir()),  # prove the state dir does not depend on CWD
+            # This script drives the two-phase approval protocol; blocking approval
+            # waits for a human and is covered by the unit suite instead.
+            env=dict(os.environ, PLANNING_MCP_BLOCKING_APPROVAL="false", PYTHONUTF8="1"),
         )
         self._id = 0
 

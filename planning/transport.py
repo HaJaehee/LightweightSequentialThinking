@@ -27,12 +27,43 @@ log = logging.getLogger("planning-mcp.transport")
 # ---------------------------------------------------------------------------
 
 
+class StdioNotifier:
+    """Thread-safe sender for server-initiated notifications.
+
+    Needed because a blocking approval must emit `notifications/progress` heartbeats
+    from a side thread while the main stdio loop sits inside a tool handler. Writes are
+    serialized so a heartbeat can never interleave with a response frame.
+    """
+
+    def __init__(self, out) -> None:
+        self._out = out
+        self._lock = threading.Lock()
+
+    def send(self, method: str, params: dict[str, Any]) -> None:
+        frame = json.dumps(
+            {"jsonrpc": "2.0", "method": method, "params": params}, ensure_ascii=False
+        )
+        try:
+            with self._lock:
+                self._out.write(frame + "\n")
+                self._out.flush()
+        except (BrokenPipeError, ValueError):
+            pass  # client went away; the handler will unblock on its own timeout
+
+    def progress(self, token: Any, progress: float, message: str | None = None) -> None:
+        params: dict[str, Any] = {"progressToken": token, "progress": progress}
+        if message:
+            params["message"] = message
+        self.send("notifications/progress", params)
+
+
 def serve_stdio(protocol: McpProtocol) -> None:
     """Newline-delimited JSON-RPC over stdin/stdout."""
     out = sys.stdout
     # Hard guarantee: stdout belongs to the protocol. Any stray print() anywhere in the
     # process goes to stderr instead of corrupting the JSON-RPC stream.
     sys.stdout = sys.stderr
+    protocol.notifier = StdioNotifier(out)
 
     log.info("planning-mcp listening on stdio")
     try:

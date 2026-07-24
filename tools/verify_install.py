@@ -238,6 +238,7 @@ def main() -> int:
     print("\nTests")
     run_child("Unit suite", ["-m", "unittest", "discover", "-s", "tests"])
     run_child("stdio end-to-end smoke test", ["tests/smoke_stdio.py"])
+    run_child("blocking-approval smoke test", ["tests/smoke_blocking_approval.py"])
 
     failures = [label for label, ok, _ in _results if not ok]
     print("\n" + "=" * 68)

@@ -53,6 +53,17 @@ def main(argv: list[str] | None = None) -> int:
             "PLANNING_MCP_AUTOAPPROVE=true - the human approval gate is BYPASSED. "
             "This is a test-only setting; turn it off before real use."
         )
+    if config.blocking_approval:
+        log.info(
+            "Blocking approval ON - request_user_approval(ASK_USER) holds the tool call "
+            "open (agent loop paused) until you decide at http://127.0.0.1:%d/",
+            config.approval_port,
+        )
+    else:
+        log.warning(
+            "PLANNING_MCP_BLOCKING_APPROVAL=false - the agent is only *asked* to stop and "
+            "wait. A weak model may ignore that and keep executing."
+        )
 
     protocol = build_protocol(config)
 

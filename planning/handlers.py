@@ -8,9 +8,11 @@ No handler raises; `dispatch` converts any escaping exception into a resync inst
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
-from .config import Config
+from .approval import ApprovalServer
+from .config import NO_PROGRESS_WAIT_CEILING_SEC, Config
 from .leniency import normalize
 from .models import (
     Approval,
@@ -31,21 +33,41 @@ log = logging.getLogger("planning-mcp.handlers")
 
 
 class PlanningHandlers:
-    def __init__(self, store: Store, config: Config):
+    def __init__(self, store: Store, config: Config, approval_ui: ApprovalServer | None = None):
         self.store = store
         self.config = config
+        if approval_ui is not None:
+            self.approval_ui = approval_ui
+        elif config.blocking_approval:
+            self.approval_ui = ApprovalServer(
+                port=config.approval_port, open_browser=config.approval_open_browser
+            )
+        else:
+            self.approval_ui = None
 
     # ------------------------------------------------------------------
     # Entry point
     # ------------------------------------------------------------------
-    def dispatch(self, tool_name: str, raw_args: Any) -> dict[str, Any]:
+    def dispatch(
+        self,
+        tool_name: str,
+        raw_args: Any,
+        progress_token: Any = None,
+        notifier: Any = None,
+    ) -> dict[str, Any]:
         clean, notes = normalize(tool_name, raw_args)
         try:
+            # The store lock is held for the whole call, including a blocking approval
+            # wait. That is deliberate: while a human is deciding, no other tool call
+            # may mutate plan state. The approval UI runs on its own thread and never
+            # touches the store, so it cannot deadlock against this lock.
             with self.store.lock:
                 if tool_name == "plan_and_think":
                     return self._plan_and_think(clean, notes)
                 if tool_name == "request_user_approval":
-                    return self._request_user_approval(clean, notes)
+                    return self._request_user_approval(
+                        clean, notes, progress_token=progress_token, notifier=notifier
+                    )
                 if tool_name == "update_task_progress":
                     return self._update_task_progress(clean, notes)
                 if tool_name == "get_current_plan":
@@ -242,7 +264,13 @@ class PlanningHandlers:
     # ------------------------------------------------------------------
     # 2. request_user_approval  (HITL gate)
     # ------------------------------------------------------------------
-    def _request_user_approval(self, args: dict[str, Any], notes: list[str]) -> dict[str, Any]:
+    def _request_user_approval(
+        self,
+        args: dict[str, Any],
+        notes: list[str],
+        progress_token: Any = None,
+        notifier: Any = None,
+    ) -> dict[str, Any]:
         state = self.store.load()
         plan = state.active_plan
 
@@ -261,7 +289,9 @@ class PlanningHandlers:
             return error(plan, ErrorCode.NO_ACTIVE_PLAN, "No plan exists yet.", notes=notes)
 
         if decision is Decision.ASK_USER:
-            return self._ask_user(state, plan, args, notes)
+            return self._ask_user(
+                state, plan, args, notes, progress_token=progress_token, notifier=notifier
+            )
         if decision is Decision.APPROVED:
             return self._approve(state, plan, args, notes)
         if decision is Decision.REVISE:
@@ -269,7 +299,13 @@ class PlanningHandlers:
         return self._reject(state, plan, args, notes)
 
     def _ask_user(
-        self, state: State, plan: Plan, args: dict[str, Any], notes: list[str]
+        self,
+        state: State,
+        plan: Plan,
+        args: dict[str, Any],
+        notes: list[str],
+        progress_token: Any = None,
+        notifier: Any = None,
     ) -> dict[str, Any]:
         if plan.status in (PlanStatus.APPROVED, PlanStatus.IN_EXECUTION):
             task = plan.current_task()
@@ -307,13 +343,122 @@ class PlanningHandlers:
         plan.set_status(PlanStatus.AWAITING_APPROVAL)
         self.store.save(state)
         self.store.audit("approval_requested", plan_id=plan.plan_id, plan_summary=plan_summary)
+        display = render_plan_for_user(plan, plan_summary)
+
+        if self.approval_ui is not None:
+            decided = self._wait_for_human(plan, display, progress_token, notifier, notes)
+            if decided is not None:
+                decision, comment = decided
+                # Reuse the already-tested transitions so the blocking path and the
+                # two-phase path can never diverge.
+                forwarded = {"user_comment": comment} if comment else {}
+                if decision == Decision.APPROVED.value:
+                    return self._approve(state, plan, forwarded, notes)
+                if decision == Decision.REJECTED.value:
+                    return self._reject(state, plan, forwarded, notes)
+                if decision == Decision.REVISE.value:
+                    return self._revise(state, plan, forwarded, notes)
+            notes.append(
+                "No human decision arrived before the wait expired. The plan is still "
+                "LOCKED. Show the plan to the user and stop; do not execute anything."
+            )
 
         return build(
             plan,
             tasks=plan.tasks_brief(),
             notes=notes,
-            display_to_user=render_plan_for_user(plan, plan_summary),
+            display_to_user=display,
         )
+
+    def _wait_for_human(
+        self,
+        plan: Plan,
+        display: str,
+        progress_token: Any,
+        notifier: Any,
+        notes: list[str],
+    ) -> tuple[str, str] | None:
+        """Block this tool call until a human decides. Returns None on timeout.
+
+        This is what actually stops the agent: AnythingLLM's loop waits synchronously
+        for the tool result, so while we do not return, the model cannot emit another
+        tool call - no matter what the system prompt failed to make it do.
+        """
+        can_heartbeat = progress_token is not None and notifier is not None
+        timeout = self.effective_timeout(can_heartbeat)
+
+        pending = self.approval_ui.open_request(
+            plan.plan_id, plan.goal, display, plan.tasks_brief()
+        )
+        if pending is None:
+            # Degrading quietly would remove the hard pause without anyone noticing -
+            # the worst possible failure for a safety gate. Make it audible instead.
+            log.error(
+                "APPROVAL UI UNAVAILABLE - the hard pause is OFF for this call. "
+                "The model is only *asked* to stop."
+            )
+            self.store.audit("approval_ui_unavailable", plan_id=plan.plan_id)
+            notes.append(
+                "WARNING: the approval UI could not start, so this plan was NOT hard-paused. "
+                "Do not execute anything. Show the plan to the user and stop."
+            )
+            return None
+
+        stop = threading.Event()
+        if can_heartbeat:
+            threading.Thread(
+                target=self._heartbeat,
+                args=(notifier, progress_token, stop),
+                name="approval-heartbeat",
+                daemon=True,
+            ).start()
+
+        log.warning(
+            "Blocking for human approval of %s at %s (timeout %ss, heartbeat %s)",
+            plan.plan_id,
+            self.approval_ui.url,
+            timeout,
+            "on" if can_heartbeat else "off - no progressToken from client",
+        )
+        try:
+            pending.wait(timeout)
+        finally:
+            stop.set()
+            self.approval_ui.close_request(pending)
+
+        if pending.decision is None:
+            self.store.audit("approval_wait_timeout", plan_id=plan.plan_id, timeout=timeout)
+            return None
+        self.store.audit(
+            "approval_decided_out_of_band",
+            plan_id=plan.plan_id,
+            decision=pending.decision,
+            comment=pending.comment,
+        )
+        return pending.decision, pending.comment
+
+    def effective_timeout(self, can_heartbeat: bool) -> int:
+        """How long we may hold the tool call open.
+
+        Without a progressToken we cannot legally send progress notifications, so the
+        wait has to finish inside the client's 60s request timeout. With one, the
+        heartbeat keeps resetting that timer and the configured timeout applies.
+        """
+        if can_heartbeat:
+            return self.config.approval_timeout
+        return min(self.config.approval_timeout, NO_PROGRESS_WAIT_CEILING_SEC)
+
+    @staticmethod
+    def _heartbeat(notifier: Any, token: Any, stop: threading.Event) -> None:
+        """Reset the client's request timer while a human thinks.
+
+        The MCP TS SDK resets its 60s timeout on every progress notification and sets no
+        maxTotalTimeout, so a steady heartbeat turns a bounded wait into an open one.
+        """
+        n = 0
+        while not stop.wait(20):
+            n += 1
+            notifier.progress(token, n, "Waiting for human approval...")
 
     def _approve(
         self, state: State, plan: Plan, args: dict[str, Any], notes: list[str]

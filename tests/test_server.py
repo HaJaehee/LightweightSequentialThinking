@@ -20,7 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # otherwise drown the test output. The tests assert on responses and the audit log instead.
 logging.disable(logging.CRITICAL)
 
-from planning.config import Config  # noqa: E402
+from planning.approval import ApprovalServer, PendingApproval  # noqa: E402
+from planning.config import SDK_REQUEST_TIMEOUT_SEC, Config  # noqa: E402
 from planning.handlers import PlanningHandlers  # noqa: E402
 from planning.leniency import normalize  # noqa: E402
 from planning.protocol import McpProtocol  # noqa: E402
@@ -36,7 +37,9 @@ class HandlerTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.state_dir = Path(self._tmp.name)
-        self.config = Config(state_dir=self.state_dir)
+        # Blocking approval is the production default; the unit suite drives the
+        # two-phase path, so it is disabled here and exercised in TestBlockingApproval.
+        self.config = Config(state_dir=self.state_dir, blocking_approval=False)
         self.store = Store(self.state_dir, max_plans=self.config.max_plans)
         self.h = PlanningHandlers(self.store, self.config)
 
@@ -432,7 +435,9 @@ class TestStateMachine(HandlerTestCase):
 
     def test_separate_state_dirs_are_fully_isolated(self):
         other_dir = self.state_dir / "other"
-        other = PlanningHandlers(Store(other_dir), Config(state_dir=other_dir))
+        other = PlanningHandlers(
+            Store(other_dir), Config(state_dir=other_dir, blocking_approval=False)
+        )
         self.think(goal="세션1 목표", need_more_thinking=False, task_list=["x"])
         res = other.dispatch("get_current_plan", {"plan_id": "current"})
         self.assertEqual(res["plan_status"], "NONE")
@@ -515,7 +520,7 @@ class TestPersistence(HandlerTestCase):
         self.assertLessEqual(len(res["tasks"][0]["result_log"]), 205)
 
     def test_plan_pruning_keeps_the_active_plan(self):
-        config = Config(state_dir=self.state_dir, max_plans=3)
+        config = Config(state_dir=self.state_dir, max_plans=3, blocking_approval=False)
         h = PlanningHandlers(Store(self.state_dir, max_plans=3), config)
         for i in range(6):
             h.dispatch(
@@ -530,7 +535,7 @@ class TestPersistence(HandlerTestCase):
         self.assertIn(raw["active_plan_id"], raw["plans"])
 
     def test_autoapprove_bypasses_the_gate(self):
-        config = Config(state_dir=self.state_dir, autoapprove=True)
+        config = Config(state_dir=self.state_dir, autoapprove=True, blocking_approval=False)
         h = PlanningHandlers(Store(self.state_dir), config)
         h.dispatch(
             "plan_and_think",
@@ -539,6 +544,200 @@ class TestPersistence(HandlerTestCase):
         )
         res = h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
         self.assertTrue(res["ok"])
+
+
+# ===========================================================================
+# Blocking approval (the real HITL pause)
+# ===========================================================================
+
+
+class FakeApprovalUI:
+    """Stands in for the localhost page. Resolves immediately, or never."""
+
+    url = "http://127.0.0.1:0/"
+
+    def __init__(self, decision=None, comment="", available=True):
+        self.decision = decision
+        self.comment = comment
+        self.available = available
+        self.opened: list[PendingApproval] = []
+        self.closed = 0
+
+    def open_request(self, plan_id, goal, display, tasks):
+        if not self.available:
+            return None
+        pending = PendingApproval(plan_id, goal, display, tasks)
+        self.opened.append(pending)
+        if self.decision:
+            pending.resolve(self.decision, self.comment)
+        return pending
+
+    def close_request(self, pending):
+        self.closed += 1
+
+
+class RecordingNotifier:
+    def __init__(self):
+        self.sent = []
+
+    def progress(self, token, progress, message=None):
+        self.sent.append((token, progress, message))
+
+
+class TestBlockingApproval(HandlerTestCase):
+    def blocking(self, ui, timeout=1):
+        cfg = Config(
+            state_dir=self.state_dir, blocking_approval=True, approval_timeout=timeout
+        )
+        return PlanningHandlers(Store(self.state_dir), cfg, approval_ui=ui)
+
+    def draft(self, h):
+        h.dispatch("plan_and_think", {
+            "goal": "블로킹 승인 검증", "thought": "t", "step_number": 1, "total_steps": 1,
+            "need_more_thinking": False, "task_list": ["작업 1", "작업 2"]})
+
+    def ask(self, h, **kw):
+        return h.dispatch(
+            "request_user_approval",
+            {"decision": "ASK_USER", "plan_summary": "요약"},
+            **kw,
+        )
+
+    def test_human_approves_unlocks_in_one_call(self):
+        """ASK_USER blocks, the human clicks approve, and the SAME call returns APPROVED."""
+        ui = FakeApprovalUI("APPROVED")
+        h = self.blocking(ui)
+        self.draft(h)
+        res = self.ask(h)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["plan_status"], "APPROVED")
+        self.assertEqual(res["next_action"], "CALL_UPDATE_TASK_PROGRESS")
+        self.assertEqual(res["next_task"]["task_id"], 1)
+        self.assertEqual(len(ui.opened), 1)
+        self.assertEqual(ui.closed, 1)
+
+    def test_human_rejects(self):
+        h = self.blocking(FakeApprovalUI("REJECTED", "하지마"))
+        self.draft(h)
+        res = self.ask(h)
+        self.assertEqual(res["plan_status"], "CANCELLED")
+        blocked = h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.assertEqual(blocked["error_code"], "PLAN_CANCELLED")
+
+    def test_human_requests_revision(self):
+        h = self.blocking(FakeApprovalUI("REVISE", "2번 빼줘"))
+        self.draft(h)
+        res = self.ask(h)
+        self.assertEqual(res["plan_status"], "DRAFTING")
+        self.assertEqual(res["user_comment"], "2번 빼줘")
+        self.assertEqual(res["next_action"], "CALL_PLAN_AND_THINK")
+
+    def test_timeout_leaves_plan_locked(self):
+        h = self.blocking(FakeApprovalUI(decision=None), timeout=1)
+        self.draft(h)
+        res = self.ask(h)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
+        self.assertEqual(res["next_action"], "STOP_AND_WAIT_FOR_USER")
+        self.assertIn("display_to_user", res)
+        blocked = h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.assertEqual(blocked["error_code"], "PLAN_NOT_APPROVED")
+        audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
+        self.assertIn("approval_wait_timeout", audit)
+
+    def test_ui_unavailable_degrades_loudly(self):
+        """If the UI cannot start we must degrade - but never silently."""
+        h = self.blocking(FakeApprovalUI(available=False))
+        self.draft(h)
+        res = self.ask(h)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["next_action"], "STOP_AND_WAIT_FOR_USER")
+        self.assertTrue(
+            any("NOT hard-paused" in n for n in res.get("input_notes", [])),
+            f"degradation must be visible, got {res.get('input_notes')}",
+        )
+        audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
+        self.assertIn("approval_ui_unavailable", audit)
+
+    def test_port_fallback_when_base_port_is_taken(self):
+        """A stale instance holding 8765 must not disable the gate for a new one."""
+        first = ApprovalServer(port=8795, open_browser=False)
+        second = ApprovalServer(port=8795, open_browser=False)
+        try:
+            self.assertIsNotNone(first.open_request("p1", "g", "d", []))
+            self.assertEqual(first.port, 8795)
+            self.assertIsNotNone(second.open_request("p2", "g", "d", []))
+            self.assertNotEqual(second.port, first.port)
+            self.assertEqual(second.port, 8796)
+        finally:
+            first.shutdown()
+            second.shutdown()
+
+    def test_all_ports_busy_reports_failure(self):
+        blockers = [ApprovalServer(port=8797 + i, open_browser=False) for i in range(2)]
+        for b in blockers:
+            b.open_request("x", "g", "d", [])
+        crowded = ApprovalServer(port=8797, open_browser=False, port_attempts=2)
+        try:
+            self.assertIsNone(crowded.open_request("p", "g", "d", []))
+        finally:
+            crowded.shutdown()
+            for b in blockers:
+                b.shutdown()
+
+    def test_heartbeat_only_with_progress_token(self):
+        notifier = RecordingNotifier()
+        h = self.blocking(FakeApprovalUI(decision=None), timeout=1)
+        self.draft(h)
+        self.ask(h, progress_token=None, notifier=notifier)
+        self.assertEqual(notifier.sent, [])  # no token -> must not send progress
+
+    def test_wait_is_capped_without_progress_token(self):
+        """No token means the wait must stay under the client's 60s request timeout."""
+        h = self.blocking(FakeApprovalUI(decision=None), timeout=3600)
+        self.assertLessEqual(
+            h.effective_timeout(can_heartbeat=False),
+            SDK_REQUEST_TIMEOUT_SEC - 1,
+            "wait must be capped below the SDK request timeout",
+        )
+        self.assertEqual(h.effective_timeout(can_heartbeat=True), 3600)
+
+    def test_short_configured_timeout_is_respected_either_way(self):
+        h = self.blocking(FakeApprovalUI(decision=None), timeout=5)
+        self.assertEqual(h.effective_timeout(can_heartbeat=False), 5)
+        self.assertEqual(h.effective_timeout(can_heartbeat=True), 5)
+
+    def test_out_of_band_decision_is_audited(self):
+        h = self.blocking(FakeApprovalUI("APPROVED", "승인"))
+        self.draft(h)
+        self.ask(h)
+        audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
+        self.assertIn("approval_decided_out_of_band", audit)
+
+    def test_approval_server_binds_and_serves(self):
+        """The real server (not the fake) must start and answer /api/pending."""
+        import urllib.request
+
+        srv = ApprovalServer(port=8791, open_browser=False)
+        try:
+            pending = srv.open_request("plan_x", "목표", "PLAN...", [{"task_id": 1}])
+            self.assertIsNotNone(pending)
+            with urllib.request.urlopen(srv.url + "api/pending", timeout=5) as r:
+                payload = json.loads(r.read().decode("utf-8"))
+            self.assertEqual(payload["plan_id"], "plan_x")
+            body = json.dumps(
+                {"id": payload["id"], "decision": "APPROVED", "comment": "ok"}
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                srv.url + "api/decide", data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                self.assertTrue(json.loads(r.read().decode("utf-8"))["ok"])
+            self.assertTrue(pending.wait(2))
+            self.assertEqual(pending.decision, "APPROVED")
+        finally:
+            srv.shutdown()
 
 
 # ===========================================================================

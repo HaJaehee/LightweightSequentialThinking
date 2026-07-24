@@ -287,6 +287,48 @@ model prints display_to_user, ENDS TURN
      next_task: {task_id: 1, ...}         (must re-approve afterwards)
 ```
 
+### Blocking approval — the only real pause (default since 1.3.0)
+
+The instructional gate above is advisory: AnythingLLM's agent loop feeds the tool result
+back to the model and lets *the model* decide whether to keep calling tools. A weak model
+reads `STOP_AND_WAIT_FOR_USER` as one more observation and carries straight on to execute.
+AnythingLLM 1.15.0 offers no lever to prevent this — `directOutput` exists only for Agent
+Flow blocks, and MCP config is server-level (`command`, `args`, `type`, `url`, `headers`,
+`env`, `anythingllm.autoStart`) with no per-tool approval or timeout key.
+
+So the pause is taken, not asked for. The agent loop waits **synchronously** for a tool
+result before the model can generate anything else, therefore *not returning* is a hard
+stop that needs nothing from the host:
+
+```
+model ── request_user_approval(ASK_USER) ──►  server
+                                               │ persist AWAITING_APPROVAL
+                                               │ publish plan to http://127.0.0.1:8765/
+                                               │ ┌─ heartbeat: notifications/progress q20s
+   agent loop BLOCKED here, cannot execute ◄────┤ └─ (resets the client's 60s timer)
+                                               │
+        human clicks 승인 / 거절 / 수정요청 ──────┤
+        ◄── APPROVED + next_task ───────────────┘  (same call returns)
+```
+
+Two consequences worth stating plainly:
+
+- **Approval happens on the localhost page, not in the chat bubble.** This is unavoidable:
+  an in-chat reply is by definition a *new turn*, which can only occur after the tool has
+  already returned — the opposite of blocking.
+- **The two-phase protocol still exists** and the blocking path reuses `_approve` /
+  `_reject` / `_revise` verbatim, so both paths share one set of transitions.
+
+**Timeout arithmetic.** The MCP TypeScript SDK that AnythingLLM uses defaults to a 60s
+per-request timeout (`DEFAULT_REQUEST_TIMEOUT_MSEC`), resets it on every progress
+notification (`resetTimeoutOnProgress` defaults to true), and sets no `maxTotalTimeout`.
+So with a `progressToken` the heartbeat makes the wait effectively unbounded; without one
+the server caps the wait at `NO_PROGRESS_WAIT_CEILING_SEC` (55s) and returns the ordinary
+locked response rather than letting the client raise `-32001`. Both paths leave the plan
+`AWAITING_APPROVAL`, so the enforcement gate still blocks execution afterwards.
+
+Set `PLANNING_MCP_BLOCKING_APPROVAL=false` to fall back to the advisory-only behaviour.
+
 **Why the human's answer arrives as a tool call, not as a signal to the server:** the server has
 no channel to the user — it only sees what AnythingLLM sends. So the model acts as the courier,
 and `decision` is its report of what the human said. This is the one place where the protocol
