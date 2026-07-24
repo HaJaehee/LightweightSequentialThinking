@@ -340,6 +340,17 @@ times across the system prompt and the tool description, and why `revision_count
 means the next `plan_and_think` final step lands in `AWAITING_APPROVAL` again. There is no path
 from `REVISE` directly to execution.
 
+**The approval request outlives the tool call (1.5.0).** The wait has a ceiling (55s
+without a `progressToken`), but the human does not. When the call times out the request
+is *deliberately left on the page* — closing it there is what made the buttons disappear
+before anyone could answer. Whatever the human clicks afterwards is collected on the next
+tool call of any kind (`_apply_late_decision`, audited as `late_decision_applied`) and
+applied to the plan. A late decision is only honoured for the exact plan version that was
+on screen, matched by a fingerprint over the goal and task titles; if the plan changed in
+the meantime the decision is discarded. The blocking path and the late path share the
+same `_mutate_approved` / `_mutate_rejected` / `_mutate_revise` transitions, so they
+cannot drift apart.
+
 **Approval expires (1.4.0).** An approval authorizes the work that follows it *promptly*.
 A plan left idle longer than `PLANNING_MCP_APPROVAL_TTL` (default 1800s) has its approval
 revoked on the next touch: status returns to `AWAITING_APPROVAL`, the pending request is

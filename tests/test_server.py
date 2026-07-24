@@ -651,17 +651,31 @@ class FakeApprovalUI:
         self.opened: list[PendingApproval] = []
         self.closed = 0
 
-    def open_request(self, plan_id, goal, display, tasks):
+    def open_request(self, plan_id, goal, display, tasks, fingerprint=""):
         if not self.available:
             return None
-        pending = PendingApproval(plan_id, goal, display, tasks)
+        pending = PendingApproval(plan_id, goal, display, tasks, fingerprint)
         self.opened.append(pending)
+        self.live = pending
         if self.decision:
             pending.resolve(self.decision, self.comment)
         return pending
 
-    def close_request(self, pending):
+    def take_decision(self, plan_id, fingerprint):
+        p = getattr(self, "live", None)
+        if p is None or p.decision is None or p.consumed:
+            return None
+        if p.plan_id != plan_id or p.fingerprint != fingerprint:
+            return None
+        p.consumed = True
+        self.live = None
+        return p.decision, p.comment
+
+    def consume(self, pending):
         self.closed += 1
+        pending.consumed = True
+        if getattr(self, "live", None) is pending:
+            self.live = None
 
 
 class RecordingNotifier:
@@ -794,6 +808,56 @@ class TestBlockingApproval(HandlerTestCase):
         h = self.blocking(FakeApprovalUI(decision=None), timeout=5)
         self.assertEqual(h.effective_timeout(can_heartbeat=False), 5)
         self.assertEqual(h.effective_timeout(can_heartbeat=True), 5)
+
+    def test_request_stays_open_after_timeout(self):
+        """The page must keep the buttons after the tool call gives up."""
+        ui = FakeApprovalUI(decision=None)
+        h = self.blocking(ui, timeout=1)
+        self.draft(h)
+        self.ask(h)
+        self.assertEqual(ui.closed, 0, "a timed-out request must NOT be closed")
+        self.assertIsNotNone(ui.live, "the human must still be able to decide")
+
+    def test_late_approval_is_applied_on_the_next_call(self):
+        """Click approve after the timeout -> the next tool call honours it."""
+        ui = FakeApprovalUI(decision=None)
+        h = self.blocking(ui, timeout=1)
+        self.draft(h)
+        res = self.ask(h)
+        self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
+
+        ui.live.resolve("APPROVED", "승인")          # 사람이 뒤늦게 클릭
+        res = h.dispatch("get_current_plan", {"plan_id": "current"})
+        self.assertEqual(res["plan_status"], "APPROVED")
+        self.assertEqual(res["approval"]["decision"], "APPROVED")
+        audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
+        self.assertIn("late_decision_applied", audit)
+
+        run = h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.assertTrue(run["ok"])
+
+    def test_late_rejection_is_applied(self):
+        ui = FakeApprovalUI(decision=None)
+        h = self.blocking(ui, timeout=1)
+        self.draft(h)
+        self.ask(h)
+        ui.live.resolve("REJECTED", "하지마")
+        res = h.dispatch("get_current_plan", {"plan_id": "current"})
+        self.assertEqual(res["plan_status"], "CANCELLED")
+
+    def test_late_decision_is_discarded_if_the_plan_changed(self):
+        """A decision must not apply to a plan the human never saw."""
+        ui = FakeApprovalUI(decision=None)
+        h = self.blocking(ui, timeout=1)
+        self.draft(h)
+        self.ask(h)
+        stale = ui.live
+        h.dispatch("plan_and_think", {
+            "goal": "블로킹 승인 검증", "thought": "t", "step_number": 2, "total_steps": 2,
+            "need_more_thinking": False, "task_list": ["전혀 다른 작업"]})
+        stale.resolve("APPROVED", "")
+        res = h.dispatch("get_current_plan", {"plan_id": "current"})
+        self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
 
     def test_approval_url_reaches_the_user_in_chat(self):
         """A blocked popup must not hide the page: the URL rides in display_to_user."""

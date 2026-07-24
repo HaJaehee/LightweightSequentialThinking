@@ -7,6 +7,7 @@ No handler raises; `dispatch` converts any escaping exception into a resync inst
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from typing import Any
@@ -62,6 +63,9 @@ class PlanningHandlers:
             # may mutate plan state. The approval UI runs on its own thread and never
             # touches the store, so it cannot deadlock against this lock.
             with self.store.lock:
+                # A human may have clicked approve after the previous call timed out.
+                # Collect that first so every handler below sees the true state.
+                self._apply_late_decision()
                 if tool_name == "plan_and_think":
                     return self._plan_and_think(clean, notes)
                 if tool_name == "request_user_approval":
@@ -88,6 +92,65 @@ class PlanningHandlers:
             f"Unknown tool '{tool_name}'.",
             notes=notes,
         )
+
+    # ---- decision application (shared by the blocking and late paths) -------
+    @staticmethod
+    def _fingerprint(plan: Plan) -> str:
+        """Identifies the exact plan version shown to the human."""
+        payload = plan.goal + "\x00" + "\x00".join(t.title for t in plan.tasks)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _mutate_approved(plan: Plan, comment: str | None) -> None:
+        plan.approval.decision = Decision.APPROVED.value
+        plan.approval.decided_at = now_iso()
+        if comment:
+            plan.approval.user_comment = comment
+        plan.set_status(PlanStatus.APPROVED)
+
+    @staticmethod
+    def _mutate_rejected(plan: Plan, comment: str | None) -> None:
+        plan.approval.decision = Decision.REJECTED.value
+        plan.approval.decided_at = now_iso()
+        plan.approval.user_comment = comment or ""
+        plan.set_status(PlanStatus.CANCELLED)
+
+    @staticmethod
+    def _mutate_revise(plan: Plan, comment: str | None) -> None:
+        plan.approval.revision_count += 1
+        plan.approval.user_comment = comment or ""
+        plan.approval.reset_request()
+        plan.set_status(PlanStatus.DRAFTING)
+
+    def _apply_late_decision(self) -> None:
+        """Honour a decision the human made after the tool call had already returned.
+
+        The approval page stays actionable past the request timeout so people can take
+        their time. Whatever they clicked is collected here, on the next tool call of
+        any kind, and applied to the plan - otherwise the button would appear to work
+        while nothing actually happened.
+        """
+        if self.approval_ui is None:
+            return
+        state = self.store.load()
+        plan = state.active_plan
+        if plan is None:
+            return
+        taken = self.approval_ui.take_decision(plan.plan_id, self._fingerprint(plan))
+        if taken is None:
+            return
+        decision, comment = taken
+        if decision == Decision.APPROVED.value:
+            self._mutate_approved(plan, comment)
+        elif decision == Decision.REJECTED.value:
+            self._mutate_rejected(plan, comment)
+        else:
+            self._mutate_revise(plan, comment)
+        self.store.save(state)
+        self.store.audit(
+            "late_decision_applied", plan_id=plan.plan_id, decision=decision, comment=comment
+        )
+        log.warning("Applied a late human decision for %s: %s", plan.plan_id, decision)
 
     def _expire_stale_approval(self, state: State, plan: Plan | None) -> bool:
         """Revoke an approval that has gone cold, before anything acts on it.
@@ -451,7 +514,7 @@ class PlanningHandlers:
         timeout = self.effective_timeout(can_heartbeat)
 
         pending = self.approval_ui.open_request(
-            plan.plan_id, plan.goal, display, plan.tasks_brief()
+            plan.plan_id, plan.goal, display, plan.tasks_brief(), self._fingerprint(plan)
         )
         if pending is None:
             # Degrading quietly would remove the hard pause without anyone noticing -
@@ -487,11 +550,14 @@ class PlanningHandlers:
             pending.wait(timeout)
         finally:
             stop.set()
-            self.approval_ui.close_request(pending)
 
         if pending.decision is None:
+            # Deliberately leave the request on the page. Closing it here is what made
+            # the buttons vanish after 55s, before the human had a chance to answer;
+            # the next tool call collects whatever they click later.
             self.store.audit("approval_wait_timeout", plan_id=plan.plan_id, timeout=timeout)
             return None
+        self.approval_ui.consume(pending)
         self.store.audit(
             "approval_decided_out_of_band",
             plan_id=plan.plan_id,
@@ -558,11 +624,7 @@ class PlanningHandlers:
                 tasks=plan.tasks_brief(),
             )
 
-        plan.approval.decision = Decision.APPROVED.value
-        plan.approval.decided_at = now_iso()
-        if args.get("user_comment"):
-            plan.approval.user_comment = args["user_comment"]
-        plan.set_status(PlanStatus.APPROVED)
+        self._mutate_approved(plan, args.get("user_comment"))
         self.store.save(state)
         self.store.audit("approved", plan_id=plan.plan_id, comment=args.get("user_comment"))
 
@@ -580,10 +642,7 @@ class PlanningHandlers:
         self, state: State, plan: Plan, args: dict[str, Any], notes: list[str]
     ) -> dict[str, Any]:
         comment = args.get("user_comment") or ""
-        plan.approval.revision_count += 1
-        plan.approval.user_comment = comment
-        plan.approval.reset_request()
-        plan.set_status(PlanStatus.DRAFTING)
+        self._mutate_revise(plan, comment)
         self.store.save(state)
         self.store.audit(
             "revision_requested",
@@ -606,10 +665,7 @@ class PlanningHandlers:
         self, state: State, plan: Plan, args: dict[str, Any], notes: list[str]
     ) -> dict[str, Any]:
         comment = args.get("user_comment") or ""
-        plan.approval.decision = Decision.REJECTED.value
-        plan.approval.decided_at = now_iso()
-        plan.approval.user_comment = comment
-        plan.set_status(PlanStatus.CANCELLED)
+        self._mutate_rejected(plan, comment)
         self.store.save(state)
         self.store.audit("rejected", plan_id=plan.plan_id, user_comment=comment)
         return build(

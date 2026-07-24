@@ -218,6 +218,42 @@ def main() -> int:
         finally:
             s.close()
 
+    print("\n== 5) 타임아웃 후에도 승인 창이 살아있고, 늦은 클릭이 반영되는가 ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        s = Server(tmp, timeout=3600)   # progressToken 없음 -> 55초로 축소
+        try:
+            draft(s)
+            started = time.monotonic()
+            mid = s.call_async("request_user_approval",
+                               {"decision": "ASK_USER", "plan_summary": "요약"})
+            payload = None
+            while time.monotonic() - started < 70:
+                payload = s.reply_for(mid)
+                if payload:
+                    break
+                time.sleep(0.2)
+            check("타임아웃으로 반환", payload is not None and payload["plan_status"] == "AWAITING_APPROVAL")
+
+            pending = http_json("/api/pending")
+            check("승인 요청이 페이지에 그대로 남아 있음", bool(pending.get("id")),
+                  json.dumps(pending, ensure_ascii=False)[:160])
+            check("아직 미결정 상태", pending.get("decided") in (None, ""))
+
+            http_json("/api/decide",
+                      {"id": pending["id"], "decision": "APPROVED", "comment": "뒤늦게 승인"})
+            r = s.request("tools/call", {"name": "get_current_plan",
+                                         "arguments": {"plan_id": "current"}})
+            after = json.loads(r["result"]["content"][0]["text"])
+            check("늦은 승인이 다음 호출에서 반영됨", after["plan_status"] == "APPROVED",
+                  after["plan_status"])
+
+            r = s.request("tools/call", {"name": "update_task_progress",
+                                         "arguments": {"task_id": 1, "status": "IN_PROGRESS"}})
+            run = json.loads(r["result"]["content"][0]["text"])
+            check("실행 잠금 해제됨", run["ok"] is True, str(run.get("error_code")))
+        finally:
+            s.close()
+
     print()
     if _failures:
         print(f"FAILED: {len(_failures)} - {', '.join(_failures)}")

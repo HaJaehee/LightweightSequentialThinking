@@ -62,14 +62,25 @@ class _ExclusiveHTTPServer(ThreadingHTTPServer):
 class PendingApproval:
     """One awaited human decision."""
 
-    def __init__(self, plan_id: str, goal: str, display: str, tasks: list[dict[str, Any]]):
+    def __init__(
+        self,
+        plan_id: str,
+        goal: str,
+        display: str,
+        tasks: list[dict[str, Any]],
+        fingerprint: str = "",
+    ):
         self.id = uuid.uuid4().hex
         self.plan_id = plan_id
         self.goal = goal
         self.display = display
         self.tasks = tasks
+        # Identifies the exact plan version the human is looking at, so a decision made
+        # long after the tool call gave up can still be checked against what they saw.
+        self.fingerprint = fingerprint
         self.decision: str | None = None
         self.comment: str = ""
+        self.consumed = False
         self._event = threading.Event()
 
     def resolve(self, decision: str, comment: str = "") -> bool:
@@ -164,6 +175,11 @@ function render(d){
   const root=document.getElementById('root');
   if(!d){root.innerHTML='<div class="idle">대기 중인 승인 요청이 없습니다.<br>'+
     '<span style="font-size:.85rem">에이전트가 계획을 제출하면 여기에 표시됩니다.</span></div>';return;}
+  if(d.decided){
+    const label={APPROVED:'승인함',REJECTED:'거절함',REVISE:'수정 요청함'}[d.decided]||d.decided;
+    root.innerHTML='<div class="done">'+label+
+      '<br><span style="font-weight:400;opacity:.6;font-size:.9rem">'+
+      '에이전트가 다음 호출에서 이 결정을 반영합니다.</span></div>';return;}
   root.innerHTML='<h1>승인 요청 · '+esc(d.plan_id)+'</h1>'+
     '<p class="goal">'+esc(d.goal)+'</p>'+
     '<pre>'+esc(d.display)+'</pre>'+
@@ -172,8 +188,8 @@ function render(d){
     '<button class="ok" onclick="decide(\\'APPROVED\\')">승인</button>'+
     '<button class="rev" onclick="decide(\\'REVISE\\')">수정 요청</button>'+
     '<button class="no" onclick="decide(\\'REJECTED\\')">거절</button></div>'+
-    '<p class="hint">이 결정이 에이전트에게 즉시 전달됩니다. 결정하기 전까지 에이전트는 '+
-    '아무것도 실행하지 못하고 멈춰 있습니다.</p>';
+    '<p class="hint">결정하기 전까지 에이전트는 아무것도 실행하지 못합니다. '+
+    '이 요청은 응답하실 때까지 사라지지 않으니 천천히 검토하셔도 됩니다.</p>';
 }
 async function decide(dec){
   if(busy||!currentId)return;busy=true;alertOff();
@@ -277,12 +293,17 @@ class ApprovalServer:
 
     # ---- approval flow -------------------------------------------------
     def open_request(
-        self, plan_id: str, goal: str, display: str, tasks: list[dict[str, Any]]
+        self,
+        plan_id: str,
+        goal: str,
+        display: str,
+        tasks: list[dict[str, Any]],
+        fingerprint: str = "",
     ) -> PendingApproval | None:
         """Publish an approval request. Returns None if the UI could not start."""
         if not self._ensure_started():
             return None
-        pending = PendingApproval(plan_id, goal, display, tasks)
+        pending = PendingApproval(plan_id, goal, display, tasks, fingerprint)
         with self._lock:
             if self._pending is not None:
                 self._pending.cancel()  # a superseded request must not block a thread
@@ -290,8 +311,33 @@ class ApprovalServer:
         self._surface()
         return pending
 
-    def close_request(self, pending: PendingApproval) -> None:
+    def take_decision(self, plan_id: str, fingerprint: str) -> tuple[str, str] | None:
+        """Collect a decision the human made after the tool call already gave up.
+
+        The page stays actionable past the request timeout, so people can take as long
+        as they need. Whatever they clicked is picked up here on the next tool call and
+        applied - otherwise the button would look like it worked while nothing happened.
+
+        A decision is only honoured for the exact plan version that was on screen.
+        """
         with self._lock:
+            p = self._pending
+            if p is None or p.decision is None or p.consumed:
+                return None
+            if p.plan_id != plan_id or p.fingerprint != fingerprint:
+                log.warning(
+                    "Discarding a decision for a plan that has since changed (%s)", p.plan_id
+                )
+                self._pending = None
+                return None
+            p.consumed = True
+            self._pending = None
+            return p.decision, p.comment
+
+    def consume(self, pending: PendingApproval) -> None:
+        """Clear a request whose decision has been applied."""
+        with self._lock:
+            pending.consumed = True
             if self._pending is pending:
                 self._pending = None
 
