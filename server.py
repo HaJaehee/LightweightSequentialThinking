@@ -30,18 +30,23 @@ def build_protocol(config: Config, log=None) -> McpProtocol:
     store = Store(config.state_dir, max_plans=config.max_plans)
     handlers = PlanningHandlers(store, config)
     if handlers.approval_ui is not None:
-        # Bind now, not at the first approval: a failure has to be visible at startup
-        # rather than silently disarming the gate mid-workflow.
+        # Claim the page now, not at the first approval: a failure has to be visible at
+        # startup rather than silently disarming the gate mid-workflow. If another
+        # instance already serves this state directory we publish to the shared state
+        # it reads, so there is still exactly one URL for the human.
         if handlers.approval_ui.start():
             if log:
                 log.warning(
-                    "APPROVE PLANS AT -> %s   (leave this tab open; it alerts on new requests)",
+                    "APPROVE PLANS AT -> %s   (leave this tab open; it alerts on new "
+                    "requests)%s",
                     handlers.approval_ui.url,
+                    "" if handlers.approval_ui.owns_page else "  [served by a peer instance]",
                 )
         elif log:
             log.error(
-                "Approval UI FAILED TO START - blocking approval is disarmed. "
-                "Free the port range or set PLANNING_MCP_APPROVAL_PORT."
+                "Approval page UNAVAILABLE - port %d is held by something else. Blocking "
+                "approval cannot show anything to the user. Set PLANNING_MCP_APPROVAL_PORT.",
+                config.approval_port,
             )
     return McpProtocol(handlers, TOOL_DEFINITIONS, SERVER_NAME, SERVER_VERSION)
 

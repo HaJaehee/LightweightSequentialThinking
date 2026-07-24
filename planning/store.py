@@ -14,27 +14,10 @@ import json
 import logging
 import os
 import threading
-import time
 from pathlib import Path
 from typing import Any
 
-if os.name == "nt":
-    import msvcrt
-
-    def _lock_file(fh) -> None:
-        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-
-    def _unlock_file(fh) -> None:
-        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-
-else:
-    import fcntl
-
-    def _lock_file(fh) -> None:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-
-    def _unlock_file(fh) -> None:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+from .filelock import exclusive
 
 from .models import Plan, PlanStatus, TERMINAL_PLAN_STATUSES, now_iso
 
@@ -127,52 +110,19 @@ class Store:
     def _enter(self) -> None:
         if self._txn_depth == 0:
             self.lock.acquire()
-            self._txn_handle = self._acquire_file_lock()
+            self._txn_handle = exclusive(
+                self.state_dir / TXN_LOCK_FILENAME, timeout=TXN_LOCK_TIMEOUT
+            )
+            self._txn_handle.__enter__()
         self._txn_depth += 1
 
     def _exit(self) -> None:
         self._txn_depth -= 1
         if self._txn_depth == 0:
-            self._release_file_lock(self._txn_handle)
-            self._txn_handle = None
+            handle, self._txn_handle = self._txn_handle, None
+            if handle is not None:
+                handle.__exit__(None, None, None)
             self.lock.release()
-
-    def _acquire_file_lock(self):
-        path = self.state_dir / TXN_LOCK_FILENAME
-        deadline = time.monotonic() + TXN_LOCK_TIMEOUT
-        while True:
-            try:
-                fh = open(path, "a+b")
-            except OSError as exc:
-                log.warning("No cross-process lock (%s); concurrent writers may clash", exc)
-                return None
-            try:
-                _lock_file(fh)
-                return fh
-            except OSError:
-                fh.close()
-                if time.monotonic() >= deadline:
-                    # Blocking the user's workflow is worse than a rare race, so we
-                    # proceed - but loudly, because a plan really can be lost here.
-                    log.error(
-                        "Could not take the cross-process lock within %.0fs. Proceeding "
-                        "UNSERIALIZED - another planning-mcp instance may be running on "
-                        "this state directory.",
-                        TXN_LOCK_TIMEOUT,
-                    )
-                    return None
-                time.sleep(0.05)
-
-    @staticmethod
-    def _release_file_lock(fh) -> None:
-        if fh is None:
-            return
-        try:
-            _unlock_file(fh)
-        except OSError:
-            pass
-        finally:
-            fh.close()
 
     # ---- paths ---------------------------------------------------------
     @property

@@ -12,7 +12,9 @@ import logging
 import threading
 from typing import Any
 
-from .approval import ApprovalServer
+import time
+
+from .approval import ApprovalServer, ApprovalStore
 from .config import NO_PROGRESS_WAIT_CEILING_SEC, Config
 from .leniency import normalize
 from .models import (
@@ -41,7 +43,9 @@ class PlanningHandlers:
             self.approval_ui = approval_ui
         elif config.blocking_approval:
             self.approval_ui = ApprovalServer(
-                port=config.approval_port, open_browser=config.approval_open_browser
+                ApprovalStore(config.state_dir),
+                port=config.approval_port,
+                open_browser=config.approval_open_browser,
             )
         else:
             self.approval_ui = None
@@ -535,10 +539,10 @@ class PlanningHandlers:
         can_heartbeat = progress_token is not None and notifier is not None
         timeout = self.effective_timeout(can_heartbeat)
 
-        pending = self.approval_ui.open_request(
+        request_id = self.approval_ui.open_request(
             plan.plan_id, plan.goal, display, plan.tasks_brief(), self._fingerprint(plan)
         )
-        if pending is None:
+        if request_id is None:
             # Degrading quietly would remove the hard pause without anyone noticing -
             # the worst possible failure for a safety gate. Make it audible instead.
             log.error(
@@ -568,27 +572,35 @@ class PlanningHandlers:
             timeout,
             "on" if can_heartbeat else "off - no progressToken from client",
         )
+        decided: tuple[str, str] | None = None
         try:
             # Let every other session through while this one waits on a person.
             with self.store.paused():
-                pending.wait(timeout)
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    # Polling, not an Event: the decision may be recorded by a DIFFERENT
+                    # server process (whichever one owns the page), so it has to be read
+                    # from shared state.
+                    decided = self.approval_ui.claim(request_id)
+                    if decided is not None:
+                        break
+                    time.sleep(0.2)
         finally:
             stop.set()
 
-        if pending.decision is None:
-            # Deliberately leave the request on the page. Closing it here is what made
+        if decided is None:
+            # Deliberately leave the request published. Clearing it here is what made
             # the buttons vanish after 55s, before the human had a chance to answer;
             # the next tool call collects whatever they click later.
             self.store.audit("approval_wait_timeout", plan_id=plan.plan_id, timeout=timeout)
             return None
-        self.approval_ui.consume(pending)
         self.store.audit(
             "approval_decided_out_of_band",
             plan_id=plan.plan_id,
-            decision=pending.decision,
-            comment=pending.comment,
+            decision=decided[0],
+            comment=decided[1],
         )
-        return pending.decision, pending.comment
+        return decided
 
     def effective_timeout(self, can_heartbeat: bool) -> int:
         """How long we may hold the tool call open.

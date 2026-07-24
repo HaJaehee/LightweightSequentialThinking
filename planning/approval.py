@@ -1,112 +1,185 @@
-"""Out-of-band human approval: a localhost page with real Approve/Reject buttons.
+"""Human approval: shared file-backed state plus a single localhost page over it.
 
-Why this exists
----------------
-AnythingLLM's agent loop calls a tool and waits *synchronously* for its result before
-the model can generate anything else. Returning "STOP_AND_WAIT_FOR_USER" as text does
-not stop a weak model - it reads the instruction as one more observation and keeps
-calling tools. But if the tool simply does not return yet, the loop physically cannot
-advance: control has not gone back to the LLM.
+Why the state is in a file
+--------------------------
+Approval used to live in process memory. Restarts leave old MCP server processes alive
+on the same state directory, so each one bound its own port and served its own page. The
+human had one tab open - usually on the first port - and any approval request raised by
+another process appeared on a port nobody was looking at, then timed out. The gate
+silently degraded to "the model asked and nothing stopped it", which is the exact failure
+this whole subsystem exists to prevent.
 
-So the pause is achieved by making `request_user_approval(ASK_USER)` block until a human
-decides here. This needs nothing from AnythingLLM - no loop patch, no directOutput, no
-per-tool config (none of which exist as of 1.15.0).
+So the request and the decision live in `state/approval.json`, and the page is just a
+view over that file. Any process can publish a request; any process can read the
+decision. Reads take no lock (writes are atomic rename, so a reader never sees a torn
+file); only writers serialize.
 
-The cost is that approval happens on this page rather than in the chat bubble, and that
-is unavoidable: an in-chat reply is by definition a *new turn*, which can only happen
-after the tool has already returned - the opposite of blocking.
-
-Standard library only, so it runs under the bundled embeddable interpreter (which has
-no tkinter, ruling out native dialogs).
+Why exactly one page
+--------------------
+The URL has to be stable, because a human keeps that tab open. Only the base port is
+ever bound. If it is already taken, we check whether the occupant is another
+planning-mcp on the *same* state directory - if so it is already serving our requests
+and we need no page of our own. A background thread keeps retrying the bind, so if the
+owner exits another process takes the same port over and the open tab keeps working.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
 import threading
+import time
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from urllib.request import urlopen
+
+from .filelock import exclusive
 
 log = logging.getLogger("planning-mcp.approval")
 
 DECISIONS = ("APPROVED", "REJECTED", "REVISE")
+APPROVAL_FILENAME = "approval.json"
+APPROVAL_LOCK_FILENAME = ".approvallock"
+SERVER_SIGNATURE = "planning-mcp-approval"
 
 
-class _ExclusiveHTTPServer(ThreadingHTTPServer):
-    """HTTP server that refuses to share a port.
-
-    http.server sets allow_reuse_address, and on Windows SO_REUSEADDR lets a second
-    process bind a port another process is already listening on. That would make the
-    port-fallback below silently useless: a duplicate planning-mcp instance would
-    "succeed" on the same port and its approval page would never be the one the browser
-    reaches. Turning reuse off makes a real conflict raise, so we walk to the next port.
-    """
-
-    allow_reuse_address = False
-
-    def server_bind(self) -> None:
-        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
-        if exclusive is not None:  # Windows: hard exclusivity
-            try:
-                self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
-            except OSError:
-                pass
-        super().server_bind()
+# ---------------------------------------------------------------------------
+# Shared state
+# ---------------------------------------------------------------------------
 
 
-class PendingApproval:
-    """One awaited human decision."""
+class ApprovalStore:
+    """The approval request and its decision, shared by every server process."""
 
-    def __init__(
+    def __init__(self, state_dir: Path):
+        self.state_dir = Path(state_dir)
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+    @property
+    def path(self) -> Path:
+        return self.state_dir / APPROVAL_FILENAME
+
+    @property
+    def lock_path(self) -> Path:
+        return self.state_dir / APPROVAL_LOCK_FILENAME
+
+    # ---- io -----------------------------------------------------------
+    def read(self) -> dict[str, Any]:
+        """Current record, or {}. Lock-free: writes are atomic."""
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8")) or {}
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+
+    def _write(self, record: dict[str, Any]) -> None:
+        tmp = self.path.with_suffix(".json.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False, indent=2))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            log.error("Could not persist approval state: %s", exc)
+
+    # ---- operations ---------------------------------------------------
+    def publish(
         self,
         plan_id: str,
         goal: str,
         display: str,
         tasks: list[dict[str, Any]],
-        fingerprint: str = "",
-    ):
-        self.id = uuid.uuid4().hex
-        self.plan_id = plan_id
-        self.goal = goal
-        self.display = display
-        self.tasks = tasks
-        # Identifies the exact plan version the human is looking at, so a decision made
-        # long after the tool call gave up can still be checked against what they saw.
-        self.fingerprint = fingerprint
-        self.decision: str | None = None
-        self.comment: str = ""
-        self.consumed = False
-        self._event = threading.Event()
-
-    def resolve(self, decision: str, comment: str = "") -> bool:
-        if self._event.is_set():
-            return False
-        self.decision = decision
-        self.comment = comment or ""
-        self._event.set()
-        return True
-
-    def wait(self, timeout: float) -> bool:
-        return self._event.wait(timeout)
-
-    def cancel(self) -> None:
-        self._event.set()
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "plan_id": self.plan_id,
-            "goal": self.goal,
-            "display": self.display,
-            "tasks": self.tasks,
-            "decided": self.decision,
+        fingerprint: str,
+    ) -> str:
+        """Put a request in front of the human. Returns its id."""
+        request_id = uuid.uuid4().hex
+        record = {
+            "id": request_id,
+            "plan_id": plan_id,
+            "goal": goal,
+            "display": display,
+            "tasks": tasks,
+            "fingerprint": fingerprint,
+            "created_at": time.time(),
+            "created_by_pid": os.getpid(),
+            "decision": None,
+            "comment": "",
+            "decided_at": None,
         }
+        with exclusive(self.lock_path) as got:
+            previous = self.read()
+            if previous.get("id") and previous.get("decision") is None:
+                log.warning(
+                    "Superseding an undecided approval request for %s", previous.get("plan_id")
+                )
+            self._write(record)
+        if not got:
+            log.warning("Published an approval request without the write lock")
+        return request_id
 
+    def record_decision(self, request_id: str, decision: str, comment: str) -> bool:
+        """Called by the page. Only applies to the request currently on screen."""
+        if decision not in DECISIONS:
+            return False
+        with exclusive(self.lock_path):
+            record = self.read()
+            if record.get("id") != request_id or record.get("decision") is not None:
+                return False
+            record["decision"] = decision
+            record["comment"] = comment or ""
+            record["decided_at"] = time.time()
+            self._write(record)
+            return True
+
+    def peek(self) -> dict[str, Any]:
+        return self.read()
+
+    def claim(self, request_id: str) -> tuple[str, str] | None:
+        """Consume the decision for a specific request. Used by the blocking waiter."""
+        with exclusive(self.lock_path):
+            record = self.read()
+            if record.get("id") != request_id or not record.get("decision"):
+                return None
+            self._write({})
+            return record["decision"], record.get("comment", "")
+
+    def claim_for_plan(self, plan_id: str, fingerprint: str) -> tuple[str, str] | None:
+        """Consume a decision made after the tool call already returned.
+
+        Only honoured for the exact plan version that was on screen - the human agreed
+        to what they saw, not to whatever the plan became afterwards.
+        """
+        with exclusive(self.lock_path):
+            record = self.read()
+            if not record.get("decision"):
+                return None
+            if record.get("plan_id") != plan_id or record.get("fingerprint") != fingerprint:
+                log.warning(
+                    "Discarding a decision for a plan that has since changed (%s)",
+                    record.get("plan_id"),
+                )
+                self._write({})
+                return None
+            self._write({})
+            return record["decision"], record.get("comment", "")
+
+    def clear(self) -> None:
+        with exclusive(self.lock_path):
+            self._write({})
+
+
+# ---------------------------------------------------------------------------
+# The page
+# ---------------------------------------------------------------------------
 
 _PAGE = """<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
@@ -167,7 +240,7 @@ async function poll(){
   try{
     const r=await fetch('/api/pending');const d=await r.json();
     if(!d.id){currentId=null;alertOff();render(null);return;}
-    if(d.id!==currentId){currentId=d.id;render(d);alertOn();}
+    if(d.id!==currentId||d.decided){currentId=d.id;render(d);if(!d.decided)alertOn();else alertOff();}
   }catch(e){}
 }
 function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
@@ -179,7 +252,7 @@ function render(d){
     const label={APPROVED:'승인함',REJECTED:'거절함',REVISE:'수정 요청함'}[d.decided]||d.decided;
     root.innerHTML='<div class="done">'+label+
       '<br><span style="font-weight:400;opacity:.6;font-size:.9rem">'+
-      '에이전트가 다음 호출에서 이 결정을 반영합니다.</span></div>';return;}
+      '에이전트가 이 결정을 반영합니다.</span></div>';return;}
   root.innerHTML='<h1>승인 요청 · '+esc(d.plan_id)+'</h1>'+
     '<p class="goal">'+esc(d.goal)+'</p>'+
     '<pre>'+esc(d.display)+'</pre>'+
@@ -198,168 +271,166 @@ async function decide(dec){
   try{
     await fetch('/api/decide',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({id:currentId,decision:dec,comment:c})});
-    const label={APPROVED:'승인했습니다',REJECTED:'거절했습니다',REVISE:'수정을 요청했습니다'}[dec];
-    document.getElementById('root').innerHTML='<div class="done">'+label+
-      '<br><span style="font-weight:400;opacity:.6;font-size:.9rem">AnythingLLM 대화로 돌아가세요.</span></div>';
   }catch(e){}
-  currentId=null;busy=false;
-  setTimeout(()=>{poll();},2500);
+  busy=false;currentId=null;poll();
 }
 poll();setInterval(poll,1500);
 </script></body></html>"""
 
 
-class ApprovalServer:
-    """Lazily-started localhost page that resolves pending approvals."""
+class _ExclusiveHTTPServer(ThreadingHTTPServer):
+    """Refuses to share its port.
 
-    def __init__(self, port: int = 8765, open_browser: bool = True, port_attempts: int = 10):
+    http.server sets allow_reuse_address, and on Windows SO_REUSEADDR lets a second
+    process bind a port another process is already listening on. That would break the
+    single-page guarantee: two instances would both think they own the URL.
+    """
+
+    allow_reuse_address = False
+    daemon_threads = True
+
+    def server_bind(self) -> None:
+        exclusive_opt = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if exclusive_opt is not None:
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, exclusive_opt, 1)
+            except OSError:
+                pass
+        super().server_bind()
+
+
+class ApprovalServer:
+    """Serves the shared approval state on one stable localhost URL."""
+
+    def __init__(
+        self,
+        store: ApprovalStore,
+        port: int = 8765,
+        open_browser: bool = True,
+        takeover_interval: float = 5.0,
+    ):
+        self.store = store
         self.base_port = port
         self.port = port
         self.open_browser = open_browser
-        self.port_attempts = max(1, port_attempts)
+        self.takeover_interval = takeover_interval
         self._httpd: _ExclusiveHTTPServer | None = None
         self._lock = threading.Lock()
-        self._pending: PendingApproval | None = None
         self._opened_once = False
+        self._stop = threading.Event()
 
-    # ---- lifecycle -----------------------------------------------------
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}/"
 
-    def _ensure_started(self) -> bool:
-        """Bind the approval UI, walking forward if the port is taken.
+    @property
+    def owns_page(self) -> bool:
+        return self._httpd is not None
 
-        A stale server process from a previous restart keeps holding the base port. If a
-        second instance simply gave up, blocking approval would silently degrade back to
-        advisory-only - the exact safety loss this feature exists to prevent - so we take
-        the next free port instead.
-        """
+    # ---- lifecycle -----------------------------------------------------
+    def start(self) -> bool:
+        """Take the page if it is free, otherwise confirm a peer already serves it."""
+        if self._try_bind():
+            if self.open_browser and not self._opened_once:
+                self._open_browser_once()
+            self._start_takeover_watch()
+            return True
+
+        peer = self._probe_peer(self.base_port)
+        if peer == "ours":
+            log.info(
+                "Approval page already served by another planning-mcp instance on %s; "
+                "publishing to the shared state it reads",
+                self.url,
+            )
+            self._start_takeover_watch()
+            return True
+
+        log.error(
+            "Port %s is held by something that is not a planning-mcp approval page for "
+            "this state directory. The approval page is unavailable.",
+            self.base_port,
+        )
+        return False
+
+    def _try_bind(self) -> bool:
         with self._lock:
             if self._httpd is not None:
                 return True
-            handler = self._make_handler()
-            last: OSError | None = None
-            for offset in range(self.port_attempts):
-                port = self.base_port + offset
-                try:
-                    self._httpd = _ExclusiveHTTPServer(("127.0.0.1", port), handler)
-                except OSError as exc:
-                    last = exc
-                    continue
-                self.port = port
-                threading.Thread(
-                    target=self._httpd.serve_forever, name="approval-ui", daemon=True
-                ).start()
-                if offset:
-                    log.warning(
-                        "Approval UI port %s was busy (another planning-mcp instance?); "
-                        "using %s instead",
-                        self.base_port,
-                        port,
-                    )
-                log.info("Approval UI listening on %s", self.url)
-                return True
-            log.error(
-                "Could not bind the approval UI on ports %s-%s: %s",
-                self.base_port,
-                self.base_port + self.port_attempts - 1,
-                last,
-            )
-            self._httpd = None
-            return False
+            try:
+                httpd = _ExclusiveHTTPServer(("127.0.0.1", self.base_port), self._make_handler())
+            except OSError:
+                return False
+            self._httpd = httpd
+            self.port = self.base_port
+            threading.Thread(target=httpd.serve_forever, name="approval-ui", daemon=True).start()
+            log.info("Approval UI listening on %s", self.url)
+            return True
 
-    def start(self) -> bool:
-        """Bind the page at server startup rather than at first approval.
+    def _probe_peer(self, port: int) -> str:
+        """Is the occupant of `port` a planning-mcp page for our state directory?"""
+        try:
+            with urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as resp:
+                info = json.loads(resp.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 - any failure means "not ours"
+            return "unknown"
+        if info.get("server") != SERVER_SIGNATURE:
+            return "foreign"
+        try:
+            same = Path(info.get("state_dir", "")).resolve() == self.store.state_dir.resolve()
+        except OSError:
+            same = False
+        return "ours" if same else "other-state-dir"
 
-        Two reasons. A bind failure then shows up while you are still looking at the
-        logs, instead of silently disarming the gate mid-workflow. And the tab can be
-        opened once, up front, so it is already polling when an approval arrives -
-        which is the only reliable surfacing path when a per-request popup is blocked
-        or lands on another monitor.
-        """
-        if not self._ensure_started():
-            return False
-        if self.open_browser and not self._opened_once:
-            self._open_browser_once()
-        return True
+    def _start_takeover_watch(self) -> None:
+        """Keep trying to own the page so a dead owner is replaced automatically."""
+        if self._httpd is not None:
+            return  # we already own it
+        def watch() -> None:
+            while not self._stop.wait(self.takeover_interval):
+                if self._try_bind():
+                    log.warning("Took over the approval page on %s", self.url)
+                    return
+        threading.Thread(target=watch, name="approval-takeover", daemon=True).start()
 
     def shutdown(self) -> None:
+        self._stop.set()
         with self._lock:
             httpd, self._httpd = self._httpd, None
         if httpd is not None:
             httpd.shutdown()
-            httpd.server_close()  # release the listening socket, not just the loop
+            httpd.server_close()
 
-    # ---- approval flow -------------------------------------------------
+    # ---- request flow --------------------------------------------------
     def open_request(
-        self,
-        plan_id: str,
-        goal: str,
-        display: str,
-        tasks: list[dict[str, Any]],
+        self, plan_id: str, goal: str, display: str, tasks: list[dict[str, Any]],
         fingerprint: str = "",
-    ) -> PendingApproval | None:
-        """Publish an approval request. Returns None if the UI could not start."""
-        if not self._ensure_started():
-            return None
-        pending = PendingApproval(plan_id, goal, display, tasks, fingerprint)
-        with self._lock:
-            if self._pending is not None:
-                self._pending.cancel()  # a superseded request must not block a thread
-            self._pending = pending
+    ) -> str | None:
+        request_id = self.store.publish(plan_id, goal, display, tasks, fingerprint)
         self._surface()
-        return pending
+        return request_id
+
+    def claim(self, request_id: str) -> tuple[str, str] | None:
+        return self.store.claim(request_id)
 
     def take_decision(self, plan_id: str, fingerprint: str) -> tuple[str, str] | None:
-        """Collect a decision the human made after the tool call already gave up.
-
-        The page stays actionable past the request timeout, so people can take as long
-        as they need. Whatever they clicked is picked up here on the next tool call and
-        applied - otherwise the button would look like it worked while nothing happened.
-
-        A decision is only honoured for the exact plan version that was on screen.
-        """
-        with self._lock:
-            p = self._pending
-            if p is None or p.decision is None or p.consumed:
-                return None
-            if p.plan_id != plan_id or p.fingerprint != fingerprint:
-                log.warning(
-                    "Discarding a decision for a plan that has since changed (%s)", p.plan_id
-                )
-                self._pending = None
-                return None
-            p.consumed = True
-            self._pending = None
-            return p.decision, p.comment
-
-    def consume(self, pending: PendingApproval) -> None:
-        """Clear a request whose decision has been applied."""
-        with self._lock:
-            pending.consumed = True
-            if self._pending is pending:
-                self._pending = None
+        return self.store.claim_for_plan(plan_id, fingerprint)
 
     def _surface(self) -> None:
-        """Bring the approval page in front of the human."""
         log.warning("HUMAN APPROVAL NEEDED -> %s", self.url)
         if self.open_browser:
             self._open_browser_once()
 
     def _open_browser_once(self) -> None:
         """Best-effort only. Corporate policy, a missing default browser, or a second
-        monitor can all defeat this, which is why the page also polls: an already-open
-        tab lights up on its own."""
+        monitor can all defeat this, which is why the page also polls."""
         try:
             if webbrowser.open(self.url):
                 self._opened_once = True
                 return
-        except Exception as exc:  # noqa: BLE001 - never let this break approval
+        except Exception as exc:  # noqa: BLE001
             log.debug("webbrowser.open failed: %s", exc)
-        try:  # Windows fallback when no browser is registered with webbrowser
-            import os
-
+        try:
             os.startfile(self.url)  # type: ignore[attr-defined]
             self._opened_once = True
             return
@@ -385,19 +456,34 @@ class ApprovalServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _json(self, payload: Any, code: int = 200) -> None:
+                self._send(
+                    code,
+                    json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
+
             def do_GET(self) -> None:  # noqa: N802
                 path = urlparse(self.path).path
                 if path == "/":
                     self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8")
-                elif path == "/api/pending":
-                    with server._lock:
-                        p = server._pending
-                    payload = p.to_json() if p else {"id": None}
-                    self._send(
-                        200,
-                        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                        "application/json; charset=utf-8",
+                elif path == "/api/health":
+                    self._json(
+                        {"server": SERVER_SIGNATURE, "state_dir": str(server.store.state_dir)}
                     )
+                elif path == "/api/pending":
+                    record = server.store.peek()
+                    if not record.get("id"):
+                        self._json({"id": None})
+                    else:
+                        self._json({
+                            "id": record["id"],
+                            "plan_id": record.get("plan_id"),
+                            "goal": record.get("goal"),
+                            "display": record.get("display"),
+                            "tasks": record.get("tasks", []),
+                            "decided": record.get("decision"),
+                        })
                 else:
                     self.send_error(404)
 
@@ -411,19 +497,11 @@ class ApprovalServer:
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     self.send_error(400)
                     return
-
-                decision = str(body.get("decision", "")).upper()
-                if decision not in DECISIONS:
-                    self._send(400, b'{"ok":false}', "application/json")
-                    return
-
-                with server._lock:
-                    p = server._pending
-                ok = bool(p and p.id == body.get("id") and p.resolve(decision, body.get("comment", "")))
-                self._send(
-                    200,
-                    json.dumps({"ok": ok}).encode("utf-8"),
-                    "application/json; charset=utf-8",
+                ok = server.store.record_decision(
+                    str(body.get("id", "")),
+                    str(body.get("decision", "")).upper(),
+                    body.get("comment", ""),
                 )
+                self._json({"ok": ok})
 
         return Handler

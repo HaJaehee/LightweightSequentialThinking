@@ -10,7 +10,9 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import socket
 import sys
+import urllib.request
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # otherwise drown the test output. The tests assert on responses and the audit log instead.
 logging.disable(logging.CRITICAL)
 
-from planning.approval import ApprovalServer, PendingApproval  # noqa: E402
+from planning.approval import ApprovalServer, ApprovalStore  # noqa: E402
 from planning.config import SDK_REQUEST_TIMEOUT_SEC, Config  # noqa: E402
 from planning.handlers import PlanningHandlers  # noqa: E402
 from planning.leniency import normalize  # noqa: E402
@@ -640,42 +642,52 @@ class TestStaleApproval(HandlerTestCase):
 
 
 class FakeApprovalUI:
-    """Stands in for the localhost page. Resolves immediately, or never."""
+    """Stands in for the shared approval state + page. Decides immediately, or never."""
 
     url = "http://127.0.0.1:0/"
+    owns_page = True
 
     def __init__(self, decision=None, comment="", available=True):
         self.decision = decision
         self.comment = comment
         self.available = available
-        self.opened: list[PendingApproval] = []
-        self.closed = 0
+        self.opened: list[dict] = []
+        self.cleared = 0
+        self.live: dict | None = None
 
     def open_request(self, plan_id, goal, display, tasks, fingerprint=""):
         if not self.available:
             return None
-        pending = PendingApproval(plan_id, goal, display, tasks, fingerprint)
-        self.opened.append(pending)
-        self.live = pending
-        if self.decision:
-            pending.resolve(self.decision, self.comment)
-        return pending
+        record = {
+            "id": f"req{len(self.opened)}", "plan_id": plan_id, "fingerprint": fingerprint,
+            "decision": self.decision, "comment": self.comment,
+        }
+        self.opened.append(record)
+        self.live = record
+        return record["id"]
+
+    def resolve(self, decision, comment=""):
+        """Simulates the human clicking after the fact."""
+        self.live["decision"] = decision
+        self.live["comment"] = comment
+
+    def claim(self, request_id):
+        r = self.live
+        if r is None or r["id"] != request_id or not r.get("decision"):
+            return None
+        self.live = None
+        self.cleared += 1
+        return r["decision"], r.get("comment", "")
 
     def take_decision(self, plan_id, fingerprint):
-        p = getattr(self, "live", None)
-        if p is None or p.decision is None or p.consumed:
+        r = self.live
+        if r is None or not r.get("decision"):
             return None
-        if p.plan_id != plan_id or p.fingerprint != fingerprint:
-            return None
-        p.consumed = True
-        self.live = None
-        return p.decision, p.comment
-
-    def consume(self, pending):
-        self.closed += 1
-        pending.consumed = True
-        if getattr(self, "live", None) is pending:
+        if r["plan_id"] != plan_id or r["fingerprint"] != fingerprint:
             self.live = None
+            return None
+        self.live = None
+        return r["decision"], r.get("comment", "")
 
 
 class RecordingNotifier:
@@ -716,7 +728,7 @@ class TestBlockingApproval(HandlerTestCase):
         self.assertEqual(res["next_action"], "CALL_UPDATE_TASK_PROGRESS")
         self.assertEqual(res["next_task"]["task_id"], 1)
         self.assertEqual(len(ui.opened), 1)
-        self.assertEqual(ui.closed, 1)
+        self.assertEqual(ui.cleared, 1)
 
     def test_human_rejects(self):
         h = self.blocking(FakeApprovalUI("REJECTED", "하지마"))
@@ -761,31 +773,59 @@ class TestBlockingApproval(HandlerTestCase):
         audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
         self.assertIn("approval_ui_unavailable", audit)
 
-    def test_port_fallback_when_base_port_is_taken(self):
-        """A stale instance holding 8765 must not disable the gate for a new one."""
-        first = ApprovalServer(port=8795, open_browser=False)
-        second = ApprovalServer(port=8795, open_browser=False)
+    def test_two_instances_share_one_page_and_one_state(self):
+        """The whole point: a request from EITHER process shows on the same page."""
+        store_dir = self.state_dir / "shared"
+        owner = ApprovalServer(ApprovalStore(store_dir), port=8795, open_browser=False)
+        peer = ApprovalServer(ApprovalStore(store_dir), port=8795, open_browser=False)
         try:
-            self.assertIsNotNone(first.open_request("p1", "g", "d", []))
-            self.assertEqual(first.port, 8795)
-            self.assertIsNotNone(second.open_request("p2", "g", "d", []))
-            self.assertNotEqual(second.port, first.port)
-            self.assertEqual(second.port, 8796)
-        finally:
-            first.shutdown()
-            second.shutdown()
+            self.assertTrue(owner.start())
+            self.assertTrue(owner.owns_page)
+            # The second instance must NOT grab a different port; it detects the peer.
+            self.assertTrue(peer.start())
+            self.assertFalse(peer.owns_page)
+            self.assertEqual(peer.url, owner.url, "both must point at one URL")
 
-    def test_all_ports_busy_reports_failure(self):
-        blockers = [ApprovalServer(port=8797 + i, open_browser=False) for i in range(2)]
-        for b in blockers:
-            b.open_request("x", "g", "d", [])
-        crowded = ApprovalServer(port=8797, open_browser=False, port_attempts=2)
-        try:
-            self.assertIsNone(crowded.open_request("p", "g", "d", []))
+            # A request published by the peer is served by the owner's page.
+            req = peer.open_request("plan_p", "목표", "PLAN...", [{"task_id": 1}], "fp")
+            with urllib.request.urlopen(owner.url + "api/pending", timeout=5) as r:
+                shown = json.loads(r.read().decode("utf-8"))
+            self.assertEqual(shown["id"], req)
+            self.assertEqual(shown["plan_id"], "plan_p")
+
+            # And a decision taken on that page is visible to the peer that asked.
+            body = json.dumps({"id": req, "decision": "APPROVED", "comment": "ok"}).encode()
+            post = urllib.request.Request(
+                owner.url + "api/decide", data=body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(post, timeout=5) as r:
+                self.assertTrue(json.loads(r.read().decode("utf-8"))["ok"])
+            self.assertEqual(peer.claim(req), ("APPROVED", "ok"))
         finally:
-            crowded.shutdown()
-            for b in blockers:
-                b.shutdown()
+            owner.shutdown()
+            peer.shutdown()
+
+    def test_foreign_occupant_is_detected(self):
+        """A non-planning-mcp listener on the port must be reported, not adopted."""
+        blocker = socket.socket()
+        blocker.bind(("127.0.0.1", 8797))
+        blocker.listen(1)
+        srv = ApprovalServer(ApprovalStore(self.state_dir / "x"), port=8797, open_browser=False)
+        try:
+            self.assertFalse(srv.start())
+        finally:
+            srv.shutdown()
+            blocker.close()
+
+    def test_store_survives_a_new_process_view(self):
+        """A second ApprovalStore object sees what the first published."""
+        d = self.state_dir / "sharedstore"
+        a, b = ApprovalStore(d), ApprovalStore(d)
+        rid = a.publish("plan_1", "g", "display", [], "fp1")
+        self.assertEqual(b.peek()["id"], rid)
+        self.assertTrue(b.record_decision(rid, "APPROVED", "예"))
+        self.assertEqual(a.claim_for_plan("plan_1", "fp1"), ("APPROVED", "예"))
+        self.assertEqual(a.peek(), {})
 
     def test_heartbeat_only_with_progress_token(self):
         notifier = RecordingNotifier()
@@ -815,7 +855,7 @@ class TestBlockingApproval(HandlerTestCase):
         h = self.blocking(ui, timeout=1)
         self.draft(h)
         self.ask(h)
-        self.assertEqual(ui.closed, 0, "a timed-out request must NOT be closed")
+        self.assertEqual(ui.cleared, 0, "a timed-out request must NOT be cleared")
         self.assertIsNotNone(ui.live, "the human must still be able to decide")
 
     def test_late_approval_is_applied_on_the_next_call(self):
@@ -826,7 +866,7 @@ class TestBlockingApproval(HandlerTestCase):
         res = self.ask(h)
         self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
 
-        ui.live.resolve("APPROVED", "승인")          # 사람이 뒤늦게 클릭
+        ui.resolve("APPROVED", "승인")               # 사람이 뒤늦게 클릭
         res = h.dispatch("get_current_plan", {"plan_id": "current"})
         self.assertEqual(res["plan_status"], "APPROVED")
         self.assertEqual(res["approval"]["decision"], "APPROVED")
@@ -841,7 +881,7 @@ class TestBlockingApproval(HandlerTestCase):
         h = self.blocking(ui, timeout=1)
         self.draft(h)
         self.ask(h)
-        ui.live.resolve("REJECTED", "하지마")
+        ui.resolve("REJECTED", "하지마")
         res = h.dispatch("get_current_plan", {"plan_id": "current"})
         self.assertEqual(res["plan_status"], "CANCELLED")
 
@@ -851,11 +891,10 @@ class TestBlockingApproval(HandlerTestCase):
         h = self.blocking(ui, timeout=1)
         self.draft(h)
         self.ask(h)
-        stale = ui.live
         h.dispatch("plan_and_think", {
             "goal": "블로킹 승인 검증", "thought": "t", "step_number": 2, "total_steps": 2,
             "need_more_thinking": False, "task_list": ["전혀 다른 작업"]})
-        stale.resolve("APPROVED", "")
+        ui.resolve("APPROVED", "")     # 사람이 본 적 없는 계획에 대한 승인
         res = h.dispatch("get_current_plan", {"plan_id": "current"})
         self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
 
@@ -878,26 +917,26 @@ class TestBlockingApproval(HandlerTestCase):
 
     def test_approval_server_binds_and_serves(self):
         """The real server (not the fake) must start and answer /api/pending."""
-        import urllib.request
-
-        srv = ApprovalServer(port=8791, open_browser=False)
+        srv = ApprovalServer(
+            ApprovalStore(self.state_dir / "real"), port=8791, open_browser=False
+        )
         try:
-            pending = srv.open_request("plan_x", "목표", "PLAN...", [{"task_id": 1}])
-            self.assertIsNotNone(pending)
+            self.assertTrue(srv.start())
+            req = srv.open_request("plan_x", "목표", "PLAN...", [{"task_id": 1}], "fp")
+            self.assertIsNotNone(req)
             with urllib.request.urlopen(srv.url + "api/pending", timeout=5) as r:
                 payload = json.loads(r.read().decode("utf-8"))
             self.assertEqual(payload["plan_id"], "plan_x")
             body = json.dumps(
                 {"id": payload["id"], "decision": "APPROVED", "comment": "ok"}
             ).encode("utf-8")
-            req = urllib.request.Request(
+            post = urllib.request.Request(
                 srv.url + "api/decide", data=body,
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=5) as r:
+            with urllib.request.urlopen(post, timeout=5) as r:
                 self.assertTrue(json.loads(r.read().decode("utf-8"))["ok"])
-            self.assertTrue(pending.wait(2))
-            self.assertEqual(pending.decision, "APPROVED")
+            self.assertEqual(srv.claim(req), ("APPROVED", "ok"))
         finally:
             srv.shutdown()
 

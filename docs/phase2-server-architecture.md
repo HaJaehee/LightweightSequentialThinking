@@ -299,6 +299,32 @@ model prints display_to_user, ENDS TURN
      next_task: {task_id: 1, ...}         (must re-approve afterwards)
 ```
 
+### One approval surface per state directory (1.7.0)
+
+Approval used to live in process memory, and that was the last structural hole in the
+gate. Restarts leave old server processes alive on the same state directory; each bound
+its own port and served its own page. The human keeps one tab open — so a request raised
+by any other process appeared on a port nobody was watching and quietly timed out. The
+gate degraded to "the model asked and nothing stopped it", with no error anywhere.
+
+The fix has two halves:
+
+- **State is shared, not per-process.** The request and its decision live in
+  `state/approval.json`. Reads take no lock (writes are a temp file plus atomic rename,
+  so a reader never sees a torn file); only writers serialize, on `state/.approvallock`.
+  Any process can publish a request; any process can claim the decision.
+- **The page is a singleton elected by port binding.** Only the base port is ever bound.
+  If it is taken, the instance probes `/api/health` — if the occupant is another
+  planning-mcp on the *same* state directory, it is already serving our requests and we
+  deliberately do **not** open a second page. That keeps the URL stable, which matters
+  because a human leaves that tab open. A background thread keeps retrying the bind, so
+  when the owner exits another process takes the same port over and the open tab keeps
+  working. A foreign occupant (not planning-mcp, or a different state directory) is
+  reported as an error rather than silently adopted.
+
+Because a decision can now be recorded by a *different* process, the blocking waiter
+polls the shared file every 200ms instead of waiting on a `threading.Event`.
+
 ### Blocking approval — the only real pause (default since 1.3.0)
 
 The instructional gate above is advisory: AnythingLLM's agent loop feeds the tool result
