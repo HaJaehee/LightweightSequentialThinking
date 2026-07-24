@@ -12,6 +12,8 @@ import json
 import logging
 import socket
 import sys
+import threading
+import time
 import urllib.request
 import tempfile
 import unittest
@@ -981,6 +983,326 @@ class TestBlockingApproval(HandlerTestCase):
             self.assertEqual(srv.claim(req), ("APPROVED", "ok"))
         finally:
             srv.shutdown()
+
+
+# ===========================================================================
+# Edge cases — deliberately probing the seams between recent refactors
+# ===========================================================================
+
+
+class TestConcurrencyEdges(HandlerTestCase):
+    def test_transaction_is_exclusive_across_threads(self):
+        """Only one thread may be inside a transaction at a time.
+
+        The stdio transport now handles each request on its own thread, so this is a
+        live path, not a theoretical one.
+        """
+        store = Store(self.state_dir / "txn")
+        inside: list[int] = []
+        violations: list[str] = []
+
+        def worker() -> None:
+            for _ in range(5):
+                with store.transaction():
+                    inside.append(1)
+                    if len(inside) > 1:
+                        violations.append(f"{len(inside)} threads inside at once")
+                    time.sleep(0.01)
+                    inside.pop()
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(violations, [], "transaction is not mutually exclusive")
+
+    def test_concurrent_requests_in_one_process_lose_nothing(self):
+        """The stdio transport threads every request; none may clobber another's plan."""
+        h = PlanningHandlers(
+            Store(self.state_dir),
+            Config(state_dir=self.state_dir, blocking_approval=False, max_active_plans=50),
+        )
+        results: list[dict] = []
+        barrier = threading.Barrier(6)
+
+        def worker(i: int) -> None:
+            barrier.wait()  # maximise the overlap
+            results.append(h.dispatch("plan_and_think", {
+                "goal": f"목표 {i}", "thought": "t", "step_number": 1, "total_steps": 1,
+                "need_more_thinking": False, "task_list": [f"작업 {i}"]}))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        ids = [r["plan_id"] for r in results]
+        self.assertEqual(len(set(ids)), 6, f"plan_id collision: {ids}")
+        raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(raw["plans"]), 6, "a concurrent plan was lost")
+        self.assertEqual(
+            {p["goal"] for p in raw["plans"].values()},
+            {f"목표 {i}" for i in range(6)},
+        )
+
+    def test_transaction_is_reentrant_within_one_thread(self):
+        store = Store(self.state_dir / "reentrant")
+        with store.transaction():
+            with store.transaction():
+                store.save(store.load())
+        # A second, independent acquisition must still work afterwards.
+        with store.transaction():
+            pass
+
+    def test_paused_outside_a_transaction_is_harmless(self):
+        store = Store(self.state_dir / "paused")
+        with store.paused():
+            pass
+        with store.transaction():
+            pass
+
+    def test_paused_lets_another_thread_in(self):
+        store = Store(self.state_dir / "handoff")
+        got_in = threading.Event()
+
+        def other() -> None:
+            with store.transaction():
+                got_in.set()
+
+        with store.transaction():
+            t = threading.Thread(target=other, daemon=True)
+            t.start()
+            self.assertFalse(got_in.wait(0.3), "should be blocked while we hold it")
+            with store.paused():
+                self.assertTrue(got_in.wait(5), "paused() must release the transaction")
+            t.join(timeout=5)
+
+
+class TestMultiPlanEdges(HandlerTestCase):
+    def two_plans(self):
+        a = self.think(goal="A", need_more_thinking=False, task_list=["a1", "a2"])
+        b = self.think(goal="B", need_more_thinking=False, task_list=["b1"])
+        return a["plan_id"], b["plan_id"]
+
+    def approve(self, pid):
+        self.h.dispatch("request_user_approval",
+                        {"decision": "ASK_USER", "plan_summary": "s", "plan_id": pid})
+        return self.h.dispatch("request_user_approval", {"decision": "APPROVED", "plan_id": pid})
+
+    def test_identical_goals_route_to_the_same_plan(self):
+        first = self.think(goal="같은 목표", need_more_thinking=False, task_list=["x"])
+        second = self.think(goal="같은 목표", need_more_thinking=False, task_list=["y"])
+        self.assertEqual(first["plan_id"], second["plan_id"])
+        raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
+        plan = raw["plans"][first["plan_id"]]
+        self.assertEqual([t["title"] for t in plan["superseded_tasks"][0]], ["x"])
+
+    def test_blocked_plan_does_not_block_its_sibling(self):
+        a_id, b_id = self.two_plans()
+        self.approve(a_id)
+        self.approve(b_id)
+        self.h.dispatch("update_task_progress",
+                        {"task_id": 1, "status": "FAILED", "plan_id": a_id})
+        res = self.h.dispatch("update_task_progress",
+                              {"task_id": 1, "status": "IN_PROGRESS", "plan_id": b_id})
+        self.assertTrue(res["ok"], res.get("error_code"))
+        self.assertEqual(res["plan_id"], b_id)
+
+    def test_expiry_touches_only_the_resolved_plan(self):
+        a_id, b_id = self.two_plans()
+        self.approve(a_id)
+        self.approve(b_id)
+        raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
+        old = (datetime.datetime.now().astimezone()
+               - datetime.timedelta(hours=5)).replace(microsecond=0).isoformat()
+        raw["plans"][a_id]["updated_at"] = old
+        (self.state_dir / "plan_state.json").write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+        fresh = self.h.dispatch("update_task_progress",
+                                {"task_id": 1, "status": "IN_PROGRESS", "plan_id": b_id})
+        self.assertTrue(fresh["ok"], "a sibling must not be expired by proxy")
+        stale = self.h.dispatch("update_task_progress",
+                                {"task_id": 1, "status": "IN_PROGRESS", "plan_id": a_id})
+        self.assertEqual(stale["error_code"], "APPROVAL_EXPIRED")
+
+    def test_finishing_one_plan_removes_the_ambiguity(self):
+        a_id, b_id = self.two_plans()
+        self.approve(a_id)
+        self.h.dispatch("request_user_approval",
+                        {"decision": "REJECTED", "plan_id": b_id})
+        # Only A is live now, so plan_id becomes optional again.
+        res = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.assertTrue(res["ok"], res.get("error_code"))
+        self.assertEqual(res["plan_id"], a_id)
+
+    def test_terminal_plan_is_still_readable_by_id(self):
+        a_id, _ = self.two_plans()
+        self.h.dispatch("request_user_approval", {"decision": "REJECTED", "plan_id": a_id})
+        res = self.h.dispatch("get_current_plan", {"plan_id": a_id})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["plan_status"], "CANCELLED")
+
+    def test_unknown_plan_id_is_reported(self):
+        self.two_plans()
+        res = self.h.dispatch("get_current_plan", {"plan_id": "plan_does_not_exist"})
+        self.assertTrue(res["ok"])
+        self.assertTrue(
+            any("plan_does_not_exist" in n for n in res.get("input_notes", [])),
+            res.get("input_notes"),
+        )
+
+    def test_max_active_plans_is_enforced(self):
+        cfg = Config(state_dir=self.state_dir, blocking_approval=False, max_active_plans=2)
+        h = PlanningHandlers(Store(self.state_dir), cfg)
+        for name in ("G1", "G2"):
+            h.dispatch("plan_and_think", {"goal": name, "thought": "t", "step_number": 1,
+                                          "total_steps": 1, "need_more_thinking": False,
+                                          "task_list": ["x"]})
+        res = h.dispatch("plan_and_think", {"goal": "G3", "thought": "t", "step_number": 1,
+                                            "total_steps": 1, "need_more_thinking": False,
+                                            "task_list": ["x"]})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "PLAN_AMBIGUOUS")
+        self.assertEqual(len(res["active_plans"]), 2)
+
+    def test_pruning_never_drops_an_active_plan(self):
+        cfg = Config(state_dir=self.state_dir, blocking_approval=False, max_plans=3,
+                     max_active_plans=10)
+        h = PlanningHandlers(Store(self.state_dir, max_plans=3), cfg)
+        live = []
+        for i in range(4):
+            r = h.dispatch("plan_and_think", {"goal": f"살아있는 {i}", "thought": "t",
+                                              "step_number": 1, "total_steps": 1,
+                                              "need_more_thinking": False, "task_list": ["x"]})
+            live.append(r["plan_id"])
+        raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
+        for pid in live:
+            self.assertIn(pid, raw["plans"], "an active plan was pruned away")
+
+    def test_plan_id_accepts_whitespace_and_case(self):
+        a_id, _ = self.two_plans()
+        res = self.h.dispatch("get_current_plan", {"plan_id": f"  {a_id}  "})
+        self.assertEqual(res["plan_id"], a_id)
+        res = self.h.dispatch("get_current_plan", {"plan_id": "CURRENT"})
+        self.assertIn("active_plans", res)  # ambiguous, reported as a directory
+
+    def test_plan_id_sent_as_a_number_does_not_crash(self):
+        self.two_plans()
+        res = self.h.dispatch("update_task_progress",
+                              {"task_id": 1, "status": "IN_PROGRESS", "plan_id": 12345})
+        self.assertContract(res)
+        self.assertFalse(res["ok"])
+
+
+class TestApprovalQueueEdges(HandlerTestCase):
+    def store_for(self, name):
+        return ApprovalStore(self.state_dir / name)
+
+    def test_one_entry_per_plan(self):
+        s = self.store_for("q1")
+        s.publish("plan_a", "g", "d1", [], "fp1")
+        second = s.publish("plan_a", "g", "d2", [], "fp2")
+        queue = s.peek()
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["id"], second)
+
+    def test_sibling_entries_coexist_and_claim_independently(self):
+        s = self.store_for("q2")
+        ra = s.publish("plan_a", "ga", "da", [], "fpa")
+        rb = s.publish("plan_b", "gb", "db", [], "fpb")
+        self.assertEqual(len(s.peek()), 2)
+        self.assertTrue(s.record_decision(rb, "APPROVED", "ok"))
+        self.assertIsNone(s.claim(ra), "claiming A must not pick up B's decision")
+        self.assertEqual(s.claim(rb), ("APPROVED", "ok"))
+        self.assertEqual([e["id"] for e in s.peek()], [ra])
+
+    def test_fingerprint_mismatch_drops_only_that_entry(self):
+        s = self.store_for("q3")
+        ra = s.publish("plan_a", "ga", "da", [], "fpa")
+        rb = s.publish("plan_b", "gb", "db", [], "fpb")
+        s.record_decision(ra, "APPROVED", "")
+        s.record_decision(rb, "APPROVED", "")
+        self.assertIsNone(s.claim_for_plan("plan_a", "CHANGED"))
+        self.assertEqual([e["id"] for e in s.peek()], [rb], "B's entry must survive")
+        self.assertEqual(s.claim_for_plan("plan_b", "fpb"), ("APPROVED", ""))
+
+    def test_decision_cannot_be_recorded_twice(self):
+        s = self.store_for("q4")
+        r = s.publish("p", "g", "d", [], "fp")
+        self.assertTrue(s.record_decision(r, "APPROVED", ""))
+        self.assertFalse(s.record_decision(r, "REJECTED", ""))
+
+    def test_unknown_request_id_is_rejected(self):
+        s = self.store_for("q5")
+        s.publish("p", "g", "d", [], "fp")
+        self.assertFalse(s.record_decision("nope", "APPROVED", ""))
+
+    def test_legacy_single_record_file_does_not_crash(self):
+        """1.7.0 wrote one record; 1.8.0 writes a queue. Upgrading must not explode."""
+        d = self.state_dir / "legacy"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "approval.json").write_text(
+            json.dumps({"id": "old", "plan_id": "p", "decision": "APPROVED"}),
+            encoding="utf-8")
+        s = ApprovalStore(d)
+        self.assertEqual(s.peek(), [])
+        self.assertIsNone(s.claim("old"))
+        self.assertEqual(s.publish("p2", "g", "d", [], "fp") and len(s.peek()), 1)
+
+    def test_corrupt_approval_file_is_ignored(self):
+        d = self.state_dir / "corrupt"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "approval.json").write_text("{{{ not json", encoding="utf-8")
+        s = ApprovalStore(d)
+        self.assertEqual(s.peek(), [])
+        s.publish("p", "g", "d", [], "fp")
+        self.assertEqual(len(s.peek()), 1)
+
+
+class TestPlanStateEdges(HandlerTestCase):
+    def test_task_list_of_blanks_is_refused(self):
+        res = self.think(need_more_thinking=False, task_list=["", "   ", "\n"])
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "MISSING_TASK_LIST")
+
+    def test_all_tasks_failed_keeps_the_plan_blocked(self):
+        self.approve_flow(["a", "b"])
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "FAILED"})
+        res = self.h.dispatch("update_task_progress", {"task_id": 2, "status": "FAILED"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "PLAN_BLOCKED")
+
+    def test_active_plan_id_pointing_at_a_deleted_plan(self):
+        self.think(need_more_thinking=False, task_list=["a"])
+        raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
+        raw["active_plan_id"] = "plan_ghost"
+        (self.state_dir / "plan_state.json").write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        res = self.h.dispatch("get_current_plan", {"plan_id": "current"})
+        self.assertContract(res)
+        self.assertTrue(res["ok"])
+
+    def test_task_id_zero_and_negative(self):
+        self.approve_flow(["a"])
+        for bad in (0, -1):
+            res = self.h.dispatch("update_task_progress",
+                                  {"task_id": bad, "status": "IN_PROGRESS"})
+            self.assertFalse(res["ok"], f"task_id={bad} should not be accepted")
+            self.assertEqual(res["error_code"], "TASK_NOT_FOUND")
+
+    def test_every_multi_plan_path_keeps_the_contract(self):
+        self.think(goal="A", need_more_thinking=False, task_list=["a"])
+        self.think(goal="B", need_more_thinking=False, task_list=["b"])
+        for name, args in [
+            ("update_task_progress", {"task_id": 1, "status": "DONE"}),
+            ("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"}),
+            ("get_current_plan", {"plan_id": "current"}),
+            ("get_current_plan", {"plan_id": "plan_nope"}),
+        ]:
+            self.assertContract(self.h.dispatch(name, args))
 
 
 # ===========================================================================

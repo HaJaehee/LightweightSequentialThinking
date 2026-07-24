@@ -158,6 +158,12 @@ measured failures drove the current design (1.6.0):
 If the cross-process lock cannot be taken within 20s the server proceeds unserialized rather
 than failing the user's call — but logs an error, because a plan really can be lost there.
 
+> **Nesting depth is per thread (1.8.1).** It was an instance counter, so a second thread
+> arriving while the first held the transaction saw `depth != 0`, skipped the lock, and
+> walked into the critical section. That silently disabled the very serialization added
+> above — and it was a live path, because the stdio transport threads every request. Found
+> by a test that asserts mutual exclusion directly; a `threading.local()` depth fixes it.
+
 Remaining cheap defenses:
 
 > **Session isolation caveat:** there is ONE active-plan slot per state directory. Approved /

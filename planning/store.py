@@ -100,8 +100,11 @@ class Store:
         self.state_dir = Path(state_dir)
         self.max_plans = max_plans
         self.lock = threading.Lock()
-        self._txn_handle = None
-        self._txn_depth = 0
+        # Nesting depth is PER THREAD. A shared counter meant a second thread arriving
+        # while the first held the transaction saw depth != 0, skipped the lock, and
+        # walked straight into the critical section - which silently disabled the
+        # serialization that exists to stop concurrent writers losing a plan.
+        self._local = threading.local()
         self._ensure_dir()
         self._write_lock_file()
 
@@ -131,7 +134,7 @@ class Store:
         whole wait (measured at 52s, and up to the full timeout with heartbeats). The
         caller MUST reload state afterwards - anything may have changed meanwhile.
         """
-        depth = self._txn_depth
+        depth = self._depth
         for _ in range(depth):
             self._exit()
         try:
@@ -140,19 +143,23 @@ class Store:
             for _ in range(depth):
                 self._enter()
 
+    @property
+    def _depth(self) -> int:
+        return getattr(self._local, "depth", 0)
+
     def _enter(self) -> None:
-        if self._txn_depth == 0:
+        if self._depth == 0:
             self.lock.acquire()
-            self._txn_handle = exclusive(
-                self.state_dir / TXN_LOCK_FILENAME, timeout=TXN_LOCK_TIMEOUT
-            )
-            self._txn_handle.__enter__()
-        self._txn_depth += 1
+            handle = exclusive(self.state_dir / TXN_LOCK_FILENAME, timeout=TXN_LOCK_TIMEOUT)
+            handle.__enter__()
+            self._local.handle = handle
+        self._local.depth = self._depth + 1
 
     def _exit(self) -> None:
-        self._txn_depth -= 1
-        if self._txn_depth == 0:
-            handle, self._txn_handle = self._txn_handle, None
+        self._local.depth = self._depth - 1
+        if self._local.depth == 0:
+            handle = getattr(self._local, "handle", None)
+            self._local.handle = None
             if handle is not None:
                 handle.__exit__(None, None, None)
             self.lock.release()
