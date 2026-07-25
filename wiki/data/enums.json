@@ -1,0 +1,50 @@
+{
+  "_comment": "Generated from planning/models.py — the single source of truth. Do not hand-edit; regenerate.",
+  "plan_status": [
+    "NONE",
+    "DRAFTING",
+    "AWAITING_APPROVAL",
+    "APPROVED",
+    "IN_EXECUTION",
+    "BLOCKED",
+    "COMPLETED",
+    "CANCELLED"
+  ],
+  "task_status": [
+    "PENDING",
+    "IN_PROGRESS",
+    "DONE",
+    "FAILED"
+  ],
+  "decision": [
+    "ASK_USER",
+    "APPROVED",
+    "REJECTED",
+    "REVISE"
+  ],
+  "next_action": [
+    "CALL_PLAN_AND_THINK",
+    "CALL_REQUEST_USER_APPROVAL",
+    "CALL_UPDATE_TASK_PROGRESS",
+    "CALL_GET_CURRENT_PLAN",
+    "STOP_AND_WAIT_FOR_USER",
+    "ANSWER_USER"
+  ],
+  "error_code": [
+    "PLAN_NOT_APPROVED",
+    "PLAN_NOT_READY",
+    "PLAN_BLOCKED",
+    "PLAN_CANCELLED",
+    "NO_ACTIVE_PLAN",
+    "TASK_NOT_FOUND",
+    "MISSING_TASK_LIST",
+    "MISSING_PLAN_SUMMARY",
+    "APPROVAL_NOT_REQUESTED",
+    "APPROVAL_EXPIRED",
+    "PLAN_AMBIGUOUS",
+    "INVALID_STATUS",
+    "INVALID_DECISION",
+    "INVALID_STEP",
+    "INTERNAL_ERROR"
+  ]
+}

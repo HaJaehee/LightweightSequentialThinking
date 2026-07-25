@@ -1,0 +1,97 @@
+# 05 · Concurrency and Sessions
+
+This is the hardest-won part of the project. Read it before touching `store.py`,
+`approval.py`, `filelock.py`, or the routing logic in `handlers.py`. Most defects in
+[09](09-defects-and-lessons.md) live here.
+
+## The setup that makes concurrency real
+
+MCP has **no session identifier** — the server cannot tell which call came from which
+conversation. Worse, AnythingLLM/Claude Code leave **old server processes alive** on the same
+state directory after a restart (observed: 2–3 ghosts). And a blocking approval occupies one
+handler for as long as the human takes. So concurrency is not theoretical; it is the normal
+operating condition.
+
+## Multi-plan routing (1.8.0)
+
+There used to be a single `active_plan_id`, so two conversations evicted each other's plans.
+Now plans coexist, and a call is routed three ways, in priority order:
+
+1. **Explicit `plan_id`** on `request_user_approval` / `update_task_progress` / `get_current_plan`.
+2. **By goal**, for `plan_and_think` — the model repeats the same goal each step, so a matching
+   active plan is this session's. A different goal gets a fresh plan; it never touches another's.
+3. **The only active plan**, when there is exactly one — the ordinary case, so a model that
+   never learns `plan_id` behaves exactly as before.
+
+If several plans are active and no `plan_id` is given → `PLAN_AMBIGUOUS` with an `active_plans`
+directory. A weak model recovers because (a) it only ever saw *its own* plan_id in prior
+responses, and (b) while multiple plans are live, every `next_action_hint` names the plan_id to
+include (`qualify=True`). `PLANNING_MCP_MAX_ACTIVE_PLANS` (default 5) caps how many can coexist.
+
+**Watch-outs baked in as fixes:** after a blocking wait, re-read *your own* plan by id (not
+"the active plan", which could be a sibling); the late-decision collector iterates *all* active
+plans, not just one.
+
+## Locking (`filelock.py` + `store.transaction()`)
+
+Two layers, because `threading.Lock` only covers one process:
+
+- **Thread layer:** `store.lock` (a `threading.Lock`), with per-thread nesting depth via
+  `threading.local()`. (A shared depth counter was a real bug — see [09](09-defects-and-lessons.md#d5).)
+- **Process layer:** an OS advisory lock on `state/.txnlock` (plan writes) and
+  `state/.approvallock` (approval writes), via `msvcrt.locking` / `fcntl.flock`.
+
+Critical detail: locking uses **non-blocking attempts + a 50 ms retry loop**, *not* a blocking
+acquire. Windows `msvcrt.locking(LK_LOCK)` blocks internally for ~10 s before giving up, which
+made the timeout argument meaningless and stalled contended callers for ten seconds
+([09](09-defects-and-lessons.md#d8)). If the lock can't be taken within `timeout` (default
+20 s) the call proceeds **unserialized but logs an error** — blocking the user is worse than a
+rare race, but the race really can lose a plan, so it must be loud. A missing parent directory
+fails immediately rather than burning the whole timeout.
+
+Reads take **no lock**: every write is a temp file + atomic `os.replace`, so a reader sees the
+whole old version or the whole new one, never a torn file. Only writers serialize.
+
+## `store.paused()` — releasing the lock during a human wait
+
+Holding the transaction across a blocking approval froze every other session (measured 52 s).
+`store.paused()` releases the transaction for the duration of the wait and re-acquires it after.
+The caller **must re-read state** afterwards — anything may have changed — and re-verify the
+plan fingerprint before honouring a decision.
+
+## Threaded stdio transport
+
+The stdio read loop handles each request on its **own daemon thread**. Handling inline meant a
+blocking approval stalled every later request behind it (again 52 s —
+[09](09-defects-and-lessons.md#d6)). JSON-RPC matches responses by id, so out-of-order
+completion is fine; writes are serialized through one output lock (`StdioNotifier`).
+
+## Shared approval surface (1.7.0)
+
+Approval state used to be per-process, so each ghost bound its own port and served its own
+page; a request raised by a process the human wasn't watching timed out silently. Now:
+
+- **State is shared** in `state/approval.json` (a queue, one entry per plan).
+- **The page is a singleton elected by port binding.** Only the base port (8765) is bound. If
+  it's taken, the instance probes `/api/health`; if the occupant is another planning-mcp on the
+  *same* state directory, it publishes to the shared state that page already serves — no second
+  page. The URL stays stable (a human keeps that tab open). A background thread keeps retrying
+  the bind, so if the owner exits, another process takes the port over and the open tab keeps
+  working. A foreign occupant is reported as an error, never adopted.
+
+Because a decision can be recorded by a *different* process, the blocking waiter **polls** the
+shared file every 200 ms rather than waiting on a `threading.Event`.
+
+## Approval queue semantics
+
+Two sessions waiting at once both appear on the page, each with its own buttons. Publishing for
+a plan replaces that plan's earlier entry (revision), never another plan's. A plan's entry is
+**withdrawn as soon as the plan settles** (approved/rejected/revised/completed) — a request
+whose buttons would be ignored on the fingerprint check is worse than no request.
+
+## Still true after all this
+
+The **plan slot is multiplexed, but the state directory is shared.** For genuinely isolated
+workspaces, run one server registration per workspace with distinct
+`PLANNING_MCP_STATE_DIR` — separate state dirs are fully isolated. See
+[10-deployment.md](10-deployment.md).

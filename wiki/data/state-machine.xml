@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  planning-mcp plan state machine.
+  Source of truth: planning/state_machine.py + transition checks in planning/handlers.py.
+  Prose: wiki/04-state-machine.md.
+-->
+<stateMachine name="plan-lifecycle">
+
+  <states>
+    <state id="NONE"              terminal="false" description="No plan yet."/>
+    <state id="DRAFTING"          terminal="false" description="Thinking steps being recorded; not yet finalized."/>
+    <state id="AWAITING_APPROVAL" terminal="false" description="Task list finalized; locked pending human approval."/>
+    <state id="APPROVED"          terminal="false" description="Human approved; execution unlocked; no task started yet."/>
+    <state id="IN_EXECUTION"      terminal="false" description="At least one task started."/>
+    <state id="BLOCKED"           terminal="false" description="A task failed; must re-plan before continuing."/>
+    <state id="COMPLETED"         terminal="true"  description="All tasks DONE."/>
+    <state id="CANCELLED"         terminal="true"  description="Human rejected the plan."/>
+  </states>
+
+  <transitions>
+    <transition from="NONE"              call="plan_and_think(step 1)"                 to="DRAFTING"/>
+    <transition from="COMPLETED"         call="plan_and_think(step 1)"                 to="DRAFTING" note="new plan id"/>
+    <transition from="CANCELLED"         call="plan_and_think(step 1)"                 to="DRAFTING" note="new plan id"/>
+    <transition from="DRAFTING"          call="plan_and_think(need_more_thinking=true)" to="DRAFTING"/>
+    <transition from="DRAFTING"          call="plan_and_think(final + task_list)"      to="AWAITING_APPROVAL" onError="MISSING_TASK_LIST"/>
+    <transition from="AWAITING_APPROVAL" call="request_user_approval(ASK_USER)"        to="AWAITING_APPROVAL" note="blocking wait"/>
+    <transition from="AWAITING_APPROVAL" call="request_user_approval(APPROVED)"        to="APPROVED" onError="APPROVAL_NOT_REQUESTED (if version not shown)"/>
+    <transition from="AWAITING_APPROVAL" call="request_user_approval(REVISE)"          to="DRAFTING"/>
+    <transition from="AWAITING_APPROVAL" call="request_user_approval(REJECTED)"        to="CANCELLED"/>
+    <transition from="APPROVED"          call="update_task_progress(IN_PROGRESS)"      to="IN_EXECUTION"/>
+    <transition from="IN_EXECUTION"      call="update_task_progress(DONE, not last)"   to="IN_EXECUTION"/>
+    <transition from="IN_EXECUTION"      call="update_task_progress(DONE, last)"       to="COMPLETED"/>
+    <transition from="IN_EXECUTION"      call="update_task_progress(FAILED)"           to="BLOCKED"/>
+    <transition from="BLOCKED"           call="plan_and_think"                          to="DRAFTING" note="same plan id, revision"/>
+    <transition from="any"               call="get_current_plan"                        to="(unchanged)" note="never fails"/>
+  </transitions>
+
+  <guards>
+    <guard call="update_task_progress" whenState="DRAFTING,AWAITING_APPROVAL" error="PLAN_NOT_APPROVED" note="the critical enforcement gate"/>
+    <guard call="update_task_progress" whenState="BLOCKED" onOtherTask="PLAN_BLOCKED"/>
+    <guard call="update_task_progress" whenState="CANCELLED" error="PLAN_CANCELLED"/>
+    <guard call="request_user_approval(APPROVED)" whenState="DRAFTING" error="PLAN_NOT_READY"/>
+    <guard call="any(with plan_id absent)" whenMultipleActivePlans="true" error="PLAN_AMBIGUOUS" note="response carries active_plans directory"/>
+  </guards>
+
+  <leniencies note="rejecting these would strand a weak model">
+    <leniency call="update_task_progress(IN_PROGRESS out of order)" behavior="redirect to correct task_id, ok:true"/>
+    <leniency call="update_task_progress(DONE duplicate)" behavior="idempotent, point at next pending"/>
+    <leniency call="update_task_progress(DONE without prior IN_PROGRESS)" behavior="accept, audit skipped_in_progress"/>
+    <leniency call="plan_and_think(same goal while APPROVED/IN_EXECUTION)" behavior="redirect to in-flight task, not a new plan"/>
+  </leniencies>
+
+  <timeGuards>
+    <guard name="approval-expiry" note="APPROVED/IN_EXECUTION idle past approval_ttl (1800s) -> revoke to AWAITING_APPROVAL; audit approval_expired; unreadable timestamp = expired"/>
+    <guard name="approval-binding" note="any task-list change clears the pending approval; APPROVED for an unshown version -> APPROVAL_NOT_REQUESTED"/>
+  </timeGuards>
+
+</stateMachine>

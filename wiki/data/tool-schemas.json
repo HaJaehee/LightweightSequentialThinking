@@ -1,0 +1,142 @@
+{
+  "_comment": "Generated from planning/schemas.py (built from planning/models.py). The authoritative MCP tools/list payload. Regenerate; do not hand-edit.",
+  "tools": [
+    {
+      "name": "plan_and_think",
+      "description": "STEP 1 - MANDATORY FIRST TOOL.\nYou MUST call this tool before answering ANY user request, even simple-looking ones.\nUse it to think one step at a time and to write down the task breakdown.\n\nHOW TO USE:\n- Call it once per thinking step. Start at step_number = 1.\n- Keep calling with need_more_thinking = true until your plan is complete.\n- On your FINAL thinking step, set need_more_thinking = false AND provide task_list.\n- To correct an earlier step, set revises_step to that step number.\n\nDO NOT execute anything, DO NOT answer the user while using this tool.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "goal": {
+            "type": "string",
+            "description": "One sentence restating what the user ultimately wants. Repeat the SAME goal text on every step. Example: 'Summarize the Q3 sales report and email it to the team lead.'"
+          },
+          "thought": {
+            "type": "string",
+            "description": "Your reasoning for THIS step only. One idea per call. Example: 'Step 2: I must first locate the Q3 report file before I can summarize it.'"
+          },
+          "step_number": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Which thinking step this is. Starts at 1 and increases by exactly 1 each call. Example: 2"
+          },
+          "total_steps": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Your current estimate of how many thinking steps are needed. You may raise this number later. Example: 4"
+          },
+          "need_more_thinking": {
+            "type": "boolean",
+            "description": "true = you will call plan_and_think again. false = this is your LAST thinking step and task_list is now final. Example: true"
+          },
+          "task_list": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "REQUIRED when need_more_thinking is false. A flat list of plain-text action items, in execution order. Plain strings only - do NOT send objects, do NOT add numbering, do NOT add status. The server assigns task_id automatically. Example: [\"Locate the Q3 sales report file\", \"Extract the revenue table\", \"Write a 5-line summary\", \"Send the summary by email\"]"
+          },
+          "revises_step": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "OPTIONAL. Only set this when you are CORRECTING an earlier thinking step. Set it to the step_number you are replacing. Example: 2"
+          }
+        },
+        "required": [
+          "goal",
+          "thought",
+          "step_number",
+          "total_steps",
+          "need_more_thinking"
+        ]
+      }
+    },
+    {
+      "name": "request_user_approval",
+      "description": "STEP 2 - MANDATORY HUMAN APPROVAL GATE.\nThe plan is LOCKED until the user approves it. You cannot skip this tool.\n\nUSE IN TWO PHASES:\nPhase A - ASK: call with decision = \"ASK_USER\" and a plan_summary.\n          Then STOP. Print the plan to the user and wait. Say nothing else.\nPhase B - REPORT: after the user replies in chat, call this tool AGAIN with\n          decision = \"APPROVED\"  (user said yes / ok / proceed / 승인)\n          decision = \"REJECTED\"  (user said no / cancel / stop / 취소)\n          decision = \"REVISE\"    (user asked for changes) + put the requested\n                                 change into user_comment.\n\nNEVER guess the user's answer. NEVER call APPROVED unless the user actually said so.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "decision": {
+            "type": "string",
+            "enum": [
+              "ASK_USER",
+              "APPROVED",
+              "REJECTED",
+              "REVISE"
+            ],
+            "description": "ASK_USER = first call, ask the human. APPROVED / REJECTED / REVISE = report what the human actually replied. Example: \"ASK_USER\""
+          },
+          "plan_summary": {
+            "type": "string",
+            "description": "REQUIRED when decision is ASK_USER. A short human-readable summary of the plan you want approval for, written for a non-technical reader. Example: 'I will (1) find the Q3 report, (2) extract the revenue table, (3) write a 5-line summary, (4) email it to the team lead.'"
+          },
+          "user_comment": {
+            "type": "string",
+            "description": "OPTIONAL. Copy the user's exact words here when decision is REVISE or REJECTED. Example: 'Do not send the email, just show me the summary.'"
+          },
+          "plan_id": {
+            "type": "string",
+            "description": "OPTIONAL. Leave this out unless the server asks for it. If several plans are active at the same time, set it to the plan_id this conversation has been receiving in every response. Example: \"plan_20260724_0002\""
+          }
+        },
+        "required": [
+          "decision"
+        ]
+      }
+    },
+    {
+      "name": "update_task_progress",
+      "description": "STEP 3 - EXECUTION TRACKING.\nCall this tool TWICE for every task:\n  1. BEFORE you start the task  -> status = \"IN_PROGRESS\"\n  2. AFTER you finish the task  -> status = \"DONE\"  (or \"FAILED\" if it did not work)\nHandle exactly ONE task per call. Never mark a task DONE before you actually did it.\nIf a task fails, set status = \"FAILED\" and explain in result_log - then follow the\nnext_action the server gives you back.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The number of the task you are working on, taken from the tasks list the server gave you. One task per call. Example: 1"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "PENDING",
+              "IN_PROGRESS",
+              "DONE",
+              "FAILED"
+            ],
+            "description": "IN_PROGRESS = starting now. DONE = finished successfully. FAILED = could not finish. PENDING = reset back to not-started. Example: \"IN_PROGRESS\""
+          },
+          "result_log": {
+            "type": "string",
+            "description": "OPTIONAL but STRONGLY recommended. What you actually did or what actually went wrong, in one or two sentences. Example: 'Found the file at /reports/q3_sales.xlsx.'  or  'FAILED: no file matching q3 was found in /reports.'"
+          },
+          "plan_id": {
+            "type": "string",
+            "description": "OPTIONAL. Leave this out unless the server asks for it. If several plans are active at the same time, set it to the plan_id this conversation has been receiving in every response. Example: \"plan_20260724_0002\""
+          }
+        },
+        "required": [
+          "task_id",
+          "status"
+        ]
+      }
+    },
+    {
+      "name": "get_current_plan",
+      "description": "RECOVERY TOOL.\nCall this when you are unsure what the plan is, which task you were on, or after a long\nconversation. It returns the full current plan and tells you exactly what to do next.\nIt changes nothing - it is always safe to call.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "plan_id": {
+            "type": "string",
+            "default": "current",
+            "description": "Use the exact text \"current\" to get the active plan. Only use a real plan_id if you want an older plan. Example: \"current\""
+          }
+        },
+        "required": [
+          "plan_id"
+        ]
+      }
+    }
+  ]
+}
