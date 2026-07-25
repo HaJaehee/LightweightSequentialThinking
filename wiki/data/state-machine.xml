@@ -41,6 +41,7 @@
     <guard call="update_task_progress" whenState="CANCELLED" error="PLAN_CANCELLED"/>
     <guard call="request_user_approval(APPROVED)" whenState="DRAFTING" error="PLAN_NOT_READY"/>
     <guard call="any(with plan_id absent)" whenMultipleActivePlans="true" error="PLAN_AMBIGUOUS" note="response carries active_plans directory"/>
+    <guard call="plan_and_think(step_number>1, goal matches no active plan)" error="GOAL_NOT_MATCHED" note="goal drift; return active_plans to pick from instead of forking a plan. step_number==1 with a new goal starts a new plan instead."/>
   </guards>
 
   <leniencies note="rejecting these would strand a weak model">

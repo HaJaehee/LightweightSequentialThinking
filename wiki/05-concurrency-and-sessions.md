@@ -32,6 +32,33 @@ include (`qualify=True`). `PLANNING_MCP_MAX_ACTIVE_PLANS` (default 5) caps how m
 "the active plan", which could be a sibling); the late-decision collector iterates *all* active
 plans, not just one.
 
+<a id="goal-drift"></a>
+### Goal drift — the routing key can be forgotten (1.8.2)
+
+Because routing is by goal string, the model *forgetting or rephrasing* the goal is a real
+hazard. Before 1.8.2, a drifted goal on step 2 of drafting silently created a **second plan** —
+the model thought it was continuing one plan while the server accumulated several, then hit
+`PLAN_AMBIGUOUS` at approval time. Demonstrated with a fuzz script.
+
+The fix distinguishes *starting* from *continuing* using `step_number`, which the model already
+sends:
+
+- **`step_number == 1`** → starting fresh → a new plan (this is how a new concurrent
+  conversation legitimately begins, so it must stay).
+- **`step_number > 1`, exact goal match** → continue that plan (normal).
+- **`step_number > 1`, no match** → the model is continuing but the goal drifted. Do **not**
+  fork. Return `GOAL_NOT_MATCHED` with the `active_plans` list (id + goal) and ask the model to
+  repeat the exact goal, send the `plan_id`, or use `step_number=1` if it's genuinely new.
+- **`step_number > 1`, no active plans** → recover by starting one (don't error out).
+
+Goal matching normalizes trailing punctuation/whitespace (a period-only difference no longer
+forks) but stays conservative on case and wording, so two genuinely different conversations are
+never merged. `plan_id` is now also accepted by `plan_and_think` to continue explicitly.
+
+**Safety net regardless:** `get_current_plan` always echoes the exact goal, and after
+finalization the approval/execution tools route by `plan_id` or the-only-active-plan — so a
+forgotten goal during *execution* of a single plan is harmless.
+
 ## Locking (`filelock.py` + `store.transaction()`)
 
 Two layers, because `threading.Lock` only covers one process:

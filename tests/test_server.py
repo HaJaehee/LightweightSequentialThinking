@@ -515,6 +515,78 @@ class TestStateMachine(HandlerTestCase):
         b = self.think(goal="B", need_more_thinking=False, task_list=["b"])
         self.assertIn(b["plan_id"], b["next_action_hint"])
 
+
+class TestGoalDriftRouting(HandlerTestCase):
+    """Goal drift mid-drafting must not fork a plan; the model is asked to pick (1.8.2)."""
+
+    def step(self, goal, n, more=True, tasks=None, plan_id=None):
+        a = {"goal": goal, "thought": "t", "step_number": n, "total_steps": 3,
+             "need_more_thinking": more}
+        if tasks is not None:
+            a["task_list"] = tasks
+        if plan_id is not None:
+            a["plan_id"] = plan_id
+        return self.h.dispatch("plan_and_think", a)
+
+    def test_drifted_goal_while_continuing_is_refused_with_the_list(self):
+        r1 = self.step("Q3 리포트를 요약한다", 1)
+        r2 = self.step("Q3 리포트를 요약하고 정리한다", 2)   # drift
+        self.assertFalse(r2["ok"])
+        self.assertEqual(r2["error_code"], "GOAL_NOT_MATCHED")
+        self.assertEqual(r2["next_action"], "CALL_PLAN_AND_THINK")
+        self.assertEqual([p["plan_id"] for p in r2["active_plans"]], [r1["plan_id"]])
+        self.assertEqual(r2["active_plans"][0]["goal"], "Q3 리포트를 요약한다")
+        # No second plan was created.
+        raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(raw["plans"]), 1)
+
+    def test_picking_the_exact_goal_continues_the_plan(self):
+        r1 = self.step("원래 목표", 1)
+        r2 = self.step("드리프트된 목표", 2)
+        exact = r2["active_plans"][0]["goal"]
+        r3 = self.step(exact, 2, more=False, tasks=["작업"])
+        self.assertTrue(r3["ok"])
+        self.assertEqual(r3["plan_id"], r1["plan_id"])
+        self.assertEqual(r3["plan_status"], "AWAITING_APPROVAL")
+
+    def test_plan_id_continues_across_a_goal_change(self):
+        r1 = self.step("목표A", 1)
+        r2 = self.step("완전히 다른 표현", 2, more=False, tasks=["작업"], plan_id=r1["plan_id"])
+        self.assertTrue(r2["ok"])
+        self.assertEqual(r2["plan_id"], r1["plan_id"])
+
+    def test_step1_new_goal_creates_a_new_plan_even_with_actives(self):
+        r1 = self.step("첫 대화", 1, more=False, tasks=["a"])
+        r2 = self.step("둘째 대화", 1, more=False, tasks=["b"])   # step 1 = starting fresh
+        self.assertTrue(r2["ok"])
+        self.assertNotEqual(r2["plan_id"], r1["plan_id"])
+
+    def test_trailing_punctuation_does_not_fork(self):
+        r1 = self.step("파일을 찾는다", 1)
+        r2 = self.step("파일을 찾는다.", 2, more=False, tasks=["찾기"])   # period only
+        self.assertTrue(r2["ok"])
+        self.assertEqual(r2["plan_id"], r1["plan_id"])
+
+    def test_drift_with_no_active_plans_just_starts_one(self):
+        """step>1 but nothing active: recover by starting, don't error out."""
+        r = self.step("갑자기 2단계", 2, more=False, tasks=["작업"])
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["plan_status"], "AWAITING_APPROVAL")
+
+    def test_concurrent_drafts_still_route_by_goal(self):
+        """Two conversations drafting at once: goal match must still isolate them."""
+        a1 = self.step("대화A 목표", 1)
+        b1 = self.step("대화B 목표", 1)
+        self.assertNotEqual(a1["plan_id"], b1["plan_id"])
+        # A continues with its exact goal — must hit A, not B, not a fork.
+        a2 = self.step("대화A 목표", 2, more=False, tasks=["A작업"])
+        self.assertEqual(a2["plan_id"], a1["plan_id"])
+        # B drifts while continuing — ambiguous list, no fork.
+        b2 = self.step("대화B 목표 살짝 다름", 2)
+        self.assertEqual(b2["error_code"], "GOAL_NOT_MATCHED")
+        self.assertEqual({p["plan_id"] for p in b2["active_plans"]},
+                         {a1["plan_id"], b1["plan_id"]})
+
     def test_new_goal_never_inherits_an_approval(self):
         """A different goal must not ride on an approved plan's execution licence.
 

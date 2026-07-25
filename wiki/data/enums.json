@@ -1,5 +1,5 @@
 {
-  "_comment": "Generated from planning/models.py — the single source of truth. Do not hand-edit; regenerate.",
+  "_comment": "Generated from planning/models.py. Regenerate; do not hand-edit.",
   "plan_status": [
     "NONE",
     "DRAFTING",
@@ -42,6 +42,7 @@
     "APPROVAL_NOT_REQUESTED",
     "APPROVAL_EXPIRED",
     "PLAN_AMBIGUOUS",
+    "GOAL_NOT_MATCHED",
     "INVALID_STATUS",
     "INVALID_DECISION",
     "INVALID_STEP",

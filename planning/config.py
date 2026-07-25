@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SERVER_NAME = "planning-mcp"
-SERVER_VERSION = "1.8.1"
+SERVER_VERSION = "1.8.2"
 
 # The state dir is resolved from this file, NOT from the working directory.
 # AnythingLLM spawns the server with its own CWD, which is why plans "disappear"

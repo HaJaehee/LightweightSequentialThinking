@@ -129,6 +129,19 @@ objects, mixed types, nulls, 100k-char strings across all four tools — it must
 
 ---
 
+<a id="d13"></a>
+## D13 — Goal drift forked plans silently (1.8.2)
+**Symptom:** during multi-step drafting, the model rephrasing its `goal` between steps created a
+second (third, …) plan; at approval time the model hit `PLAN_AMBIGUOUS` with plans it didn't
+know it had. A period-only difference ("find file" vs "find file.") also forked.
+**Root cause:** routing was by exact goal string, and the model repeating the goal verbatim
+every step is exactly the kind of discipline a weak model lacks.
+**Fix:** use `step_number` as the start-vs-continue signal. `step==1` starts a new plan;
+`step>1` with no goal match returns `GOAL_NOT_MATCHED` + the active-goal list so the model picks
+the exact one (or sends `plan_id`), never forking. Goal matching ignores trailing punctuation.
+**Lesson:** any routing key the *model* must reproduce is a key the model can forget — give it a
+way to recover (a list to pick from) instead of guessing on its behalf.
+
 ## Where the next bug probably is
 
 Judging by the pattern (bugs cluster in untested seams and failure paths), the thinner-covered

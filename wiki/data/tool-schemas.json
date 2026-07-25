@@ -1,5 +1,5 @@
 {
-  "_comment": "Generated from planning/schemas.py (built from planning/models.py). The authoritative MCP tools/list payload. Regenerate; do not hand-edit.",
+  "_comment": "Generated from planning/schemas.py. Regenerate; do not hand-edit.",
   "tools": [
     {
       "name": "plan_and_think",
@@ -40,6 +40,10 @@
             "type": "integer",
             "minimum": 1,
             "description": "OPTIONAL. Only set this when you are CORRECTING an earlier thinking step. Set it to the step_number you are replacing. Example: 2"
+          },
+          "plan_id": {
+            "type": "string",
+            "description": "OPTIONAL. Leave this out unless the server asks for it. If several plans are active at the same time, set it to the plan_id this conversation has been receiving in every response. Example: \"plan_20260724_0002\""
           }
         },
         "required": [

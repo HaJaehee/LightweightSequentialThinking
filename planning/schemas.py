@@ -125,6 +125,7 @@ PLAN_AND_THINK_SCHEMA: dict[str, Any] = {
                 "to the step_number you are replacing. Example: 2"
             ),
         },
+        "plan_id": _PLAN_ID_PARAM,
     },
     "required": ["goal", "thought", "step_number", "total_steps", "need_more_thinking"],
 }

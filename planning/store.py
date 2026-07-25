@@ -24,6 +24,16 @@ from .models import Plan, PlanStatus, TERMINAL_PLAN_STATUSES, now_iso  # noqa: F
 log = logging.getLogger("planning-mcp.store")
 
 SCHEMA_VERSION = 1
+
+# Trailing sentence punctuation and whitespace that must not fork a plan.
+_GOAL_TRIM = " \t\r\n.!?,;:。！？．…"
+
+
+def goal_key(goal: str) -> str:
+    """Normalized key for goal-based routing. Conservative: only trims edges."""
+    return (goal or "").strip().strip(_GOAL_TRIM).strip()
+
+
 STATE_FILENAME = "plan_state.json"
 AUDIT_FILENAME = "audit.jsonl"
 LOCK_FILENAME = ".lock"
@@ -72,12 +82,17 @@ class State:
         return live
 
     def plan_for_goal(self, goal: str) -> Plan | None:
-        """Route by goal: within one conversation the model repeats it every step."""
-        goal = (goal or "").strip()
-        if not goal:
+        """Route by goal: within one conversation the model repeats it every step.
+
+        Matching is normalized so a trailing period or stray whitespace does not fork a
+        second plan (a demonstrated failure). It stays conservative — case and wording
+        must still match — so two genuinely different conversations are not merged.
+        """
+        key = goal_key(goal)
+        if not key:
             return None
         for plan in self.active_plans():
-            if plan.goal.strip() == goal:
+            if goal_key(plan.goal) == key:
                 return plan
         return None
 

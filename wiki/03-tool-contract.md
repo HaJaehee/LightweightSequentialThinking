@@ -21,7 +21,14 @@ Optional: `task_list` (required when finalizing), `revises_step`, `plan_id`.
 
 - **Routing by goal.** The model repeats the same `goal` on every step (the system prompt tells
   it to), so a matching active plan *is* this session's plan. A different goal starts its own
-  new plan and never touches another session's. See [05](05-concurrency-and-sessions.md).
+  new plan and never touches another conversation's. Optional `plan_id` overrides goal routing.
+- **Goal-drift protection (1.8.2).** If the model is *continuing* (`step_number > 1`) but its
+  goal matches no active plan — i.e. the goal drifted — the server does **not** fork a new plan.
+  It returns `GOAL_NOT_MATCHED` with an `active_plans` directory (id + goal), telling the model
+  to call again with the exact goal shown, or the `plan_id`, or `step_number=1` for a genuinely
+  new plan. `step_number == 1` with a new goal always starts a new plan (so new conversations
+  work). Goal matching ignores trailing punctuation/whitespace. See
+  [05](05-concurrency-and-sessions.md#goal-drift).
 - On finalize → `plan_status: AWAITING_APPROVAL`, `next_action: CALL_REQUEST_USER_APPROVAL`.
 - Guard rails: missing/empty `task_list` on finalize → `MISSING_TASK_LIST`; `step_number`
   jumps/repeats are auto-normalized (never an error); `revises_step` marks the old step
@@ -79,6 +86,7 @@ Every error maps to a `next_action` that tells the model how to recover. Full li
 | `APPROVAL_NOT_REQUESTED` | approving a version never shown | `CALL_REQUEST_USER_APPROVAL` |
 | `APPROVAL_EXPIRED` | approval idle past TTL | `CALL_REQUEST_USER_APPROVAL` |
 | `PLAN_AMBIGUOUS` | several plans active, no `plan_id` given | `CALL_GET_CURRENT_PLAN` |
+| `GOAL_NOT_MATCHED` | continuing (step>1) but goal matches no plan (drift) | `CALL_PLAN_AND_THINK` (with the exact goal from `active_plans`) |
 | `TASK_NOT_FOUND` | bad `task_id` | `CALL_UPDATE_TASK_PROGRESS` (with valid ids listed) |
 | `INTERNAL_ERROR` | something unexpected | `CALL_GET_CURRENT_PLAN` (resync) |
 

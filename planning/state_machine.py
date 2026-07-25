@@ -90,6 +90,15 @@ def _error_action(plan: Plan | None, code: ErrorCode) -> tuple[str, str]:
             "it is the plan_id this conversation has been receiving in every response. "
             "Call get_current_plan with plan_id='current' if you need the list.",
         )
+    if code is ErrorCode.GOAL_NOT_MATCHED:
+        return (
+            NextAction.CALL_PLAN_AND_THINK.value,
+            "You said you are continuing (step_number > 1), but no active plan has this "
+            "goal. Do not start a new plan by drifting the goal. Look at active_plans "
+            "below: if one of them is what you are working on, call plan_and_think again "
+            "with its EXACT goal text (or its plan_id). If this really is a brand-new "
+            "plan, call again with step_number=1.",
+        )
     if code is ErrorCode.INVALID_STATUS:
         return (
             NextAction.CALL_UPDATE_TASK_PROGRESS.value,

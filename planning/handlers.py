@@ -259,17 +259,41 @@ class PlanningHandlers:
         state = self.store.load()
         goal = (args.get("goal") or "").strip()
         thought = (args.get("thought") or "").strip()
+        step_number = args.get("step_number")
+        continuing = isinstance(step_number, int) and step_number > 1
 
-        # Route by goal. Within one conversation the model repeats the same goal on
-        # every step, so a matching active plan is this session's plan. A different goal
-        # belongs to a different session and gets its own plan - it must never evict
-        # somebody else's work, which is what a single active-plan slot used to do.
-        plan = state.plan_for_goal(goal)
+        # Routing, in priority order:
+        #   1. explicit plan_id wins;
+        #   2. exact (normalized) goal match - the model repeats its goal each step;
+        #   3. no match while CONTINUING (step > 1) - do not fork a plan on drifted goal;
+        #      hand the model the list of active goals so it picks the exact one;
+        #   4. no match while STARTING (step 1) - a genuinely new plan.
+        plan = None
+        pid_arg = args.get("plan_id")
+        if isinstance(pid_arg, str) and pid_arg.strip().lower() not in (
+            "", "current", "active", "latest"
+        ):
+            plan = state.plans.get(pid_arg.strip())
+        if plan is None:
+            plan = state.plan_for_goal(goal)
         if plan is None and not goal:
-            resolved = self._resolve_plan(state, args.get("plan_id"))
+            resolved = self._resolve_plan(state, pid_arg)
             plan = None if resolved is self._AMBIGUOUS else resolved
         if plan is not None and plan.status in TERMINAL_PLAN_STATUSES:
             plan = None  # a finished plan is never resurrected; this starts a new one
+
+        # The requested feature: no exact goal match, but the model believes it is
+        # continuing. Rather than silently create a second plan (goal drift = fork),
+        # return the active goals and let the model pick the exact one.
+        if plan is None and goal and continuing and state.active_plans():
+            self.store.audit("goal_not_matched", goal=goal, step_number=step_number)
+            return error(
+                None,
+                ErrorCode.GOAL_NOT_MATCHED,
+                f"No active plan matches the goal '{goal}'.",
+                notes=notes,
+                active_plans=self._plan_directory(state),
+            )
 
         if self._expire_stale_approval(state, plan):
             notes.append(
