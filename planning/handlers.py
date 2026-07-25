@@ -61,8 +61,12 @@ class PlanningHandlers:
         progress_token: Any = None,
         notifier: Any = None,
     ) -> dict[str, Any]:
-        clean, notes = normalize(tool_name, raw_args)
+        notes: list[str] = []
         try:
+            # normalize() lives inside the guard on purpose: were it to raise on some
+            # unforeseen input it would otherwise escape as a raw JSON-RPC error, when a
+            # weak model needs the graceful ok:false + next_action instead.
+            clean, notes = normalize(tool_name, raw_args)
             # Serialized against other threads AND other server processes on the same
             # state directory. The blocking approval wait explicitly gives this up
             # (see _wait_for_human) so one pending approval cannot freeze every other

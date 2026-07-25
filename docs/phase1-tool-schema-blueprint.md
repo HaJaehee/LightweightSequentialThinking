@@ -424,6 +424,12 @@ No active plan:
 
 ## 6. Input leniency layer (server-side, invisible to the LLM)
 
+`normalize()` runs **inside** the handler's exception guard. It used to run before it, so an
+unforeseen input that made it raise escaped as a raw JSON-RPC error instead of the graceful
+`ok:false` a weak model can act on. It also drops non-string keys instead of calling `.lower()`
+on them, and rejects NaN/inf where an integer is expected. Fuzzed against nested objects, mixed
+types, nulls and 100k-char strings across all four tools — it must never raise.
+
 Applied before validation so that near-miss calls succeed instead of erroring:
 
 - Case/alias normalization: `done|complete|completed|finished` → `DONE`; `in progress|started|doing|running` → `IN_PROGRESS`; `fail|error|failed` → `FAILED`; `yes|y|ok|approve|승인|네` → `APPROVED`; `no|cancel|reject|취소|아니오` → `REJECTED`.

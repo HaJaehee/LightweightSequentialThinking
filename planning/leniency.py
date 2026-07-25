@@ -203,6 +203,11 @@ def normalize(tool_name: str, args: Any) -> tuple[dict[str, Any], list[str]]:
         if key in allowed:
             clean[key] = value
             continue
+        # JSON keys are strings, but a crafted client could send otherwise; a
+        # non-string key must be dropped, not crash the whole call.
+        if not isinstance(key, str):
+            notes.append(f"Ignored non-text parameter key {key!r}.")
+            continue
         # Common misspellings weak models produce for the id fields.
         lowered = key.lower().replace("-", "_")
         remap = {

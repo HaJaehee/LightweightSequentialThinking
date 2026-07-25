@@ -14,6 +14,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from unittest import mock
 import tempfile
@@ -151,6 +152,51 @@ class TestLeniency(unittest.TestCase):
         clean, notes = normalize("plan_and_think", "not a dict")
         self.assertEqual(clean, {})
         self.assertTrue(notes)
+
+    # ---- normalize must never raise, whatever the model sends -----------
+    HOSTILE_ARGS = [
+        {"task_list": [{"title": {"nested": "dict"}}]},        # title value is a dict
+        {"task_list": [[1, 2], None, {"x": 1}]},               # list of junk
+        {"task_list": {"2": ["a"], "1": None}},                # dict of junk values
+        {"task_list": [{"title": ["a", "b"]}]},                # title value is a list
+        {"step_number": [1, 2, 3]},                             # int field is a list
+        {"step_number": {"n": 1}},                             # int field is a dict
+        {"need_more_thinking": {"maybe": True}},               # bool field is a dict
+        {"status": ["DONE"]},                                  # enum field is a list
+        {"decision": {"x": 1}},                                # enum field is a dict
+        {"task_list": "a" * 100_000},                          # very long string
+        {"goal": None, "thought": None},                       # explicit nulls
+        {"task_id": "1" * 5000},                               # absurd number string
+        {"result_log": {"nested": {"deep": {"deeper": 1}}}},   # nested object scalar
+        {"": "empty key", "\n": "newline key"},                # odd keys
+        {"revises_step": float("nan")},                        # NaN
+        {"total_steps": float("inf")},                         # infinity
+        {"task_list": []},                                     # empty list
+        {"task_list": [""]},                                   # list of empty string
+    ]
+
+    def test_normalize_never_raises_on_hostile_input(self):
+        for tool in ("plan_and_think", "update_task_progress",
+                     "request_user_approval", "get_current_plan"):
+            for args in self.HOSTILE_ARGS:
+                try:
+                    clean, notes = normalize(tool, args)
+                except Exception as exc:  # noqa: BLE001
+                    self.fail(f"normalize({tool}, {args!r}) raised {type(exc).__name__}: {exc}")
+                self.assertIsInstance(clean, dict)
+                self.assertIsInstance(notes, list)
+
+    def test_normalize_non_string_keys(self):
+        # JSON cannot produce these, but a crafted client could.
+        clean, notes = normalize("update_task_progress", {5: "x", None: "y", "status": "DONE"})
+        self.assertIsInstance(clean, dict)
+        self.assertEqual(clean.get("status"), "DONE")
+
+    def test_nan_and_inf_ints_are_rejected(self):
+        clean, _ = normalize("plan_and_think", {"step_number": float("nan"),
+                                                "total_steps": float("inf")})
+        self.assertNotIn("step_number", clean)
+        self.assertNotIn("total_steps", clean)
 
 
 # ===========================================================================
@@ -1268,6 +1314,21 @@ class TestApprovalQueueEdges(HandlerTestCase):
         self.assertEqual(len(s.peek()), 1)
 
 
+class TestLeniencyDispatchEdges(HandlerTestCase):
+    def test_dispatch_survives_every_hostile_input(self):
+        """The real guarantee: hostile args yield the contract, never a raw error."""
+        for tool in ("plan_and_think", "update_task_progress",
+                     "request_user_approval", "get_current_plan"):
+            for args in TestLeniency.HOSTILE_ARGS:
+                res = self.h.dispatch(tool, args)
+                self.assertContract(res)
+
+    def test_dispatch_with_non_dict_args_gives_the_contract(self):
+        for bad in ("string", 42, [1, 2], None, True):
+            res = self.h.dispatch("plan_and_think", bad)
+            self.assertContract(res)
+
+
 class TestStoreFailureEdges(HandlerTestCase):
     def test_failed_save_is_not_reported_as_success(self):
         """A write that never landed must not come back as ok:true."""
@@ -1408,6 +1469,94 @@ class TestApprovalStoreFailureEdges(HandlerTestCase):
             Config(state_dir=self.state_dir, blocking_approval=True, approval_timeout=1),
             approval_ui=ui,
         )
+
+
+class TestApprovalPageSurface(HandlerTestCase):
+    """The page HTML/JS itself. The full click-through was verified in a real browser;
+    these guard the template against regression without needing one."""
+
+    def serve(self):
+        srv = ApprovalServer(ApprovalStore(self.state_dir / "page"), port=8788,
+                             open_browser=False)
+        self.assertTrue(srv.start())
+        return srv
+
+    def get(self, srv, path):
+        with urllib.request.urlopen(srv.url + path, timeout=5) as r:
+            return r.read().decode("utf-8")
+
+    def test_root_serves_html_with_the_escaping_function(self):
+        srv = self.serve()
+        try:
+            html = self.get(srv, "")
+            self.assertIn("<!doctype html>", html.lower())
+            # The client-side escaper is what neutralises HTML in plan text.
+            self.assertIn("function esc(", html)
+            self.assertIn("&amp;", html)  # esc maps & -> &amp;
+            self.assertIn("function decide(", html)
+        finally:
+            srv.shutdown()
+
+    def test_api_returns_content_raw_for_the_client_to_escape(self):
+        """Escaping is the page's job; the API must not double-escape or drop content."""
+        srv = self.serve()
+        try:
+            srv.store.publish("p", "<script>x</script>", "d & <b>", [], "fp")
+            payload = json.loads(self.get(srv, "api/pending"))
+            entry = payload["requests"][0]
+            self.assertEqual(entry["goal"], "<script>x</script>")
+            self.assertEqual(entry["display"], "d & <b>")
+        finally:
+            srv.shutdown()
+
+    def test_health_endpoint_identifies_the_server(self):
+        srv = self.serve()
+        try:
+            info = json.loads(self.get(srv, "api/health"))
+            self.assertEqual(info["server"], "planning-mcp-approval")
+            self.assertIn("state_dir", info)
+        finally:
+            srv.shutdown()
+
+    def test_decide_endpoint_round_trip(self):
+        srv = self.serve()
+        try:
+            rid = srv.store.publish("p", "g", "d", [], "fp")
+            body = json.dumps({"id": rid, "decision": "APPROVED", "comment": "좋아요"}).encode()
+            req = urllib.request.Request(srv.url + "api/decide", data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                self.assertTrue(json.loads(r.read().decode())["ok"])
+            self.assertEqual(srv.claim(rid), ("APPROVED", "좋아요"))
+        finally:
+            srv.shutdown()
+
+    def test_decide_with_bad_body_is_rejected_not_crashed(self):
+        srv = self.serve()
+        try:
+            for body in (b"not json", b'{"id":"x"}', b'{"decision":"MAYBE"}', b"{}"):
+                req = urllib.request.Request(srv.url + "api/decide", data=body,
+                                             headers={"Content-Type": "application/json"})
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        payload = json.loads(r.read().decode())
+                        self.assertFalse(payload.get("ok"))
+                except urllib.error.HTTPError as e:
+                    self.assertIn(e.code, (400, 404))
+        finally:
+            srv.shutdown()
+
+    def test_unknown_path_is_404_not_500(self):
+        srv = self.serve()
+        try:
+            for path in ("nope", "api/nope", "../etc/passwd", "api/pending/x"):
+                try:
+                    with urllib.request.urlopen(srv.url + path, timeout=5) as r:
+                        self.assertNotEqual(r.status, 500)
+                except urllib.error.HTTPError as e:
+                    self.assertEqual(e.code, 404)
+        finally:
+            srv.shutdown()
 
 
 class TestPlanStateEdges(HandlerTestCase):
