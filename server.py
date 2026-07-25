@@ -53,6 +53,9 @@ def build_protocol(config: Config, log=None) -> McpProtocol:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog=SERVER_NAME, description=__doc__)
+    parser.add_argument(
+        "--version", action="version", version=f"{SERVER_NAME} {SERVER_VERSION}"
+    )
     parser.add_argument("--transport", choices=("stdio", "sse"), default="stdio")
     parser.add_argument("--host", default="127.0.0.1", help="SSE bind address (loopback only)")
     parser.add_argument("--port", type=int, default=8931, help="SSE port")
