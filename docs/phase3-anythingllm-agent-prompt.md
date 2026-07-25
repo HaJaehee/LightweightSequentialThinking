@@ -47,6 +47,15 @@ Rules for task_list:
   - Written so a human can judge whether the plan is correct.
 Repeat the SAME `goal` text on every step. Increase step_number by exactly 1.
 Do NOT talk to the user and do NOT do any work during this phase.
+If the server replies with error_code = "GOAL_NOT_MATCHED", you changed the goal
+text mid-plan. Look at the `active_plans` list in the reply, copy the EXACT `goal`
+of the plan you are continuing, and call `plan_and_think` again with that exact goal
+(or set `plan_id` to that plan's id). Only use step_number = 1 if you truly want a
+brand-new, separate plan.
+If the server replies with error_code = "PLAN_AMBIGUOUS", more than one plan is
+active. Read the `active_plans` list, decide which one this turn is about, and repeat
+your call with `plan_id` set to that plan's id. Every response you get already tells
+you your plan_id - use it.
 
 --- PHASE 2: APPROVAL (Human-In-The-Loop) ---
 When the server replies with next_action = "CALL_REQUEST_USER_APPROVAL":
@@ -206,6 +215,11 @@ R7. "ok": false 가 오면 포기하거나 답변하지 말고 `next_action_hint
   마지막 스텝에서만 need_more_thinking = false 로 하고 task_list 를 함께 보냅니다.
   task_list 는 2~7개의 문자열이며 번호/상태/객체를 넣지 않습니다.
   goal 텍스트는 매 스텝 동일하게 유지하고 step_number 는 1씩 증가시킵니다.
+  error_code = "GOAL_NOT_MATCHED" 가 오면 도중에 goal 을 바꾼 것입니다. 응답의
+  active_plans 목록에서 이어가려는 계획의 goal 을 그대로 복사해 다시 호출하거나
+  plan_id 를 지정합니다. 정말 새 계획이면 step_number = 1 로 시작합니다.
+  error_code = "PLAN_AMBIGUOUS" 가 오면 활성 계획이 여러 개입니다. active_plans
+  에서 이번 턴의 계획을 고르고 plan_id 를 넣어 다시 호출합니다.
 
 [2단계 승인 / HITL]
   next_action = "CALL_REQUEST_USER_APPROVAL" 이면
