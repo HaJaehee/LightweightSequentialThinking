@@ -57,8 +57,13 @@ def main(argv: list[str] | None = None) -> int:
         "--version", action="version", version=f"{SERVER_NAME} {SERVER_VERSION}"
     )
     parser.add_argument("--transport", choices=("stdio", "sse"), default="stdio")
-    parser.add_argument("--host", default="127.0.0.1", help="SSE bind address (loopback only)")
-    parser.add_argument("--port", type=int, default=8931, help="SSE port")
+    # No argparse defaults here: a default would be indistinguishable from an explicit
+    # flag, so it would silently override PLANNING_MCP_SSE_HOST/PORT. None means
+    # "not given" and the env-derived config value is used.
+    parser.add_argument("--host", default=None,
+                        help="SSE bind address, loopback only (env: PLANNING_MCP_SSE_HOST)")
+    parser.add_argument("--port", type=int, default=None,
+                        help="SSE port (env: PLANNING_MCP_SSE_PORT, default 8931)")
     parser.add_argument("--state-dir", default=None, help="Override PLANNING_MCP_STATE_DIR")
     parser.add_argument("--log-level", default=None, help="DEBUG / INFO / WARNING / ERROR")
     args = parser.parse_args(argv)
@@ -90,7 +95,11 @@ def main(argv: list[str] | None = None) -> int:
     protocol = build_protocol(config, log=log)
 
     if args.transport == "sse":
-        serve_sse(protocol, host=args.host, port=args.port)
+        serve_sse(
+            protocol,
+            host=args.host or config.sse_host,
+            port=args.port or config.sse_port,
+        )
     else:
         serve_stdio(protocol)
     return 0

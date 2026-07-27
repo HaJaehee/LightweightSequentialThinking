@@ -174,6 +174,8 @@ docs/                     Phase 1~4: 스키마, 아키텍처, 에이전트 프�
 | `PLANNING_MCP_MAX_TASKS` | `12` | 초과 작업 목록은 거부 대신 잘라냄 |
 | `PLANNING_MCP_BLOCKING_APPROVAL` | `true` | 승인 도구가 사람이 결정할 때까지 반환을 보류 (에이전트 루프 정지). `false`면 "멈춰라"고 말만 함 |
 | `PLANNING_MCP_APPROVAL_PORT` | `8765` | 승인 페이지 포트 (127.0.0.1 전용) |
+| `PLANNING_MCP_SSE_PORT` | `8931` | SSE 트랜스포트 포트 (`--transport sse` 일 때). CLI `--port` 가 우선 |
+| `PLANNING_MCP_SSE_HOST` | `127.0.0.1` | SSE 바인드 주소. 루프백 외 주소는 코드가 거부 |
 | `PLANNING_MCP_APPROVAL_TIMEOUT` | `900` | 승인 대기 상한(초). `progressToken`이 없으면 55초로 자동 축소 |
 | `PLANNING_MCP_APPROVAL_OPEN_BROWSER` | `true` | 승인 요청 시 브라우저 자동 실행 |
 | `PLANNING_MCP_APPROVAL_TTL` | `1800` | 승인 유효 시간(초). 이만큼 방치된 계획은 승인이 만료되어 재승인이 필요 |

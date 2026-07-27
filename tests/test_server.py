@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
 import socket
 import sys
 import threading
@@ -674,6 +675,55 @@ class TestTaskCompletionEnforcement(HandlerTestCase):
             json.dumps(raw, ensure_ascii=False), encoding="utf-8")
         after = self.h._fingerprint(self.h.store.load().active_plan)
         self.assertNotEqual(before, after)
+
+
+class TestPortConfiguration(unittest.TestCase):
+    """Ports must be settable from the environment: AnythingLLM's MCP config sets `env`
+    far more naturally than it sets `args`."""
+
+    def env(self, **overrides):
+        with mock.patch.dict(os.environ, overrides, clear=False):
+            return Config.from_env()
+
+    def test_approval_port_defaults_to_8765(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(Config.from_env().approval_port, 8765)
+
+    def test_approval_port_from_env(self):
+        self.assertEqual(self.env(PLANNING_MCP_APPROVAL_PORT="8899").approval_port, 8899)
+
+    def test_sse_port_and_host_from_env(self):
+        cfg = self.env(PLANNING_MCP_SSE_PORT="9001", PLANNING_MCP_SSE_HOST="localhost")
+        self.assertEqual(cfg.sse_port, 9001)
+        self.assertEqual(cfg.sse_host, "localhost")
+
+    def test_sse_defaults(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            cfg = Config.from_env()
+            self.assertEqual(cfg.sse_port, 8931)
+            self.assertEqual(cfg.sse_host, "127.0.0.1")
+
+    def test_garbage_port_falls_back_to_the_default(self):
+        self.assertEqual(self.env(PLANNING_MCP_APPROVAL_PORT="not-a-port").approval_port, 8765)
+
+    def _run_sse(self, argv, **env):
+        """Run server.main for the SSE transport without actually serving."""
+        import server as server_module
+        env = dict(env, PLANNING_MCP_BLOCKING_APPROVAL="false",
+                   PLANNING_MCP_STATE_DIR=tempfile.mkdtemp())
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(server_module, "serve_sse") as served:
+            server_module.main(["--transport", "sse", *argv])
+        return served.call_args.kwargs
+
+    def test_env_port_is_used_when_no_cli_flag(self):
+        """The bug this guards: an argparse default would silently beat the env var."""
+        kwargs = self._run_sse([], PLANNING_MCP_SSE_PORT="9100")
+        self.assertEqual(kwargs["port"], 9100)
+
+    def test_cli_flag_overrides_the_env(self):
+        kwargs = self._run_sse(["--port", "9200"], PLANNING_MCP_SSE_PORT="9100")
+        self.assertEqual(kwargs["port"], 9200)
 
 
 class TestGoalDriftRouting(HandlerTestCase):

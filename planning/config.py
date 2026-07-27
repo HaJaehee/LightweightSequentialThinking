@@ -59,6 +59,10 @@ class Config:
     max_active_plans: int = 5
     completion_approval: bool = True
     min_result_log: int = 8
+    # SSE transport. CLI flags still win; these exist because AnythingLLM's MCP config
+    # sets `env` more naturally than it sets `args`.
+    sse_host: str = "127.0.0.1"
+    sse_port: int = 8931
 
     @classmethod
     def from_env(cls, state_dir_override: str | None = None) -> "Config":
@@ -79,6 +83,8 @@ class Config:
             max_active_plans=_env_int("PLANNING_MCP_MAX_ACTIVE_PLANS", 5),
             completion_approval=_env_bool("PLANNING_MCP_COMPLETION_APPROVAL", True),
             min_result_log=_env_int("PLANNING_MCP_MIN_RESULT_LOG", 8),
+            sse_host=os.environ.get("PLANNING_MCP_SSE_HOST", "127.0.0.1"),
+            sse_port=_env_int("PLANNING_MCP_SSE_PORT", 8931),
         )
 
 

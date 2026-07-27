@@ -83,15 +83,28 @@
       "env": "PLANNING_MCP_MIN_RESULT_LOG",
       "default": 8,
       "purpose": "Minimum normalized length of result_log evidence for DONE. Bare success phrases and task-title echoes are rejected regardless of length."
+    },
+    {
+      "field": "sse_host",
+      "env": "PLANNING_MCP_SSE_HOST",
+      "default": "127.0.0.1",
+      "purpose": "SSE bind address when --transport sse. Loopback only; other addresses are refused in code. CLI --host wins."
+    },
+    {
+      "field": "sse_port",
+      "env": "PLANNING_MCP_SSE_PORT",
+      "default": 8931,
+      "purpose": "SSE transport port. CLI --port wins; there is deliberately no argparse default so the flag's absence cannot override the env var."
     }
   ],
   "cli": {
     "server.py": [
       "--transport stdio|sse",
-      "--host",
-      "--port",
+      "--host (overrides PLANNING_MCP_SSE_HOST)",
+      "--port (overrides PLANNING_MCP_SSE_PORT)",
       "--state-dir",
-      "--log-level"
+      "--log-level",
+      "--version"
     ]
   },
   "windows_env_recommended": {
