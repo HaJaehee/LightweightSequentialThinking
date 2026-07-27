@@ -1283,7 +1283,8 @@ class TestBlockingApproval(HandlerTestCase):
         self.draft(h)
         res = self.ask(h)
         self.assertEqual(res["approval_url"], "http://127.0.0.1:8899/")
-        self.assertIn("http://127.0.0.1:8899/", res["display_to_user"])
+        # The chat line drops the trailing slash for readability; the field keeps it.
+        self.assertIn("현재 페이지: http://127.0.0.1:8899", res["display_to_user"])
 
     def test_out_of_band_decision_is_audited(self):
         h = self.blocking(FakeApprovalUI("APPROVED", "승인"))

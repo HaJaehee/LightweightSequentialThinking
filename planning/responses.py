@@ -85,7 +85,7 @@ def render_completion_report(plan: Plan, plan_summary: str | None = None) -> str
 def render_plan_for_user(plan: Plan, plan_summary: str | None = None) -> str:
     """Pre-rendered approval block. The model only has to echo this string, which is the
     single most reliable operation a weak model can perform."""
-    lines = ["PLAN FOR APPROVAL"]
+    lines = ["계획 승인 요청"]
     if plan.goal:
         lines.append(f"Goal: {plan.goal}")
     if plan_summary:
@@ -95,5 +95,5 @@ def render_plan_for_user(plan: Plan, plan_summary: str | None = None) -> str:
     for task in plan.tasks:
         lines.append(f"{task.task_id}. {task.title}")
     lines.append("")
-    lines.append("Approve this plan? (yes / no / tell me what to change)")
+    lines.append("이 계획을 승인합니까? (승인 / 수정 요청 / 거절)")
     return "\n".join(lines)

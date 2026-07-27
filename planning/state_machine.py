@@ -185,7 +185,7 @@ def _status_action(plan: Plan | None) -> tuple[str, str]:
             return (
                 NextAction.STOP_AND_WAIT_FOR_USER.value,
                 "STOP NOW. Do not call any other tool. Show the display_to_user text below to "
-                "the user and ask: 'Approve this plan? (yes / no / tell me what to change)'. "
+                "the user and ask: '이 계획을 승인합니까? (승인 / 수정 요청 / 거절)'. "
                 "Wait for their reply in the next message.",
             )
         return (

@@ -619,7 +619,7 @@ class PlanningHandlers:
         # so a blocked popup or a second monitor no longer hides the approval page.
         approval_url = self.approval_ui.url if self.approval_ui is not None else None
         if approval_url:
-            display = f"{display}\n\n승인/거절: {approval_url}"
+            display = f"{display}\n\n현재 페이지: {approval_url.rstrip('/')}"
 
         if self.approval_ui is not None:
             fingerprint = self._fingerprint(plan)
