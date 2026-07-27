@@ -41,6 +41,10 @@ class PlanStatus(str, Enum):
     AWAITING_APPROVAL = "AWAITING_APPROVAL"
     APPROVED = "APPROVED"
     IN_EXECUTION = "IN_EXECUTION"
+    # Every task is marked DONE, but the human has not yet verified the evidence.
+    # A weak model marking tasks complete without doing the work is the failure this
+    # state exists to catch, so COMPLETED is no longer reachable without a human.
+    AWAITING_COMPLETION = "AWAITING_COMPLETION"
     BLOCKED = "BLOCKED"
     COMPLETED = "COMPLETED"
     CANCELLED = "CANCELLED"
@@ -82,6 +86,10 @@ class ErrorCode(str, Enum):
     APPROVAL_EXPIRED = "APPROVAL_EXPIRED"
     PLAN_AMBIGUOUS = "PLAN_AMBIGUOUS"
     GOAL_NOT_MATCHED = "GOAL_NOT_MATCHED"
+    TASK_NOT_STARTED = "TASK_NOT_STARTED"
+    TASK_OUT_OF_ORDER = "TASK_OUT_OF_ORDER"
+    MISSING_RESULT_LOG = "MISSING_RESULT_LOG"
+    COMPLETION_PENDING = "COMPLETION_PENDING"
     INVALID_STATUS = "INVALID_STATUS"
     INVALID_DECISION = "INVALID_DECISION"
     INVALID_STEP = "INVALID_STEP"
@@ -302,6 +310,23 @@ class Plan:
 
     def all_done(self) -> bool:
         return bool(self.tasks) and all(t.status == TaskStatus.DONE.value for t in self.tasks)
+
+    def remaining_tasks(self) -> list[Task]:
+        """Tasks not yet finished. Used to keep 'work left' in front of the model."""
+        return [t for t in self.tasks if t.status != TaskStatus.DONE.value]
+
+    def unfinished_before(self, task_id: int) -> list[Task]:
+        """Earlier tasks that are not DONE - claiming a later one is finished is a lie."""
+        return [
+            t for t in self.tasks
+            if t.task_id < task_id and t.status != TaskStatus.DONE.value
+        ]
+
+    def tasks_without_evidence(self) -> list[Task]:
+        return [
+            t for t in self.tasks
+            if t.status == TaskStatus.DONE.value and not (t.result_log or "").strip()
+        ]
 
     def tasks_brief(self) -> list[dict[str, Any]]:
         return [t.brief() for t in self.tasks]

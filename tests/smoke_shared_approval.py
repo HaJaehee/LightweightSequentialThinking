@@ -1,9 +1,9 @@
 """근본 해결 검증: 프로세스가 여러 개여도 승인 페이지는 하나인가?
 
-시나리오 - 사람은 8765 탭 하나만 열어둔 상태:
+시나리오 - 사람은 승인 페이지 탭 하나만 열어둔 상태:
   1) 서버 A, B 를 같은 state_dir 로 띄운다 (A가 포트를 잡는다)
   2) B(포트를 못 잡은 쪽)가 승인을 요청한다
-  3) 8765 페이지에 B의 요청이 뜨는가?
+  3) 그 페이지에 B의 요청이 뜨는가?
   4) 그 페이지에서 승인하면 B의 블로킹 호출이 풀리는가?
   5) A를 죽이면 B가 같은 포트를 인계받는가?
 """
@@ -11,7 +11,7 @@ import json, os, subprocess, sys, tempfile, threading, time, urllib.request
 from pathlib import Path
 
 SERVER = r"D:\LightweightSequentialThinking\server.py"
-PORT = 8765
+PORT = 8781  # deliberately NOT the default 8765: a live server may hold that
 fails = []
 
 
@@ -107,7 +107,7 @@ print("== 1) 같은 state_dir 로 서버 2개 기동 ==")
 A = S(shared, "A"); time.sleep(1.5)
 B = S(shared, "B"); time.sleep(1.5)
 health = page("/api/health")
-check("8765 를 planning-mcp 가 서비스 중", health.get("server") == "planning-mcp-approval")
+check("승인 포트를 planning-mcp 가 서비스 중", health.get("server") == "planning-mcp-approval")
 check("state_dir 일치", Path(health["state_dir"]).resolve() == Path(shared).resolve())
 
 print("\n== 2) 포트를 못 잡은 B 가 승인 요청 ==")

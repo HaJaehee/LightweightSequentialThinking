@@ -142,6 +142,32 @@ the exact one (or sends `plan_id`), never forking. Goal matching ignores trailin
 **Lesson:** any routing key the *model* must reproduce is a key the model can forget — give it a
 way to recover (a list to pick from) instead of guessing on its behalf.
 
+<a id="d14"></a>
+## D14 — Tasks planned but never executed; plan reported finished (1.9.0)
+**Symptom (field report):** the small model drove one full plan-approve-update-recover cycle
+correctly, then stopped doing the actual work: it marked tasks `DONE` in a row without
+performing them and reported the plan complete.
+**Root cause:** `DONE` was accepted unconditionally. Missing `IN_PROGRESS`, missing
+`result_log`, and out-of-order completion were all *notes*, not refusals — and `all_done()`
+awarded `COMPLETED` on the model's word alone. The server treated a **claim** as a **fact**.
+**Fix, three layers:**
+1. `DONE` is refused unless the task was started, all earlier tasks are finished, and
+   `result_log` is real evidence (`TASK_NOT_STARTED` / `TASK_OUT_OF_ORDER` /
+   `MISSING_RESULT_LOG`). Since `IN_PROGRESS` already enforces order, batch-marking becomes
+   structurally impossible.
+2. Evidence is judged by **content, not length** — an exact-match filter for bare success
+   phrases ("완료", "done", "ok", repeating the task title) plus a low floor of 8 normalized
+   characters. A first attempt used a 15-character minimum and wrongly rejected
+   `"매출 표 12행을 추출함"`, a perfectly concrete Korean outcome; length is a bad proxy in a
+   dense script.
+3. `COMPLETED` is no longer reachable by the model: the last `DONE` moves the plan to
+   `AWAITING_COMPLETION`, and a human must approve a per-task **completion report**. The
+   fingerprint covers each task's status and `result_log`, so the evidence cannot be edited
+   after the human saw it.
+**Lesson:** the server cannot observe work, so anything the model *asserts* about work must
+either carry evidence or be verified by a human. Accepting an unverifiable claim with a
+warning note is the same as accepting it.
+
 ## Where the next bug probably is
 
 Judging by the pattern (bugs cluster in untested seams and failure paths), the thinner-covered

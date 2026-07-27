@@ -29,11 +29,47 @@ from .models import (
     ThinkingStep,
     now_iso,
 )
-from .responses import build, error, render_plan_for_user
+from .responses import build, error, render_completion_report, render_plan_for_user
 from .state_machine import can_start_task, execution_guard
 from .store import State, Store
 
 log = logging.getLogger("planning-mcp.handlers")
+
+# Phrases that assert completion without evidencing it. Length alone cannot separate
+# these from a genuinely terse but informative log - Korean packs a real sentence into
+# ~12 characters - so the filter is content-based and only fires on an exact match.
+_EMPTY_CLAIMS = {
+    "done", "ok", "okay", "complete", "completed", "finished", "success", "successful",
+    "task done", "task complete", "task completed", "work done", "all done", "yes",
+    "완료", "성공", "작업완료", "완료함", "완료했습니다", "완료되었습니다", "성공적으로완료",
+    "성공적으로완료했습니다", "작업을완료했습니다", "처리완료", "끝", "됐습니다", "했습니다",
+}
+
+
+def _normalize_evidence(text: str) -> str:
+    """Lowercase and strip whitespace/punctuation so claims can be compared by content."""
+    return "".join(
+        ch for ch in (text or "").lower() if not ch.isspace() and ch not in ".,!?;:-_…。、"
+    )
+
+
+def missing_evidence_reason(result_log: str, task_title: str, min_len: int) -> str | None:
+    """Why this result_log fails as proof of work, or None if it is acceptable.
+
+    The server cannot see whether work happened; the closest available check is whether
+    the model wrote something that *could only* have been written after doing it.
+    """
+    text = (result_log or "").strip()
+    if not text:
+        return "result_log was empty"
+    normalized = _normalize_evidence(text)
+    if normalized in _EMPTY_CLAIMS:
+        return "result_log only claims success without saying what was produced"
+    if normalized == _normalize_evidence(task_title):
+        return "result_log just repeats the task title instead of reporting an outcome"
+    if len(normalized) < min_len:
+        return f"result_log is too short to be a real outcome (min {min_len} characters)"
+    return None
 
 
 class PlanningHandlers:
@@ -105,8 +141,16 @@ class PlanningHandlers:
     # ---- decision application (shared by the blocking and late paths) -------
     @staticmethod
     def _fingerprint(plan: Plan) -> str:
-        """Identifies the exact plan version shown to the human."""
-        payload = plan.goal + "\x00" + "\x00".join(t.title for t in plan.tasks)
+        """Identifies the exact plan version shown to the human.
+
+        Includes each task's status and evidence, so a completion report the human
+        approved cannot be quietly rewritten afterwards - the decision would no longer
+        match and is discarded.
+        """
+        payload = "\x00".join(
+            [plan.goal]
+            + [f"{t.task_id}|{t.title}|{t.status}|{(t.result_log or '')}" for t in plan.tasks]
+        )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
     def _withdraw_approval_request(self, plan: Plan) -> None:
@@ -122,7 +166,12 @@ class PlanningHandlers:
         plan.approval.decided_at = now_iso()
         if comment:
             plan.approval.user_comment = comment
-        plan.set_status(PlanStatus.APPROVED)
+        # Approving a completion report closes the plan; approving a draft unlocks it.
+        plan.set_status(
+            PlanStatus.COMPLETED
+            if plan.status is PlanStatus.AWAITING_COMPLETION
+            else PlanStatus.APPROVED
+        )
         self._withdraw_approval_request(plan)
 
     def _mutate_rejected(self, plan: Plan, comment: str | None) -> None:
@@ -542,13 +591,28 @@ class PlanningHandlers:
                 notes=notes,
             )
 
+        # Two different questions share this tool: "may I run this plan?" before work,
+        # and "is this actually finished?" after it. The plan's status decides which,
+        # so the human always sees the right thing.
+        completion_phase = plan.status is PlanStatus.AWAITING_COMPLETION
         plan.approval.requested_at = now_iso()
         plan.approval.decision = None
         plan.approval.decided_at = None
-        plan.set_status(PlanStatus.AWAITING_APPROVAL)
+        if not completion_phase:
+            plan.set_status(PlanStatus.AWAITING_APPROVAL)
+        else:
+            plan.touch()
         self.store.save(state)
-        self.store.audit("approval_requested", plan_id=plan.plan_id, plan_summary=plan_summary)
-        display = render_plan_for_user(plan, plan_summary)
+        self.store.audit(
+            "completion_verification_requested" if completion_phase else "approval_requested",
+            plan_id=plan.plan_id,
+            plan_summary=plan_summary,
+        )
+        display = (
+            render_completion_report(plan, plan_summary)
+            if completion_phase
+            else render_plan_for_user(plan, plan_summary)
+        )
 
         # The URL only reaches the human through stderr otherwise, which nobody reads in
         # a desktop app. Putting it in display_to_user means the model prints it in chat,
@@ -722,7 +786,8 @@ class PlanningHandlers:
                 tasks=plan.tasks_brief(),
                 next_task={"task_id": task.task_id, "title": task.title} if task else None,
             )
-        if plan.status is not PlanStatus.AWAITING_APPROVAL:
+        completion_phase = plan.status is PlanStatus.AWAITING_COMPLETION
+        if plan.status is not PlanStatus.AWAITING_APPROVAL and not completion_phase:
             return error(
                 plan,
                 ErrorCode.PLAN_NOT_READY,
@@ -747,7 +812,21 @@ class PlanningHandlers:
 
         self._mutate_approved(plan, args.get("user_comment"))
         self.store.save(state)
-        self.store.audit("approved", plan_id=plan.plan_id, comment=args.get("user_comment"))
+        self.store.audit(
+            "completion_verified" if completion_phase else "approved",
+            plan_id=plan.plan_id,
+            comment=args.get("user_comment"),
+        )
+
+        if completion_phase:
+            return build(
+                plan,
+                message="The user confirmed the work is finished. The plan is now complete.",
+                notes=notes,
+                qualify=len(state.active_plans()) > 1,
+                tasks=plan.tasks_brief(),
+                progress=plan.progress(),
+            )
 
         task = plan.current_task()
         return build(
@@ -913,31 +992,87 @@ class PlanningHandlers:
     def _finish_task(
         self, state: State, plan: Plan, task: Task, args: dict[str, Any], notes: list[str]
     ) -> dict[str, Any]:
-        if task.status != TaskStatus.IN_PROGRESS.value and task.status != TaskStatus.DONE.value:
+        # Reporting DONE is a claim that work happened, and a weak model will happily
+        # fire DONE at every task in a row without doing any. The server cannot observe
+        # the work, but it can refuse claims that are structurally impossible or
+        # evidence-free. Starting the wrong task is still forgiven (a redirect); saying
+        # the wrong task is finished is not.
+        if task.status == TaskStatus.DONE.value:
+            nxt = plan.current_task()
+            return build(
+                plan,
+                message=f"Task {task.task_id} is already DONE.",
+                notes=notes,
+                qualify=len(state.active_plans()) > 1,
+                tasks=plan.tasks_brief(),
+                progress=plan.progress(),
+                next_task={"task_id": nxt.task_id, "title": nxt.title} if nxt else None,
+            )
+
+        if task.status != TaskStatus.IN_PROGRESS.value:
             self.store.audit(
-                "skipped_in_progress",
-                plan_id=plan.plan_id,
-                task_id=task.task_id,
+                "done_without_start", plan_id=plan.plan_id, task_id=task.task_id,
                 previous_status=task.status,
             )
-            notes.append(
-                f"Task {task.task_id} was marked DONE without ever being IN_PROGRESS. Accepted, "
-                "but call IN_PROGRESS before starting work next time."
+            return error(
+                plan,
+                ErrorCode.TASK_NOT_STARTED,
+                f"Task {task.task_id} was never marked IN_PROGRESS.",
+                notes=notes,
+                qualify=len(state.active_plans()) > 1,
+                tasks=plan.tasks_brief(),
+                progress=plan.progress(),
+            )
+
+        earlier = plan.unfinished_before(task.task_id)
+        if earlier:
+            self.store.audit(
+                "done_out_of_order", plan_id=plan.plan_id, task_id=task.task_id,
+                unfinished=[t.task_id for t in earlier],
+            )
+            return error(
+                plan,
+                ErrorCode.TASK_OUT_OF_ORDER,
+                f"Tasks {[t.task_id for t in earlier]} are not finished yet.",
+                notes=notes,
+                qualify=len(state.active_plans()) > 1,
+                tasks=plan.tasks_brief(),
+                progress=plan.progress(),
+            )
+
+        evidence = (args.get("result_log") or "").strip()
+        reason = missing_evidence_reason(evidence, task.title, self.config.min_result_log)
+        if reason is not None:
+            self.store.audit(
+                "done_without_evidence", plan_id=plan.plan_id, task_id=task.task_id,
+                result_log=evidence, reason=reason,
+            )
+            return error(
+                plan,
+                ErrorCode.MISSING_RESULT_LOG,
+                f"DONE refused: {reason}.",
+                notes=notes,
+                qualify=len(state.active_plans()) > 1,
+                tasks=plan.tasks_brief(),
+                progress=plan.progress(),
             )
 
         task.status = TaskStatus.DONE.value
         task.finished_at = now_iso()
-        if args.get("result_log"):
-            task.result_log = args["result_log"]
-        elif not task.result_log:
-            notes.append(
-                "No result_log was sent. Always record what you actually did - the final "
-                "answer is built from these logs."
-            )
+        task.result_log = evidence
 
         if plan.all_done():
-            plan.set_status(PlanStatus.COMPLETED)
-            self._withdraw_approval_request(plan)
+            if self.config.completion_approval:
+                # COMPLETED is no longer something the model can award itself. The human
+                # sees the per-task evidence first - the only check that catches invented
+                # result_log text.
+                plan.set_status(PlanStatus.AWAITING_COMPLETION)
+                plan.approval.reset_request()
+                self._withdraw_approval_request(plan)
+                self.store.audit("completion_pending", plan_id=plan.plan_id)
+            else:
+                plan.set_status(PlanStatus.COMPLETED)
+                self._withdraw_approval_request(plan)
         else:
             plan.set_status(PlanStatus.IN_EXECUTION)
         self.store.save(state)

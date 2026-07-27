@@ -43,6 +43,13 @@ Call this tool TWICE for every task:
   1. BEFORE you start the task  -> status = "IN_PROGRESS"
   2. AFTER you finish the task  -> status = "DONE"  (or "FAILED" if it did not work)
 Handle exactly ONE task per call. Never mark a task DONE before you actually did it.
+
+DONE IS ENFORCED. The server REFUSES a DONE that:
+  - was never marked IN_PROGRESS first,
+  - skips ahead while an earlier task is unfinished,
+  - has no result_log describing the real outcome.
+You must therefore work through EVERY task in order, one at a time. You are not
+finished until the server tells you so - keep going while it says tasks remain.
 If a task fails, set status = "FAILED" and explain in result_log - then follow the
 next_action the server gives you back."""
 
@@ -184,10 +191,11 @@ UPDATE_TASK_PROGRESS_SCHEMA: dict[str, Any] = {
         "result_log": {
             "type": "string",
             "description": (
-                "OPTIONAL but STRONGLY recommended. What you actually did or what actually went "
-                "wrong, in one or two sentences. Example: 'Found the file at "
-                "/reports/q3_sales.xlsx.'  or  'FAILED: no file matching q3 was found in "
-                "/reports.'"
+                "REQUIRED when status is DONE - the server rejects DONE without it. Write one "
+                "or two sentences stating the CONCRETE outcome of the work you just did: what "
+                "you found, where you saved it, or what you produced. 'done' / 'ok' / 'completed' "
+                "is not acceptable. Example: 'Found the file at /reports/q3_sales.xlsx.'  or  "
+                "'FAILED: no file matching q3 was found in /reports.'"
             ),
         },
         "plan_id": _PLAN_ID_PARAM,

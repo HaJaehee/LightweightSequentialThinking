@@ -83,10 +83,33 @@ For each task, in order, one at a time:
   3. `update_task_progress` (task_id = N, status = "DONE",
                              result_log = what you actually did)
 Never mark DONE before doing the work. Never skip ahead. Never batch tasks.
+
+YOU MUST FINISH EVERY TASK. A plan with 5 tasks needs 5 IN_PROGRESS calls and 5
+DONE calls - ten calls in total. The server counts them and will tell you how many
+remain in `next_action_hint`. Keep going until it stops naming a next_task.
+The server REFUSES a DONE that is not real work:
+  error_code = "TASK_NOT_STARTED"   -> you never sent IN_PROGRESS for that task
+  error_code = "TASK_OUT_OF_ORDER"  -> an earlier task is still unfinished
+  error_code = "MISSING_RESULT_LOG" -> result_log did not say what you produced
+result_log must state the concrete outcome ("saved the summary to /tmp/a.txt",
+"매출 표 12행을 추출함"). "완료" / "done" / "ok" / repeating the task title is
+rejected. If you cannot write a real outcome, you have not done the task yet.
 If a task cannot be completed:
   `update_task_progress` (task_id = N, status = "FAILED", result_log = why)
   then obey the returned next_action - normally you must re-plan and get
   approval again. Do NOT silently continue to the next task.
+
+--- PHASE 3b: COMPLETION CHECK (Human verifies the work) ---
+When the last task is DONE the plan is NOT finished. The server sets it to
+AWAITING_COMPLETION and replies next_action = "CALL_REQUEST_USER_APPROVAL".
+Call `request_user_approval` with decision = "ASK_USER" and a plan_summary that
+states, task by task, what you actually produced. The server shows the user a
+completion report built from your result_log entries. Then STOP and wait, exactly
+as in Phase 2. The user's reply decides:
+  yes / 맞아요 / 확인    -> decision = "APPROVED"  (plan becomes COMPLETED)
+  no / 안 됐어요        -> decision = "REJECTED"
+  "X 가 빠졌어요"        -> decision = "REVISE", user_comment = their words
+You may NOT declare the work finished yourself. Only the user closes a plan.
 
 --- PHASE 4: REPORT ---
 Only when next_action = "ANSWER_USER" may you write a normal answer.
@@ -237,8 +260,23 @@ R7. "ok": false 가 오면 포기하거나 답변하지 말고 `next_action_hint
   1) update_task_progress (status="IN_PROGRESS")
   2) 실제 작업 수행
   3) update_task_progress (status="DONE", result_log=실제로 한 일)
+  모든 작업을 끝까지 수행해야 합니다. 작업이 5개면 IN_PROGRESS 5회 + DONE 5회,
+  총 10회 호출입니다. 서버가 next_action_hint 에 남은 개수를 알려주니
+  next_task 가 사라질 때까지 계속 진행합니다.
+  서버는 실제 작업이 아닌 DONE 을 거부합니다:
+    TASK_NOT_STARTED   -> 그 작업에 IN_PROGRESS 를 보내지 않았음
+    TASK_OUT_OF_ORDER  -> 앞 작업이 아직 안 끝났음
+    MISSING_RESULT_LOG -> result_log 가 결과를 말하지 않음
+  result_log 는 구체적 결과여야 합니다("매출 표 12행을 추출함"). "완료"/"done"/
+  작업 제목 반복은 거부됩니다. 결과를 쓸 수 없다면 아직 안 한 것입니다.
   실패 시 status="FAILED" 와 사유를 기록하고, 다음 작업으로 넘어가지 말고
   반환된 next_action(보통 재계획)을 따릅니다.
+
+[3b단계 완료 확인] 마지막 DONE 이후에도 계획은 끝난 게 아닙니다. 서버가
+  AWAITING_COMPLETION 으로 바꾸고 CALL_REQUEST_USER_APPROVAL 을 지시합니다.
+  decision="ASK_USER" 와 작업별로 무엇을 만들었는지 담은 plan_summary 로 호출한 뒤
+  2단계와 똑같이 멈추고 기다립니다. 사용자의 답변으로 APPROVED / REJECTED /
+  REVISE 를 보고합니다. 완료 선언은 사용자만 할 수 있습니다.
 
 [4단계 보고] next_action = "ANSWER_USER" 일 때만 최종 답변을 작성합니다.
   각 작업의 result_log 를 근거로 요약하고, 실패/생략된 항목을 정직하게 밝힙니다.

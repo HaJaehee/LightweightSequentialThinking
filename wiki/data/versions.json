@@ -1,6 +1,6 @@
 {
   "_comment": "Version history. Prose detail in wiki/08-changelog.md; root causes in wiki/09-defects-and-lessons.md. current = 1.8.1.",
-  "current": "1.8.2",
+  "current": "1.9.0",
   "branch": "main",
   "remote": "github.com/HaJaehee/LightweightSequentialThinking",
   "pushed": false,
@@ -13,7 +13,8 @@
     { "version": "1.7.0", "commit": "a3456bd", "theme": "One approval surface per state dir: shared approval.json + singleton page with takeover.", "defects_fixed": ["D4"] },
     { "version": "1.8.0", "commit": "4980396", "theme": "Multi-plan: plans coexist, routed by id/goal/only-active; approval queue.", "defects_fixed": ["D7"] },
     { "version": "1.8.1", "commit": "046a75e..6d3748b", "theme": "Edge-case hunt (4 commits): thread-safe transaction, file-lock timeout, SSE fixes, failure-path honesty, leniency safety, approval-page browser verification.", "defects_fixed": ["D5", "D8", "D9", "D10", "D11", "D12"] },
-    { "version": "1.8.2", "theme": "Goal-drift routing: continuing (step>1) with an unmatched goal returns the active-goal list to pick from instead of forking a plan; plan_and_think accepts plan_id; goal matching ignores trailing punctuation.", "defects_fixed": ["D13"] }
+    { "version": "1.8.2", "theme": "Goal-drift routing: continuing (step>1) with an unmatched goal returns the active-goal list to pick from instead of forking a plan; plan_and_think accepts plan_id; goal matching ignores trailing punctuation.", "defects_fixed": ["D13"] },
+    { "version": "1.9.0", "theme": "Task completion enforced: DONE requires a prior IN_PROGRESS, in-order completion, and content-checked result_log evidence; the last DONE enters AWAITING_COMPLETION where a human verifies a per-task completion report before COMPLETED.", "defects_fixed": ["D14"] }
   ],
-  "test_counts": { "unit": 154, "smoke": 5 }
+  "test_counts": { "unit": 168, "smoke": 5 }
 }

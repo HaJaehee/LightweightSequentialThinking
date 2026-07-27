@@ -76,6 +76,17 @@ class HandlerTestCase(unittest.TestCase):
         )
         return self.h.dispatch("request_user_approval", {"decision": "APPROVED"})
 
+    def do_task(self, task_id, log=None, **kw):
+        """Run one task the way the server now demands: start, then finish with evidence."""
+        self.h.dispatch(
+            "update_task_progress", {"task_id": task_id, "status": "IN_PROGRESS", **kw}
+        )
+        return self.h.dispatch("update_task_progress", {
+            "task_id": task_id, "status": "DONE",
+            "result_log": log or f"saved output of task {task_id} to /tmp/out{task_id}.txt",
+            **kw,
+        })
+
     def assertContract(self, res):  # noqa: N802
         for field in REQUIRED_FIELDS:
             self.assertIn(field, res, f"missing {field} in {res}")
@@ -322,16 +333,18 @@ class TestStateMachine(HandlerTestCase):
 
         res = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
         self.assertEqual(res["plan_status"], "IN_EXECUTION")
-        res = self.h.dispatch(
-            "update_task_progress", {"task_id": 1, "status": "DONE", "result_log": "did a"}
-        )
+        res = self.do_task(1, log="wrote the summary to /tmp/a.txt")
         self.assertEqual(res["progress"], "1/2 done")
         self.assertEqual(res["next_task"]["task_id"], 2)
 
-        self.h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
-        res = self.h.dispatch(
-            "update_task_progress", {"task_id": 2, "status": "DONE", "result_log": "did b"}
-        )
+        # The last DONE no longer completes the plan on the model's say-so (1.9.0).
+        res = self.do_task(2, log="emailed the summary to the team lead")
+        self.assertEqual(res["plan_status"], "AWAITING_COMPLETION")
+        self.assertEqual(res["next_action"], "CALL_REQUEST_USER_APPROVAL")
+
+        self.h.dispatch("request_user_approval",
+                        {"decision": "ASK_USER", "plan_summary": "both tasks finished"})
+        res = self.h.dispatch("request_user_approval", {"decision": "APPROVED"})
         self.assertEqual(res["plan_status"], "COMPLETED")
         self.assertEqual(res["next_action"], "ANSWER_USER")
 
@@ -406,18 +419,21 @@ class TestStateMachine(HandlerTestCase):
 
     def test_done_is_idempotent(self):
         self.approve_flow(["a", "b"])
-        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
-        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "DONE"})
+        self.do_task(1)
         res = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "DONE"})
         self.assertTrue(res["ok"])
         self.assertEqual(res["progress"], "1/2 done")
 
-    def test_done_without_in_progress_is_accepted_and_audited(self):
+    def test_done_without_in_progress_is_refused(self):
+        """Claiming a task is finished without ever starting it is now rejected (1.9.0)."""
         self.approve_flow(["a", "b"])
-        res = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "DONE"})
-        self.assertTrue(res["ok"])
+        res = self.h.dispatch("update_task_progress", {
+            "task_id": 1, "status": "DONE", "result_log": "pretended to do the work"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "TASK_NOT_STARTED")
+        self.assertEqual(res["progress"], "0/2 done")
         audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
-        self.assertIn("skipped_in_progress", audit)
+        self.assertIn("done_without_start", audit)
 
     def test_approved_without_ask_is_refused(self):
         """APPROVED must be preceded by ASK_USER on the SAME plan version."""
@@ -514,6 +530,150 @@ class TestStateMachine(HandlerTestCase):
         self.think(goal="A", need_more_thinking=False, task_list=["a"])
         b = self.think(goal="B", need_more_thinking=False, task_list=["b"])
         self.assertIn(b["plan_id"], b["next_action_hint"])
+
+
+class TestTaskCompletionEnforcement(HandlerTestCase):
+    """The reported field failure: a small model marks every task DONE without doing
+    the work, then reports the plan finished (1.9.0)."""
+
+    def approved(self, n=4):
+        return self.approve_flow([f"작업{i}" for i in range(1, n + 1)])
+
+    def test_batch_marking_is_refused(self):
+        """DONE fired at every task in a row must not complete anything."""
+        self.approved()
+        for tid in (1, 2, 3, 4):
+            res = self.h.dispatch("update_task_progress", {"task_id": tid, "status": "DONE"})
+            self.assertFalse(res["ok"], f"task {tid} accepted a bare DONE")
+            self.assertEqual(res["error_code"], "TASK_NOT_STARTED")
+        cur = self.h.dispatch("get_current_plan", {"plan_id": "current"})
+        self.assertEqual(cur["progress"], "0/4 done")
+        self.assertNotEqual(cur["plan_status"], "COMPLETED")
+
+    def test_done_out_of_order_is_refused(self):
+        self.approved()
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        # Jump the queue: start+finish 3 while 1 is unfinished.
+        res = self.h.dispatch("update_task_progress", {"task_id": 3, "status": "IN_PROGRESS"})
+        self.assertEqual(res.get("next_task", {}).get("task_id"), 1)  # redirected, lenient
+        res = self.h.dispatch("update_task_progress", {
+            "task_id": 3, "status": "DONE", "result_log": "이것은 충분히 긴 결과 기록입니다"})
+        self.assertFalse(res["ok"])
+        self.assertIn(res["error_code"], ("TASK_NOT_STARTED", "TASK_OUT_OF_ORDER"))
+
+    def test_evidence_free_logs_are_refused(self):
+        self.approved(1)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        for bad in ("", "완료", "done", "OK", "성공적으로 완료했습니다", "작업1", "  완료  "):
+            res = self.h.dispatch("update_task_progress", {
+                "task_id": 1, "status": "DONE", "result_log": bad})
+            self.assertFalse(res["ok"], f"{bad!r} was accepted as evidence")
+            self.assertEqual(res["error_code"], "MISSING_RESULT_LOG")
+
+    def test_terse_but_concrete_evidence_is_accepted(self):
+        """Korean packs a real outcome into few characters - do not punish that."""
+        self.approved(1)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        res = self.h.dispatch("update_task_progress", {
+            "task_id": 1, "status": "DONE", "result_log": "매출 표 12행 추출"})
+        self.assertTrue(res["ok"], res.get("message"))
+
+    def test_result_log_repeating_the_title_is_refused(self):
+        self.approve_flow(["q3 리포트 파일을 찾는다"])
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        res = self.h.dispatch("update_task_progress", {
+            "task_id": 1, "status": "DONE", "result_log": "q3 리포트 파일을 찾는다"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "MISSING_RESULT_LOG")
+
+    def test_last_done_awaits_human_verification(self):
+        self.approved(2)
+        self.do_task(1)
+        res = self.do_task(2)
+        self.assertEqual(res["plan_status"], "AWAITING_COMPLETION")
+        self.assertEqual(res["next_action"], "CALL_REQUEST_USER_APPROVAL")
+        audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
+        self.assertIn("completion_pending", audit)
+
+    def test_completion_report_shows_per_task_evidence(self):
+        self.approved(2)
+        self.do_task(1, log="q3.xlsx 를 /reports 에서 찾음")
+        self.do_task(2, log="요약을 summary.md 로 저장함")
+        res = self.h.dispatch("request_user_approval",
+                              {"decision": "ASK_USER", "plan_summary": "둘 다 끝냈습니다"})
+        report = res["display_to_user"]
+        self.assertIn("COMPLETION REPORT", report)
+        self.assertIn("q3.xlsx 를 /reports 에서 찾음", report)
+        self.assertIn("요약을 summary.md 로 저장함", report)
+        self.assertEqual(res["next_action"], "STOP_AND_WAIT_FOR_USER")
+
+    def test_human_confirmation_completes_the_plan(self):
+        self.approved(1)
+        self.do_task(1)
+        self.h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
+        res = self.h.dispatch("request_user_approval", {"decision": "APPROVED"})
+        self.assertEqual(res["plan_status"], "COMPLETED")
+        self.assertEqual(res["next_action"], "ANSWER_USER")
+        audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
+        self.assertIn("completion_verified", audit)
+
+    def test_human_rejecting_the_report_does_not_complete(self):
+        self.approved(1)
+        self.do_task(1)
+        self.h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
+        res = self.h.dispatch("request_user_approval",
+                              {"decision": "REJECTED", "user_comment": "실제로 안 됐음"})
+        self.assertEqual(res["plan_status"], "CANCELLED")
+
+    def test_human_asking_for_more_work_reopens_planning(self):
+        self.approved(1)
+        self.do_task(1)
+        self.h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
+        res = self.h.dispatch("request_user_approval",
+                              {"decision": "REVISE", "user_comment": "3번이 빠졌어요"})
+        self.assertEqual(res["plan_status"], "DRAFTING")
+        self.assertEqual(res["next_action"], "CALL_PLAN_AND_THINK")
+
+    def test_tasks_cannot_be_touched_while_awaiting_verification(self):
+        self.approved(1)
+        self.do_task(1)
+        res = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "COMPLETION_PENDING")
+
+    def test_hint_names_the_outstanding_tasks(self):
+        """Anti-abandonment: the model must never lose sight of what is left."""
+        self.approved(3)
+        res = self.do_task(1)
+        self.assertIn("2 of 3 tasks are still unfinished", res["next_action_hint"])
+        self.assertIn("Do NOT tell the user", res["next_action_hint"])
+
+    def test_completion_approval_can_be_disabled(self):
+        cfg = Config(state_dir=self.state_dir, blocking_approval=False,
+                     completion_approval=False)
+        h = PlanningHandlers(Store(self.state_dir), cfg)
+        h.dispatch("plan_and_think", {"goal": "g", "thought": "t", "step_number": 1,
+                                      "total_steps": 1, "need_more_thinking": False,
+                                      "task_list": ["작업"]})
+        h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
+        h.dispatch("request_user_approval", {"decision": "APPROVED"})
+        h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        res = h.dispatch("update_task_progress", {
+            "task_id": 1, "status": "DONE", "result_log": "결과물을 /tmp/out 에 저장함"})
+        self.assertEqual(res["plan_status"], "COMPLETED")
+
+    def test_evidence_cannot_be_rewritten_after_the_human_saw_it(self):
+        """The fingerprint covers result_log, so a late edit invalidates the approval."""
+        self.approved(1)
+        self.do_task(1, log="원래 증거: /tmp/a.txt 생성")
+        before = self.h._fingerprint(self.h.store.load().active_plan)
+        raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
+        pid = raw["active_plan_id"]
+        raw["plans"][pid]["tasks"][0]["result_log"] = "조작된 증거"
+        (self.state_dir / "plan_state.json").write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        after = self.h._fingerprint(self.h.store.load().active_plan)
+        self.assertNotEqual(before, after)
 
 
 class TestGoalDriftRouting(HandlerTestCase):
@@ -653,8 +813,7 @@ class TestGoalDriftRouting(HandlerTestCase):
 class TestPersistence(HandlerTestCase):
     def test_state_survives_a_new_handler_instance(self):
         self.approve_flow(["a", "b"])
-        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
-        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "DONE"})
+        self.do_task(1)
 
         fresh = PlanningHandlers(Store(self.state_dir), self.config)
         res = fresh.dispatch("get_current_plan", {"plan_id": "current"})

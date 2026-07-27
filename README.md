@@ -1,6 +1,6 @@
 # planning-mcp (LightweightSequentialThinking)
 
-**버전: 1.8.2** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
+**버전: 1.9.0** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
 `SERVER_VERSION` (MCP `initialize` 응답의 `serverInfo.version` 으로 보고됨)
 
 AnythingLLM Agent Mode용 경량 **계획·작업 관리 MCP 서버**. 폐쇄망의 성능이 약한 사내 LLM이
@@ -29,6 +29,9 @@ AnythingLLM Agent Mode용 경량 **계획·작업 관리 MCP 서버**. 폐쇄망
   멈춥니다.
 - **어긋난 입력은 거부하지 않고 수리합니다.** `"done"`, `"3"`, `"true"`, 줄바꿈으로 이어붙인
   작업 문자열 — 전부 검증 전에 정규화됩니다.
+- **작업을 건너뛸 수 없습니다.** `DONE` 은 시작 기록·순서·실질적 `result_log` 가 모두
+  있어야 받아들여지고, 마지막 작업까지 끝나도 **사람이 작업별 증거를 확인해야** 계획이
+  완료됩니다. 계획만 세우고 실행을 빠뜨리는 소형 모델의 전형적 오작동을 구조적으로 막습니다.
 
 ---
 
@@ -165,6 +168,8 @@ docs/                     Phase 1~4: 스키마, 아키텍처, 에이전트 프�
 | `PLANNING_MCP_APPROVAL_OPEN_BROWSER` | `true` | 승인 요청 시 브라우저 자동 실행 |
 | `PLANNING_MCP_APPROVAL_TTL` | `1800` | 승인 유효 시간(초). 이만큼 방치된 계획은 승인이 만료되어 재승인이 필요 |
 | `PLANNING_MCP_MAX_ACTIVE_PLANS` | `5` | 동시에 진행할 수 있는 계획 수 상한 |
+| `PLANNING_MCP_COMPLETION_APPROVAL` | `true` | 마지막 작업이 DONE 되어도 바로 완료되지 않고, 사람이 작업별 증거를 확인해야 COMPLETED |
+| `PLANNING_MCP_MIN_RESULT_LOG` | `8` | DONE 에 필요한 최소 증거 길이(공백·문장부호 제외). 상투어구("완료", "done")는 길이와 무관하게 거부 |
 | `PLANNING_MCP_AUTOAPPROVE` | `false` | **테스트 전용** — HITL 게이트 우회. 호출마다 경고 로그 |
 
 CLI: `--transport stdio|sse`, `--host`, `--port`, `--state-dir`, `--log-level`

@@ -99,6 +99,38 @@ def _error_action(plan: Plan | None, code: ErrorCode) -> tuple[str, str]:
             "with its EXACT goal text (or its plan_id). If this really is a brand-new "
             "plan, call again with step_number=1.",
         )
+    if code is ErrorCode.TASK_NOT_STARTED:
+        task = plan.current_task() if plan else None
+        which = f"task_id={task.task_id}" if task else "that task"
+        return (
+            NextAction.CALL_UPDATE_TASK_PROGRESS.value,
+            "You cannot mark a task DONE that you never started. Call "
+            f"update_task_progress with {which} and status='IN_PROGRESS' first, then "
+            "actually do the work, and only then report DONE.",
+        )
+    if code is ErrorCode.TASK_OUT_OF_ORDER:
+        task = plan.current_task() if plan else None
+        which = f"task_id={task.task_id} ('{task.title}')" if task else "the earliest one"
+        return (
+            NextAction.CALL_UPDATE_TASK_PROGRESS.value,
+            "An earlier task is still unfinished, so this one cannot be complete. Work "
+            f"through the tasks in order: start {which} with status='IN_PROGRESS'.",
+        )
+    if code is ErrorCode.MISSING_RESULT_LOG:
+        return (
+            NextAction.CALL_UPDATE_TASK_PROGRESS.value,
+            "DONE was refused because result_log did not describe what you actually did. "
+            "Send the same call again with a result_log of at least one full sentence "
+            "stating the concrete outcome - for example what you found, where you saved "
+            "it, or what you produced. 'done' or 'ok' is not acceptable evidence.",
+        )
+    if code is ErrorCode.COMPLETION_PENDING:
+        return (
+            NextAction.CALL_REQUEST_USER_APPROVAL.value,
+            "Every task is already marked DONE and the plan is waiting for the user to "
+            "verify the completion report. Do not change tasks now. Call "
+            "request_user_approval with decision='ASK_USER'.",
+        )
     if code is ErrorCode.INVALID_STATUS:
         return (
             NextAction.CALL_UPDATE_TASK_PROGRESS.value,
@@ -170,17 +202,40 @@ def _status_action(plan: Plan | None) -> tuple[str, str]:
                 "All tasks are complete. Now write the final answer to the user, summarizing "
                 "the result_log of each task.",
             )
+        # Spelling out the outstanding work in every single response is the counter to a
+        # model that quietly stops after one or two tasks and declares the plan finished.
+        left = plan.remaining_tasks()
+        outstanding = (
+            f" {len(left)} of {len(plan.tasks)} tasks are still unfinished "
+            f"({', '.join(str(t.task_id) for t in left)}). Do NOT tell the user the work "
+            "is finished until every task is DONE."
+        )
         if task.status == TaskStatus.IN_PROGRESS.value:
             return (
                 NextAction.CALL_UPDATE_TASK_PROGRESS.value,
                 f"Task {task.task_id} ('{task.title}') is in progress. When it is finished, call "
                 f"update_task_progress with task_id={task.task_id}, status='DONE' and a "
-                "result_log describing what you actually did.",
+                "result_log describing what you actually did." + outstanding,
             )
         return (
             NextAction.CALL_UPDATE_TASK_PROGRESS.value,
             f"Next task is task_id={task.task_id} '{task.title}'. Call update_task_progress "
-            f"with task_id={task.task_id} and status='IN_PROGRESS'.",
+            f"with task_id={task.task_id} and status='IN_PROGRESS'." + outstanding,
+        )
+
+    if status is PlanStatus.AWAITING_COMPLETION:
+        if plan.approval.requested_at and not plan.approval.decision:
+            return (
+                NextAction.STOP_AND_WAIT_FOR_USER.value,
+                "STOP NOW. Show the completion report below to the user and ask them to "
+                "confirm the work is really finished. Do not call any other tool and do "
+                "not claim success yourself. Wait for their reply.",
+            )
+        return (
+            NextAction.CALL_REQUEST_USER_APPROVAL.value,
+            "Every task is marked DONE, but the plan is NOT complete until the user has "
+            "verified it. Call request_user_approval with decision='ASK_USER' and a "
+            "plan_summary of what you actually produced, task by task.",
         )
 
     if status is PlanStatus.BLOCKED:
@@ -246,6 +301,8 @@ def execution_guard(plan: Plan | None, autoapprove: bool = False) -> ErrorCode |
     status = plan.status
     if status in (PlanStatus.APPROVED, PlanStatus.IN_EXECUTION):
         return None
+    if status is PlanStatus.AWAITING_COMPLETION:
+        return ErrorCode.COMPLETION_PENDING
     if status is PlanStatus.BLOCKED:
         return ErrorCode.PLAN_BLOCKED
     if status is PlanStatus.CANCELLED:

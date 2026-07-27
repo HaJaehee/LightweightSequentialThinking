@@ -6,20 +6,93 @@
     "_note": "MCP TypeScript SDK default request timeout is 60s; without a progressToken the blocking wait is capped at 55s to avoid a -32001 client error."
   },
   "settings": [
-    { "field": "state_dir", "env": "PLANNING_MCP_STATE_DIR", "default": "<project>/state", "purpose": "Where plan_state.json, approval.json, audit.jsonl, and lock files live. Resolved from planning/config.py, NOT the CWD." },
-    { "field": "log_level", "env": "PLANNING_MCP_LOG_LEVEL", "default": "INFO", "purpose": "stderr verbosity." },
-    { "field": "max_plans", "env": "PLANNING_MCP_MAX_PLANS", "default": 20, "purpose": "Retention cap; oldest terminal plans pruned beyond this. Never prunes an active plan." },
-    { "field": "max_tasks", "env": "PLANNING_MCP_MAX_TASKS", "default": 12, "purpose": "Oversized task lists are truncated, not rejected." },
-    { "field": "autoapprove", "env": "PLANNING_MCP_AUTOAPPROVE", "default": false, "purpose": "TEST ONLY. Bypasses the HITL gate; logs a loud warning on every call." },
-    { "field": "blocking_approval", "env": "PLANNING_MCP_BLOCKING_APPROVAL", "default": true, "purpose": "Hold the approval tool call open until a human decides (physical loop pause). false = advisory-only." },
-    { "field": "approval_port", "env": "PLANNING_MCP_APPROVAL_PORT", "default": 8765, "purpose": "Loopback-only approval page port. Only the base port is bound; peers share it." },
-    { "field": "approval_timeout", "env": "PLANNING_MCP_APPROVAL_TIMEOUT", "default": 900, "purpose": "Max blocking-wait seconds. Auto-reduced to 55 when the client sends no progressToken." },
-    { "field": "approval_open_browser", "env": "PLANNING_MCP_APPROVAL_OPEN_BROWSER", "default": true, "purpose": "Auto-open the approval page in a browser on startup and each request (best-effort)." },
-    { "field": "approval_ttl", "env": "PLANNING_MCP_APPROVAL_TTL", "default": 1800, "purpose": "Seconds an approval stays valid; an idle-longer plan's approval is revoked (re-approval required)." },
-    { "field": "max_active_plans", "env": "PLANNING_MCP_MAX_ACTIVE_PLANS", "default": 5, "purpose": "Cap on concurrently active (non-terminal) plans; beyond it new plans are refused with PLAN_AMBIGUOUS." }
+    {
+      "field": "state_dir",
+      "env": "PLANNING_MCP_STATE_DIR",
+      "default": "<project>/state",
+      "purpose": "Where plan_state.json, approval.json, audit.jsonl, and lock files live. Resolved from planning/config.py, NOT the CWD."
+    },
+    {
+      "field": "log_level",
+      "env": "PLANNING_MCP_LOG_LEVEL",
+      "default": "INFO",
+      "purpose": "stderr verbosity."
+    },
+    {
+      "field": "max_plans",
+      "env": "PLANNING_MCP_MAX_PLANS",
+      "default": 20,
+      "purpose": "Retention cap; oldest terminal plans pruned beyond this. Never prunes an active plan."
+    },
+    {
+      "field": "max_tasks",
+      "env": "PLANNING_MCP_MAX_TASKS",
+      "default": 12,
+      "purpose": "Oversized task lists are truncated, not rejected."
+    },
+    {
+      "field": "autoapprove",
+      "env": "PLANNING_MCP_AUTOAPPROVE",
+      "default": false,
+      "purpose": "TEST ONLY. Bypasses the HITL gate; logs a loud warning on every call."
+    },
+    {
+      "field": "blocking_approval",
+      "env": "PLANNING_MCP_BLOCKING_APPROVAL",
+      "default": true,
+      "purpose": "Hold the approval tool call open until a human decides (physical loop pause). false = advisory-only."
+    },
+    {
+      "field": "approval_port",
+      "env": "PLANNING_MCP_APPROVAL_PORT",
+      "default": 8765,
+      "purpose": "Loopback-only approval page port. Only the base port is bound; peers share it."
+    },
+    {
+      "field": "approval_timeout",
+      "env": "PLANNING_MCP_APPROVAL_TIMEOUT",
+      "default": 900,
+      "purpose": "Max blocking-wait seconds. Auto-reduced to 55 when the client sends no progressToken."
+    },
+    {
+      "field": "approval_open_browser",
+      "env": "PLANNING_MCP_APPROVAL_OPEN_BROWSER",
+      "default": true,
+      "purpose": "Auto-open the approval page in a browser on startup and each request (best-effort)."
+    },
+    {
+      "field": "approval_ttl",
+      "env": "PLANNING_MCP_APPROVAL_TTL",
+      "default": 1800,
+      "purpose": "Seconds an approval stays valid; an idle-longer plan's approval is revoked (re-approval required)."
+    },
+    {
+      "field": "max_active_plans",
+      "env": "PLANNING_MCP_MAX_ACTIVE_PLANS",
+      "default": 5,
+      "purpose": "Cap on concurrently active (non-terminal) plans; beyond it new plans are refused with PLAN_AMBIGUOUS."
+    },
+    {
+      "field": "completion_approval",
+      "env": "PLANNING_MCP_COMPLETION_APPROVAL",
+      "default": true,
+      "purpose": "The last DONE moves the plan to AWAITING_COMPLETION and a human must approve a per-task completion report before COMPLETED. false = complete immediately (pre-1.9.0)."
+    },
+    {
+      "field": "min_result_log",
+      "env": "PLANNING_MCP_MIN_RESULT_LOG",
+      "default": 8,
+      "purpose": "Minimum normalized length of result_log evidence for DONE. Bare success phrases and task-title echoes are rejected regardless of length."
+    }
   ],
   "cli": {
-    "server.py": ["--transport stdio|sse", "--host", "--port", "--state-dir", "--log-level"]
+    "server.py": [
+      "--transport stdio|sse",
+      "--host",
+      "--port",
+      "--state-dir",
+      "--log-level"
+    ]
   },
   "windows_env_recommended": {
     "PYTHONUTF8": "1",

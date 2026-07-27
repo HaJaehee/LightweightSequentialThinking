@@ -56,6 +56,32 @@ def error(
     )
 
 
+def render_completion_report(plan: Plan, plan_summary: str | None = None) -> str:
+    """Per-task evidence for the human to verify before a plan may be called complete.
+
+    The server cannot see whether real work happened - it only sees tool calls. Showing
+    the human what the agent claims it did, task by task, is the only thing that catches
+    a model that marked everything DONE with invented result_log text.
+    """
+    lines = ["COMPLETION REPORT - please verify before this plan is closed"]
+    if plan.goal:
+        lines.append(f"Goal: {plan.goal}")
+    if plan_summary:
+        lines.append("")
+        lines.append(plan_summary.strip())
+    lines.append("")
+    for task in plan.tasks:
+        lines.append(f"{task.task_id}. {task.title}")
+        evidence = (task.result_log or "").strip()
+        lines.append(f"   -> {evidence}" if evidence else "   -> (no evidence recorded)")
+    lines.append("")
+    lines.append(
+        f"The agent reports all {len(plan.tasks)} tasks finished. "
+        "Is this actually done? (yes / no / tell me what is missing)"
+    )
+    return "\n".join(lines)
+
+
 def render_plan_for_user(plan: Plan, plan_summary: str | None = None) -> str:
     """Pre-rendered approval block. The model only has to echo this string, which is the
     single most reliable operation a weak model can perform."""

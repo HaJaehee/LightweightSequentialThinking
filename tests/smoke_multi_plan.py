@@ -173,7 +173,7 @@ def main() -> int:
         A.call("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS",
                                         "plan_id": pa["plan_id"]})
         done = A.call("update_task_progress", {"task_id": 1, "status": "DONE",
-                                               "result_log": "A1 완료",
+                                               "result_log": "A1 결과를 /tmp/a1.txt 에 저장함",
                                                "plan_id": pa["plan_id"]})
         check("A의 진행이 기록됨", done["progress"] == "1/2 done", done.get("progress"))
         bnow = B.call("get_current_plan", {"plan_id": pb["plan_id"]})
