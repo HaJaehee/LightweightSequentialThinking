@@ -603,7 +603,8 @@ class TestTaskCompletionEnforcement(HandlerTestCase):
         res = self.h.dispatch("request_user_approval",
                               {"decision": "ASK_USER", "plan_summary": "둘 다 끝냈습니다"})
         report = res["display_to_user"]
-        self.assertIn("COMPLETION REPORT", report)
+        self.assertIn("완료 보고", report)
+        self.assertIn("2개 태스크의 완료를 보고했습니다", report)
         self.assertIn("q3.xlsx 를 /reports 에서 찾음", report)
         self.assertIn("요약을 summary.md 로 저장함", report)
         self.assertEqual(res["next_action"], "STOP_AND_WAIT_FOR_USER")
