@@ -256,7 +256,8 @@ button:disabled{opacity:.5;cursor:default}
 .done{text-align:center;padding:2rem 0;font-size:1.05rem;font-weight:600}
 .hint{margin-top:1rem;font-size:.82rem;opacity:.55;line-height:1.5}
 </style></head><body><div class="card" id="root">
-<div class="idle">연결 중…</div></div>
+<div class="idle">현재 승인 요청 메시지가 없습니다.<br>
+<span style="font-size:.85rem">에이전트가 계획을 제출하면 여기에 표시됩니다.</span></div></div>
 <script>
 let seen='',busy=false,flash=null,pendingCount=0;
 const IDLE_TITLE='planning-mcp 승인';
@@ -297,7 +298,9 @@ async function poll(){
 function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 function render(list){
   const root=document.getElementById('root');
-  if(!list.length){root.innerHTML='<div class="idle">대기 중인 승인 요청이 없습니다.<br>'+
+  // Matches the static placeholder above, so the page does not flicker between two
+  // different wordings when the first poll lands.
+  if(!list.length){root.innerHTML='<div class="idle">현재 승인 요청 메시지가 없습니다.<br>'+
     '<span style="font-size:.85rem">에이전트가 계획을 제출하면 여기에 표시됩니다.</span></div>';return;}
   // 여러 세션이 동시에 승인을 기다릴 수 있으므로 큐 전체를 보여준다.
   root.innerHTML=list.map(d=>{
