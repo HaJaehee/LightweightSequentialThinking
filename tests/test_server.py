@@ -28,12 +28,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # otherwise drown the test output. The tests assert on responses and the audit log instead.
 logging.disable(logging.CRITICAL)
 
-from planning.approval import ApprovalServer, ApprovalStore  # noqa: E402
+from planning.approval import ApprovalServer, ApprovalStore, Verdict  # noqa: E402
 from planning.config import SDK_REQUEST_TIMEOUT_SEC, Config  # noqa: E402
 from planning.filelock import exclusive  # noqa: E402
 from planning.handlers import PlanningHandlers  # noqa: E402
 from planning.leniency import normalize  # noqa: E402
 from planning.protocol import McpProtocol  # noqa: E402
+from planning.responses import render_plan_for_user  # noqa: E402
 from planning.schemas import TOOL_DEFINITIONS  # noqa: E402
 from planning.store import Store  # noqa: E402
 
@@ -151,6 +152,43 @@ class TestLeniency(unittest.TestCase):
     def test_task_list_numbering_stripped(self):
         clean, _ = normalize("plan_and_think", {"task_list": ["1. a", "2) b", "- c", "• d"]})
         self.assertEqual(clean["task_list"], ["a", "b", "c", "d"])
+
+    def test_task_updates_shapes(self):
+        """Every unambiguous way a model might express 'change task 3 to X'."""
+        want = [{"task_id": 3, "title": "표를 그대로 삽입"}]
+        for raw in (
+            [{"task_id": 3, "title": "표를 그대로 삽입"}],
+            {"task_id": 3, "title": "표를 그대로 삽입"},           # not wrapped in a list
+            {"3": "표를 그대로 삽입"},                             # object map
+            '[{"task_id": 3, "title": "표를 그대로 삽입"}]',        # JSON in a string
+            [{"task_id": "3", "title": "3. 표를 그대로 삽입"}],     # string id, numbered title
+            [{"id": 3, "name": "표를 그대로 삽입"}],                # alternate key names
+        ):
+            clean, _ = normalize("plan_and_think", {"task_updates": raw})
+            self.assertEqual(clean["task_updates"], want, f"failed on {raw!r}")
+
+    def test_task_updates_drops_unusable_entries(self):
+        """An entry with no id or no title is dropped - never guessed at."""
+        clean, _ = normalize("plan_and_think", {"task_updates": [
+            {"task_id": 2, "title": "제대로 된 항목"},
+            {"title": "아이디 없음"},
+            {"task_id": 5},
+            "그냥 문자열",
+            {"task_id": 0, "title": "0번은 없음"},
+        ]})
+        self.assertEqual(clean["task_updates"], [{"task_id": 2, "title": "제대로 된 항목"}])
+
+    def test_task_updates_duplicates_collapse(self):
+        clean, _ = normalize("plan_and_think", {"task_updates": [
+            {"task_id": 2, "title": "첫 번째"},
+            {"task_id": 2, "title": "두 번째"},
+        ]})
+        self.assertEqual(clean["task_updates"], [{"task_id": 2, "title": "두 번째"}])
+
+    def test_task_updates_unreadable_is_ignored_not_fatal(self):
+        clean, notes = normalize("plan_and_think", {"task_updates": "완전히 엉뚱한 문장"})
+        self.assertNotIn("task_updates", clean)
+        self.assertTrue(any("task_updates" in n for n in notes))
 
     def test_unknown_keys_dropped_and_remapped(self):
         clean, notes = normalize(
@@ -1021,20 +1059,25 @@ class FakeApprovalUI:
     url = "http://127.0.0.1:0/"
     owns_page = True
 
-    def __init__(self, decision=None, comment="", available=True):
+    def __init__(self, decision=None, comment="", available=True,
+                 task_comments=None, scope="PLAN"):
         self.decision = decision
         self.comment = comment
         self.available = available
+        self.task_comments = task_comments or {}
+        self.scope = scope
         self.opened: list[dict] = []
         self.cleared = 0
         self.live: dict | None = None
 
-    def open_request(self, plan_id, goal, display, tasks, fingerprint=""):
+    def open_request(self, plan_id, goal, display, tasks, fingerprint="", phase="PLAN",
+                     summary=""):
         if not self.available:
             return None
         record = {
             "id": f"req{len(self.opened)}", "plan_id": plan_id, "fingerprint": fingerprint,
-            "decision": self.decision, "comment": self.comment,
+            "decision": self.decision, "comment": self.comment, "phase": phase,
+            "tasks": tasks, "display": display, "goal": goal, "summary": summary,
         }
         self.opened.append(record)
         self.live = record
@@ -1045,13 +1088,24 @@ class FakeApprovalUI:
         self.live["decision"] = decision
         self.live["comment"] = comment
 
+    def _verdict(self, record):
+        # A completion request can never carry a per-task scope; the real store enforces
+        # that in record_decision, and the double must not be more permissive.
+        scope = self.scope if record.get("phase") == "PLAN" else "PLAN"
+        return Verdict(
+            decision=record["decision"],
+            comment=record.get("comment", "") or "",
+            task_comments=dict(self.task_comments) if scope == "TASKS" else {},
+            scope=scope,
+        )
+
     def claim(self, request_id):
         r = self.live
         if r is None or r["id"] != request_id or not r.get("decision"):
             return None
         self.live = None
         self.cleared += 1
-        return r["decision"], r.get("comment", "")
+        return self._verdict(r)
 
     def take_decision(self, plan_id, fingerprint):
         r = self.live
@@ -1061,7 +1115,7 @@ class FakeApprovalUI:
             self.live = None
             return None
         self.live = None
-        return r["decision"], r.get("comment", "")
+        return self._verdict(r)
 
     def drop_for_plan(self, plan_id):
         if self.live is not None and self.live["plan_id"] == plan_id:
@@ -1178,7 +1232,7 @@ class TestBlockingApproval(HandlerTestCase):
                 headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(post, timeout=5) as r:
                 self.assertTrue(json.loads(r.read().decode("utf-8"))["ok"])
-            self.assertEqual(peer.claim(req), ("APPROVED", "ok"))
+            self.assertEqual(peer.claim(req), Verdict("APPROVED", "ok"))
         finally:
             owner.shutdown()
             peer.shutdown()
@@ -1202,7 +1256,7 @@ class TestBlockingApproval(HandlerTestCase):
         rid = a.publish("plan_1", "g", "display", [], "fp1")
         self.assertEqual(b.peek()[0]["id"], rid)
         self.assertTrue(b.record_decision(rid, "APPROVED", "예"))
-        self.assertEqual(a.claim_for_plan("plan_1", "fp1"), ("APPROVED", "예"))
+        self.assertEqual(a.claim_for_plan("plan_1", "fp1"), Verdict("APPROVED", "예"))
         self.assertEqual(a.peek(), [])
 
     def test_heartbeat_only_with_progress_token(self):
@@ -1315,7 +1369,7 @@ class TestBlockingApproval(HandlerTestCase):
             )
             with urllib.request.urlopen(post, timeout=5) as r:
                 self.assertTrue(json.loads(r.read().decode("utf-8"))["ok"])
-            self.assertEqual(srv.claim(req), ("APPROVED", "ok"))
+            self.assertEqual(srv.claim(req), Verdict("APPROVED", "ok"))
         finally:
             srv.shutdown()
 
@@ -1551,7 +1605,7 @@ class TestApprovalQueueEdges(HandlerTestCase):
         self.assertEqual(len(s.peek()), 2)
         self.assertTrue(s.record_decision(rb, "APPROVED", "ok"))
         self.assertIsNone(s.claim(ra), "claiming A must not pick up B's decision")
-        self.assertEqual(s.claim(rb), ("APPROVED", "ok"))
+        self.assertEqual(s.claim(rb), Verdict("APPROVED", "ok"))
         self.assertEqual([e["id"] for e in s.peek()], [ra])
 
     def test_fingerprint_mismatch_drops_only_that_entry(self):
@@ -1562,7 +1616,7 @@ class TestApprovalQueueEdges(HandlerTestCase):
         s.record_decision(rb, "APPROVED", "")
         self.assertIsNone(s.claim_for_plan("plan_a", "CHANGED"))
         self.assertEqual([e["id"] for e in s.peek()], [rb], "B's entry must survive")
-        self.assertEqual(s.claim_for_plan("plan_b", "fpb"), ("APPROVED", ""))
+        self.assertEqual(s.claim_for_plan("plan_b", "fpb"), Verdict("APPROVED", ""))
 
     def test_decision_cannot_be_recorded_twice(self):
         s = self.store_for("q4")
@@ -1810,7 +1864,7 @@ class TestApprovalPageSurface(HandlerTestCase):
                                          headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=5) as r:
                 self.assertTrue(json.loads(r.read().decode())["ok"])
-            self.assertEqual(srv.claim(rid), ("APPROVED", "좋아요"))
+            self.assertEqual(srv.claim(rid), Verdict("APPROVED", "좋아요"))
         finally:
             srv.shutdown()
 
@@ -1838,6 +1892,449 @@ class TestApprovalPageSurface(HandlerTestCase):
                         self.assertNotEqual(r.status, 500)
                 except urllib.error.HTTPError as e:
                     self.assertEqual(e.code, 404)
+        finally:
+            srv.shutdown()
+
+
+class TestTargetedRevision(HandlerTestCase):
+    """Per-task review.
+
+    The human comments on individual tasks on the approval page; only those tasks are
+    rewritten. The tasks they read and accepted keep their wording, their number, and -
+    if the plan had already been running - their evidence.
+    """
+
+    TASKS = ["보고서 찾기", "표 추출", "요약 작성"]
+
+    def blocking(self, ui, timeout=1):
+        cfg = Config(
+            state_dir=self.state_dir, blocking_approval=True, approval_timeout=timeout
+        )
+        return PlanningHandlers(Store(self.state_dir), cfg, approval_ui=ui)
+
+    def draft(self, h, tasks=None):
+        return h.dispatch("plan_and_think", {
+            "goal": "분기 보고서 정리", "thought": "t", "step_number": 1, "total_steps": 1,
+            "need_more_thinking": False, "task_list": tasks or self.TASKS})
+
+    def flagged(self, comments, tasks=None, scope="TASKS"):
+        """Drive a plan to AWAITING_APPROVAL, then have the human flag some tasks."""
+        ui = FakeApprovalUI("REVISE", "", task_comments=comments, scope=scope)
+        h = self.blocking(ui)
+        self.draft(h, tasks)
+        res = h.dispatch(
+            "request_user_approval", {"decision": "ASK_USER", "plan_summary": "요약"}
+        )
+        return h, res
+
+    def update(self, h, updates):
+        return h.dispatch("plan_and_think", {
+            "goal": "분기 보고서 정리", "thought": "고쳤습니다", "step_number": 2,
+            "total_steps": 2, "need_more_thinking": False, "task_updates": updates})
+
+    def plan(self, h):
+        return h.store.load().active_plan
+
+    def audit(self):
+        return (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
+
+    # ---- the request ---------------------------------------------------
+    def test_the_summary_reaches_the_approval_page(self):
+        """The human cannot judge a bare task list; the overview must travel with it."""
+        ui = FakeApprovalUI(decision=None)  # no decision: just capture what was published
+        h = self.blocking(ui)
+        self.draft(h)
+        h.dispatch("request_user_approval", {
+            "decision": "ASK_USER",
+            "plan_summary": "보고서를 찾아 표를 뽑고 5줄로 요약합니다."})
+        published = ui.opened[-1]
+        self.assertEqual(published["phase"], "PLAN")
+        self.assertEqual(published["goal"], "분기 보고서 정리")
+        self.assertEqual(published["summary"], "보고서를 찾아 표를 뽑고 5줄로 요약합니다.")
+
+    def test_flagged_tasks_are_recorded_as_targets(self):
+        h, res = self.flagged({"2": "표를 그대로 넣어주세요"})
+        self.assertEqual(res["plan_status"], "DRAFTING")
+        self.assertEqual(res["revision_scope"], "TASKS")
+        self.assertEqual(
+            res["revision_targets"],
+            [{"task_id": 2, "title": "표 추출", "user_comment": "표를 그대로 넣어주세요"}],
+        )
+        self.assertEqual(res["tasks_unchanged"], [1, 3])
+        self.assertEqual(self.plan(h).revision_targets(), {2: "표를 그대로 넣어주세요"})
+
+    def test_hint_hands_the_model_the_exact_call(self):
+        """A weak model copies the hint; it must therefore contain the literal argument."""
+        _, res = self.flagged({"2": "표를 그대로"})
+        hint = res["next_action_hint"]
+        self.assertIn("task_updates", hint)
+        self.assertIn('"task_id": 2', hint)
+        self.assertIn("do NOT send task_list", hint)
+        self.assertIn("1, 3", hint)  # the tasks that must not move
+
+    def test_whole_plan_scope_leaves_no_targets(self):
+        """The page said 'rewrite everything', so nothing is pinned down."""
+        h, res = self.flagged({"2": "표를 그대로"}, scope="PLAN")
+        self.assertEqual(res["revision_scope"], "PLAN")
+        self.assertIsNone(self.plan(h).pending_revision)
+        self.assertEqual(res["next_action"], "CALL_PLAN_AND_THINK")
+
+    # ---- applying the revision -----------------------------------------
+    def test_only_the_flagged_task_is_rewritten(self):
+        h, _ = self.flagged({"2": "표를 그대로 넣어주세요"})
+        res = self.update(h, [{"task_id": 2, "title": "표를 원본 그대로 삽입"}])
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
+        self.assertEqual(res["revised_tasks"], [2])
+        titles = [t.title for t in self.plan(h).tasks]
+        self.assertEqual(titles, ["보고서 찾기", "표를 원본 그대로 삽입", "요약 작성"])
+        task = self.plan(h).get_task(2)
+        self.assertEqual(task.previous_title, "표 추출")
+        self.assertEqual(task.revision_note, "표를 그대로 넣어주세요")
+        self.assertIsNone(self.plan(h).pending_revision)
+
+    def test_task_ids_are_not_renumbered(self):
+        """The whole point: task 3 is still task 3, so nothing the human read moved."""
+        h, _ = self.flagged({"1": "다른 폴더를 보세요"})
+        self.update(h, [{"task_id": 1, "title": "아카이브 폴더에서 보고서 찾기"}])
+        self.assertEqual([t.task_id for t in self.plan(h).tasks], [1, 2, 3])
+        self.assertEqual(self.plan(h).get_task(3).title, "요약 작성")
+
+    def test_unflagged_edits_are_ignored_with_a_note(self):
+        h, _ = self.flagged({"2": "표를 그대로"})
+        res = self.update(h, [
+            {"task_id": 2, "title": "표를 원본 그대로 삽입"},
+            {"task_id": 3, "title": "몰래 바꾼 요약"},
+        ])
+        self.assertTrue(res["ok"])
+        self.assertEqual(self.plan(h).get_task(3).title, "요약 작성")
+        self.assertTrue(
+            any("did not ask" in n for n in res.get("input_notes", [])),
+            f"the silent edit must be reported, got {res.get('input_notes')}",
+        )
+
+    def test_a_second_target_left_unaddressed_is_reported(self):
+        h, _ = self.flagged({"1": "다른 폴더", "3": "더 길게"})
+        res = self.update(h, [{"task_id": 1, "title": "아카이브에서 찾기"}])
+        self.assertTrue(res["ok"])
+        self.assertTrue(
+            any("did not rewrite" in n for n in res.get("input_notes", [])),
+            f"got {res.get('input_notes')}",
+        )
+
+    def test_unknown_task_id_changes_nothing(self):
+        h, _ = self.flagged({"2": "표를 그대로"})
+        res = self.update(h, [
+            {"task_id": 2, "title": "표를 원본 그대로 삽입"},
+            {"task_id": 99, "title": "존재하지 않는 태스크"},
+        ])
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "TASK_NOT_FOUND")
+        # Validation runs before any write, so the partial edit must not have landed.
+        self.assertEqual(self.plan(h).get_task(2).title, "표 추출")
+        self.assertEqual(self.plan(h).plan_status, "DRAFTING")
+        self.assertEqual(self.plan(h).revision_targets(), {2: "표를 그대로"})
+
+    def test_addressing_none_of_the_flagged_tasks_is_refused(self):
+        h, _ = self.flagged({"2": "표를 그대로"})
+        res = self.update(h, [{"task_id": 1, "title": "엉뚱한 태스크를 고침"}])
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "REVISION_INCOMPLETE")
+        self.assertIn("2", res["next_action_hint"])
+        self.assertEqual(self.plan(h).get_task(1).title, "보고서 찾기")
+
+    def test_finalizing_a_revision_with_nothing_at_all_is_refused(self):
+        h, _ = self.flagged({"2": "표를 그대로"})
+        res = h.dispatch("plan_and_think", {
+            "goal": "분기 보고서 정리", "thought": "끝", "step_number": 2, "total_steps": 2,
+            "need_more_thinking": False})
+        self.assertEqual(res["error_code"], "REVISION_INCOMPLETE")
+
+    def test_task_updates_without_a_request_are_refused(self):
+        """Otherwise the model could edit an approved plan on its own authority."""
+        self.h.dispatch("plan_and_think", {
+            "goal": "g", "thought": "t", "step_number": 1, "total_steps": 1,
+            "need_more_thinking": False, "task_list": ["하나", "둘"]})
+        res = self.h.dispatch("plan_and_think", {
+            "goal": "g", "thought": "t2", "step_number": 2, "total_steps": 2,
+            "need_more_thinking": False,
+            "task_updates": [{"task_id": 1, "title": "몰래 바꾼 태스크"}]})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "REVISION_NOT_REQUESTED")
+        self.assertEqual(self.h.store.load().active_plan.get_task(1).title, "하나")
+        self.assertIn("unrequested_task_updates", self.audit())
+
+    def test_whole_plan_rewrite_is_accepted_but_recorded(self):
+        """Wasteful, not unsafe - the human re-approves everything either way."""
+        h, _ = self.flagged({"2": "표를 그대로"})
+        res = h.dispatch("plan_and_think", {
+            "goal": "분기 보고서 정리", "thought": "다시", "step_number": 2, "total_steps": 2,
+            "need_more_thinking": False, "task_list": ["새 하나", "새 둘"]})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
+        self.assertEqual([t.title for t in self.plan(h).tasks], ["새 하나", "새 둘"])
+        self.assertIsNone(self.plan(h).pending_revision)
+        self.assertIn("targeted_revision_ignored", self.audit())
+
+    def test_task_list_alongside_task_updates_is_ignored(self):
+        h, _ = self.flagged({"2": "표를 그대로"})
+        res = h.dispatch("plan_and_think", {
+            "goal": "분기 보고서 정리", "thought": "고침", "step_number": 2, "total_steps": 2,
+            "need_more_thinking": False,
+            "task_updates": [{"task_id": 2, "title": "표를 원본 그대로 삽입"}],
+            "task_list": ["완전히 다른 계획"]})
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(self.plan(h).tasks), 3)
+        self.assertEqual(self.plan(h).get_task(2).title, "표를 원본 그대로 삽입")
+
+    # ---- what makes it worth doing --------------------------------------
+    def test_evidence_of_untouched_tasks_survives(self):
+        """A plan that has already run keeps the work nobody objected to.
+
+        This is the case a whole-plan rewrite destroys: every DONE task is replaced by a
+        fresh PENDING one and the agent redoes work the human never questioned.
+        """
+        h, _ = self.flagged({"2": "표를 그대로"})
+        # Shape of a plan whose approval expired mid-execution: task 1 already finished.
+        path = self.state_dir / "plan_state.json"
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        pid = raw["active_plan_id"]
+        raw["plans"][pid]["tasks"][0].update(
+            {"status": "DONE", "result_log": "/reports/q3.xlsx 에서 찾음"}
+        )
+        path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+        self.update(h, [{"task_id": 2, "title": "표를 원본 그대로 삽입"}])
+        first, second = self.plan(h).get_task(1), self.plan(h).get_task(2)
+        self.assertEqual(first.status, "DONE")
+        self.assertEqual(first.result_log, "/reports/q3.xlsx 에서 찾음")
+        # The rewritten one is a different task now, so its old outcome cannot stand.
+        self.assertEqual(second.status, "PENDING")
+        self.assertIsNone(second.result_log)
+
+    def test_previous_task_list_is_kept_as_evidence(self):
+        h, _ = self.flagged({"2": "표를 그대로"})
+        self.update(h, [{"task_id": 2, "title": "표를 원본 그대로 삽입"}])
+        superseded = self.plan(h).superseded_tasks
+        self.assertEqual(len(superseded), 1)
+        self.assertEqual(superseded[0][1]["title"], "표 추출")
+
+    # ---- what the human sees next ---------------------------------------
+    def test_display_marks_the_revised_task_only(self):
+        h, _ = self.flagged({"2": "표를 그대로 넣어주세요"})
+        self.update(h, [{"task_id": 2, "title": "표를 원본 그대로 삽입"}])
+        text = render_plan_for_user(self.plan(h), "수정했습니다")
+        self.assertIn("↻ 2. 표를 원본 그대로 삽입", text)
+        self.assertIn("이전: 표 추출", text)
+        self.assertIn("요청하신 내용: 표를 그대로 넣어주세요", text)
+        self.assertIn("1. 보고서 찾기", text)
+        self.assertNotIn("↻ 1.", text)
+
+    def test_revision_marks_are_cleared_once_approved(self):
+        h, _ = self.flagged({"2": "표를 그대로"})
+        self.update(h, [{"task_id": 2, "title": "표를 원본 그대로 삽입"}])
+        h.approval_ui.decision = "APPROVED"
+        h.approval_ui.scope = "PLAN"
+        res = h.dispatch(
+            "request_user_approval", {"decision": "ASK_USER", "plan_summary": "다시 요약"}
+        )
+        self.assertEqual(res["plan_status"], "APPROVED")
+        task = self.plan(h).get_task(2)
+        self.assertIsNone(task.revision_note)
+        self.assertIsNone(task.previous_title)
+
+    # ---- the completion phase is deliberately excluded -------------------
+    def test_completion_phase_is_published_as_such(self):
+        ui = FakeApprovalUI("APPROVED")
+        h = self.blocking(ui)
+        self.draft(h)
+        h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "요약"})
+        for task_id in (1, 2, 3):
+            h.dispatch("update_task_progress", {"task_id": task_id, "status": "IN_PROGRESS"})
+            h.dispatch("update_task_progress", {
+                "task_id": task_id, "status": "DONE",
+                "result_log": f"태스크 {task_id} 결과를 /tmp/out{task_id}.txt 에 저장"})
+        self.assertEqual(self.plan(h).plan_status, "AWAITING_COMPLETION")
+
+        # The human comments per task anyway; the phase must overrule it.
+        ui.decision = "REVISE"
+        ui.scope = "TASKS"
+        ui.task_comments = {"2": "이건 실제로 안 된 것 같은데요"}
+        res = h.dispatch(
+            "request_user_approval", {"decision": "ASK_USER", "plan_summary": "완료 보고"}
+        )
+        self.assertEqual(ui.opened[-1]["phase"], "COMPLETION")
+        self.assertEqual(res["revision_scope"], "PLAN")
+        self.assertIsNone(self.plan(h).pending_revision)
+        self.assertEqual(res["plan_status"], "DRAFTING")
+
+
+class TestRevisionScopeAtTheStore(HandlerTestCase):
+    """The page decides the scope; the store only refuses what cannot be honoured."""
+
+    def store_for(self, name):
+        return ApprovalStore(self.state_dir / name)
+
+    def test_task_comments_round_trip(self):
+        s = self.store_for("r1")
+        rid = s.publish("plan_a", "g", "d", [{"task_id": 1}], "fp", phase="PLAN")
+        self.assertTrue(
+            s.record_decision(rid, "REVISE", "", {"2": " 표를 그대로 "}, "TASKS")
+        )
+        self.assertEqual(
+            s.claim(rid), Verdict("REVISE", "", {"2": "표를 그대로"}, "TASKS")
+        )
+
+    def test_blank_and_unreadable_comments_are_dropped(self):
+        s = self.store_for("r2")
+        rid = s.publish("plan_a", "g", "d", [], "fp", phase="PLAN")
+        s.record_decision(
+            rid, "REVISE", "", {"1": "   ", "x": "노이즈", "3": "실제 의견"}, "TASKS"
+        )
+        self.assertEqual(s.claim(rid).task_comments, {"3": "실제 의견"})
+
+    def test_completion_request_cannot_carry_a_task_scope(self):
+        s = self.store_for("r3")
+        rid = s.publish("plan_a", "g", "d", [], "fp", phase="COMPLETION")
+        s.record_decision(rid, "REVISE", "", {"2": "안 된 것 같아요"}, "TASKS")
+        self.assertEqual(s.claim(rid).scope, "PLAN")
+
+    def test_entry_without_a_phase_cannot_carry_a_task_scope(self):
+        """Written by an older process during a rolling restart; degrade, do not guess."""
+        s = self.store_for("r4")
+        rid = s.publish("plan_a", "g", "d", [], "fp")
+        record = json.loads(s.path.read_text(encoding="utf-8"))
+        for entry in record["requests"]:
+            entry.pop("phase", None)
+        s.path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        s.record_decision(rid, "REVISE", "", {"2": "고쳐주세요"}, "TASKS")
+        self.assertEqual(s.claim(rid).scope, "PLAN")
+
+    def test_unknown_scope_falls_back_to_whole_plan(self):
+        s = self.store_for("r5")
+        rid = s.publish("plan_a", "g", "d", [], "fp", phase="PLAN")
+        s.record_decision(rid, "REVISE", "", {"2": "x"}, "EVERYTHING")
+        self.assertEqual(s.claim(rid).scope, "PLAN")
+
+    def test_old_decided_entry_reads_as_a_whole_plan_revision(self):
+        s = self.store_for("r6")
+        rid = s.publish("plan_a", "g", "d", [], "fp", phase="PLAN")
+        s.record_decision(rid, "REVISE", "고쳐줘")
+        record = json.loads(s.path.read_text(encoding="utf-8"))
+        for entry in record["requests"]:  # as an older build would have written it
+            entry.pop("scope", None)
+            entry.pop("task_comments", None)
+        s.path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(s.claim(rid), Verdict("REVISE", "고쳐줘", {}, "PLAN"))
+
+
+class TestPerTaskPageSurface(HandlerTestCase):
+    """The page needs the task list and the phase to offer per-task review at all."""
+
+    def serve(self, name="ptp", port=8789):
+        srv = ApprovalServer(ApprovalStore(self.state_dir / name), port=port,
+                             open_browser=False)
+        self.assertTrue(srv.start())
+        return srv
+
+    def test_pending_exposes_tasks_and_phase(self):
+        srv = self.serve()
+        try:
+            srv.store.publish(
+                "p", "목표", "디스플레이",
+                [{"task_id": 1, "title": "하나", "status": "PENDING"}], "fp", phase="PLAN",
+            )
+            with urllib.request.urlopen(srv.url + "api/pending", timeout=5) as r:
+                entry = json.loads(r.read().decode("utf-8"))["requests"][0]
+            self.assertEqual(entry["phase"], "PLAN")
+            self.assertEqual(entry["tasks"][0]["title"], "하나")
+        finally:
+            srv.shutdown()
+
+    def test_pending_does_not_invent_a_phase(self):
+        """A missing phase must stay missing, so the page falls back to the old form."""
+        srv = self.serve("ptp2", 8790)
+        try:
+            srv.store.publish("p", "g", "d", [{"task_id": 1}], "fp")
+            record = json.loads(srv.store.path.read_text(encoding="utf-8"))
+            for entry in record["requests"]:
+                entry.pop("phase", None)
+            srv.store.path.write_text(
+                json.dumps(record, ensure_ascii=False), encoding="utf-8")
+            with urllib.request.urlopen(srv.url + "api/pending", timeout=5) as r:
+                entry = json.loads(r.read().decode("utf-8"))["requests"][0]
+            self.assertIsNone(entry["phase"])
+        finally:
+            srv.shutdown()
+
+    def test_decide_carries_task_comments_and_scope(self):
+        srv = self.serve("ptp3", 8791)
+        try:
+            rid = srv.store.publish("p", "g", "d", [{"task_id": 2}], "fp", phase="PLAN")
+            body = json.dumps({
+                "id": rid, "decision": "REVISE", "comment": "",
+                "task_comments": {"2": "표를 그대로"}, "scope": "TASKS",
+            }).encode()
+            req = urllib.request.Request(srv.url + "api/decide", data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                self.assertTrue(json.loads(r.read().decode())["ok"])
+            self.assertEqual(
+                srv.claim(rid), Verdict("REVISE", "", {"2": "표를 그대로"}, "TASKS")
+            )
+        finally:
+            srv.shutdown()
+
+    def test_pending_exposes_the_plan_summary(self):
+        """It reaches the human through its own field now, not buried in `display`."""
+        srv = self.serve("ptp5", 8793)
+        try:
+            srv.store.publish(
+                "p", "목표", "디스플레이", [{"task_id": 1, "title": "하나"}], "fp",
+                phase="PLAN", summary="보고서를 찾아 표를 뽑고 요약합니다.",
+            )
+            with urllib.request.urlopen(srv.url + "api/pending", timeout=5) as r:
+                entry = json.loads(r.read().decode("utf-8"))["requests"][0]
+            self.assertEqual(entry["summary"], "보고서를 찾아 표를 뽑고 요약합니다.")
+        finally:
+            srv.shutdown()
+
+    def test_summary_is_empty_not_missing_for_old_entries(self):
+        srv = self.serve("ptp6", 8794)
+        try:
+            srv.store.publish("p", "g", "d", [], "fp")
+            record = json.loads(srv.store.path.read_text(encoding="utf-8"))
+            for entry in record["requests"]:
+                entry.pop("summary", None)
+            srv.store.path.write_text(
+                json.dumps(record, ensure_ascii=False), encoding="utf-8")
+            with urllib.request.urlopen(srv.url + "api/pending", timeout=5) as r:
+                entry = json.loads(r.read().decode("utf-8"))["requests"][0]
+            self.assertEqual(entry["summary"], "")
+        finally:
+            srv.shutdown()
+
+    def test_page_ships_the_header_builder(self):
+        srv = self.serve("ptp7", 8796)
+        try:
+            with urllib.request.urlopen(srv.url, timeout=5) as r:
+                html = r.read().decode("utf-8")
+            for fragment in ("function header(", "계획 승인 요청", "목표", "개요",
+                             "class=\"summary\""):
+                self.assertIn(fragment, html)
+        finally:
+            srv.shutdown()
+
+    def test_page_ships_the_per_task_review_code(self):
+        srv = self.serve("ptp4", 8792)
+        try:
+            with urllib.request.urlopen(srv.url, timeout=5) as r:
+                html = r.read().decode("utf-8")
+            for fragment in ("function taskRows(", "function relabel(", "function scopeOf(",
+                             "task_comments:comments(id)", "계획 전체를 다시 세우기"):
+                self.assertIn(fragment, html)
+            # The escaper is used in attribute values now, so quotes must be covered.
+            self.assertIn("&quot;", html)
         finally:
             srv.shutdown()
 

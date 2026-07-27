@@ -22,6 +22,10 @@ HOW TO USE:
 - On your FINAL thinking step, set need_more_thinking = false AND provide task_list.
 - To correct an earlier step, set revises_step to that step number.
 
+IF THE USER COMMENTED ON PARTICULAR TASKS:
+The server will tell you so and name them. Then send task_updates instead of task_list,
+rewriting ONLY those tasks. Every other task was already accepted - leave it alone.
+
 DO NOT execute anything, DO NOT answer the user while using this tool."""
 
 REQUEST_USER_APPROVAL_DESCRIPTION = """STEP 2 - MANDATORY HUMAN APPROVAL GATE.
@@ -122,6 +126,34 @@ PLAN_AND_THINK_SCHEMA: dict[str, Any] = {
                 "numbering, do NOT add status. The server assigns task_id automatically. "
                 'Example: ["Locate the Q3 sales report file", "Extract the revenue table", '
                 '"Write a 5-line summary", "Send the summary by email"]'
+            ),
+        },
+        "task_updates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "The task the user commented on. Example: 3",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": (
+                            "The rewritten task, answering the user's comment. Example: "
+                            "'Copy the revenue table into the summary unchanged'"
+                        ),
+                    },
+                },
+                "required": ["task_id", "title"],
+            },
+            "description": (
+                "ONLY use this when the server told you the user commented on specific tasks. "
+                "Rewrite JUST those tasks; every task you do not list stays exactly as it is. "
+                "Do NOT send task_list at the same time, and do NOT use this to add, delete or "
+                "reorder tasks - that requires a full task_list. "
+                'Example: [{"task_id": 3, "title": "Copy the revenue table in unchanged"}]'
             ),
         },
         "revises_step": {

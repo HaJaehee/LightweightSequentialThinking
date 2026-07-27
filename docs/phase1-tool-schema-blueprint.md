@@ -39,6 +39,10 @@ HOW TO USE:
 - On your FINAL thinking step, set need_more_thinking = false AND provide task_list.
 - To correct an earlier step, set revises_step to that step number.
 
+IF THE USER COMMENTED ON PARTICULAR TASKS:
+The server will tell you so and name them. Then send task_updates instead of task_list,
+rewriting ONLY those tasks. Every other task was already accepted - leave it alone.
+
 DO NOT execute anything, DO NOT answer the user while using this tool.
 ```
 
@@ -77,6 +81,18 @@ DO NOT execute anything, DO NOT answer the user while using this tool.
         "type": "array",
         "items": { "type": "string" },
         "description": "REQUIRED when need_more_thinking is false. A flat list of plain-text action items, in execution order. Plain strings only - do NOT send objects, do NOT add numbering, do NOT add status. The server assigns task_id automatically. Example: [\"Locate the Q3 sales report file\", \"Extract the revenue table\", \"Write a 5-line summary\", \"Send the summary by email\"]"
+      },
+      "task_updates": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "task_id": { "type": "integer", "minimum": 1, "description": "The task the user commented on. Example: 3" },
+            "title": { "type": "string", "description": "The rewritten task, answering the user's comment. Example: 'Copy the revenue table into the summary unchanged'" }
+          },
+          "required": ["task_id", "title"]
+        },
+        "description": "ONLY use this when the server told you the user commented on specific tasks. Rewrite JUST those tasks; every task you do not list stays exactly as it is. Do NOT send task_list at the same time, and do NOT use this to add, delete or reorder tasks - that requires a full task_list. Example: [{\"task_id\": 3, \"title\": \"Copy the revenue table in unchanged\"}]"
       },
       "revises_step": {
         "type": "integer",
@@ -130,6 +146,9 @@ On the final step (`need_more_thinking: false` + valid `task_list`):
 - `need_more_thinking: false` with empty/missing `task_list` → `ok: false`, `next_action: "CALL_PLAN_AND_THINK"`, hint: *"Send the same step again with a non-empty task_list."*
 - `step_number` skipped or repeated → auto-normalized to `last_step + 1`, warning included, never an error.
 - `revises_step` present → old step marked `superseded`, history preserved, plan reverts to `DRAFTING`.
+- `task_updates` present while the plan carries a pending per-task revision → only the flagged tasks are rewritten; task ids, positions, and the `result_log` of untouched tasks survive. An edit to an unflagged task is dropped with a note; an unknown `task_id` → `TASK_NOT_FOUND` with nothing written.
+- `task_updates` present with **no** pending per-task revision → `REVISION_NOT_REQUESTED`. The model may not edit an approved plan on its own authority.
+- A full `task_list` sent in answer to a per-task request is accepted (the user re-approves every task anyway), noted, and audited `targeted_revision_ignored`.
 
 ---
 
@@ -217,7 +236,24 @@ NEVER guess the user's answer. NEVER call APPROVED unless the user actually said
   "plan_status": "DRAFTING",
   "next_action": "CALL_PLAN_AND_THINK",
   "next_action_hint": "The user requested changes. Call plan_and_think with revises_step set, incorporate the user_comment, then request approval again.",
-  "user_comment": "Do not send the email, just show me the summary."
+  "user_comment": "Do not send the email, just show me the summary.",
+  "revision_scope": "PLAN"
+}
+```
+
+`decision = "REVISE"` where the human commented on individual tasks on the approval page
+(`revision_scope: "TASKS"` — only those tasks may change):
+```json
+{
+  "ok": true,
+  "plan_status": "DRAFTING",
+  "next_action": "CALL_PLAN_AND_THINK",
+  "next_action_hint": "The user commented on specific tasks (task 3: \"Just paste the table, do not summarize it\"). Call plan_and_think with need_more_thinking=false and task_updates=[{\"task_id\": 3, \"title\": \"<the rewritten task>\"}] - do NOT send task_list. Task(s) 1, 2, 4 were accepted by the user as they stand - do NOT change, renumber, reorder or resend them.",
+  "revision_scope": "TASKS",
+  "revision_targets": [
+    { "task_id": 3, "title": "Write a 5-line summary", "user_comment": "Just paste the table, do not summarize it" }
+  ],
+  "tasks_unchanged": [1, 2, 4]
 }
 ```
 

@@ -1,24 +1,34 @@
 # 11 · Status and Next Steps
 
-## Current state (as of version 1.8.1)
+## Current state (as of version 1.10.0)
 
 - **Code:** feature-complete for the design. All four tools, blocking approval, multi-plan,
-  shared approval surface, cross-process locking, failure-path hardening, leniency fuzzing.
-- **Tests:** 147 unit + 5 smoke, all passing. `verify_install.py` runs everything.
-- **Git:** committed on `main` up to `6d3748b`. Remote is
-  `github.com/HaJaehee/LightweightSequentialThinking`. **NOT pushed.** Pushing is a user
-  decision — the repo may be public and `docs/` contains deployment/security material; confirm
-  before pushing.
-- **Build artifacts:** `dist/planning-mcp-1.8.1-20260725*.zip` (source-only ~110 KB, and a
-  `-with-python` bundle ~13 MB). Hashes change on every rebuild — always re-record after
-  building. Current hashes are in the last build output, not hard-coded here.
+  shared approval surface, cross-process locking, failure-path hardening, leniency fuzzing,
+  per-task plan review (1.10.0).
+- **Tests:** 211 unit + 5 smoke, all passing. `verify_install.py` runs everything.
+- **Git:** on `develop`. Remote is `github.com/HaJaehee/LightweightSequentialThinking`.
+  **NOT pushed.** Pushing is a user decision — the repo may be public and `docs/` contains
+  deployment/security material; confirm before pushing.
+- **Build artifacts (1.10.0, built 2026-07-28):**
+
+  | archive | size | sha256 |
+  |---|---|---|
+  | `dist/planning-mcp-1.10.0-20260728.zip` | 174,148 B | `dfc165297527ddd5263c954f70a3d4d1d4804e445ba1f3c3286f53e9ec047e9e` |
+  | `dist/planning-mcp-1.10.0-20260728-with-python.zip` | 13,150,276 B | `8ab237b1797b390e43dbbfbfa86f2a210fde9ec025c5f78146ab4458f30efe09` |
+
+  Every archive embeds its own `MANIFEST.txt`, which carries a build timestamp — so **the zip
+  hash changes on every rebuild even when no source changed.** Re-record after building, and
+  hand the hash to the corporate side out-of-band.
+- **Live install:** `D:\planning-mcp` synced to 1.10.0 and verified GO with its bundled runtime.
 
 ## Known open items
 
-1. **Live install is behind.** `D:\planning-mcp` (the AnythingLLM-registered install) lagged
-   several versions during development. Before relying on it, redeploy the current build:
-   re-run `setup_runtime.py` then `verify_install.py` (expect GO). The `_pth` patch reverts on
-   re-extraction — `verify_install` detects it, `setup_runtime` repairs it.
+1. **`make_package --with-python` clobbers the repo's `MANIFEST.txt`.** It appends a
+   `runtime/python-3.x-embed-amd64.zip` line, which is correct *inside that archive* but names a
+   path the repo working tree does not have — so a later `verify_install.py` in the repo reports
+   `[FAIL] missing: runtime/...`. Workaround: build the `--with-python` variant **first** and the
+   source-only variant **last**, so the repo is left with a manifest that matches it. A real fix
+   would write the archive manifest without touching the repo copy.
 2. **Push decision** — see above.
 3. **AnythingLLM progressToken behaviour is unconfirmed.** Claude Code sends none (55 s
    ceiling). If AnythingLLM also sends none, blocking approvals have a 55 s window per call;
@@ -33,6 +43,16 @@ disconnect, and retention pruning under many active plans. The reliable method: 
 that asserts the guarantee, watch it fail.
 
 ## Possible future work (not started, design notes only)
+
+- **Structural edits under per-task review.** 1.10.0 deliberately excludes add/delete/reorder
+  because they renumber `task_id` and break the ordering invariants in `can_start_task` /
+  `unfinished_before`. Doing it properly means a stable task identity separate from the ordering
+  key, which is a real change to `models.py` and every id the model holds. Only worth it if the
+  field shows people reaching for 계획 전체 재작성 mainly to add one step.
+- **Measure whether models actually use `task_updates`.** The audit log records
+  `targeted_revision_ignored` every time a model answers a targeted request with a whole
+  `task_list`. That count against `tasks_revised` is the metric; if it stays high for the
+  corporate model, the fix is prompt/hint wording, not more server logic.
 
 - **Gate execution itself.** The gate governs our own tools; the model executes with other
   AnythingLLM skills we can't intercept. To close that, execution would have to become one of

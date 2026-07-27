@@ -17,7 +17,7 @@ One thinking step per call. `need_more_thinking=true` to continue; on the final 
 `false` **and** provide `task_list`.
 
 Required: `goal`, `thought`, `step_number`, `total_steps`, `need_more_thinking`.
-Optional: `task_list` (required when finalizing), `revises_step`, `plan_id`.
+Optional: `task_list` (required when finalizing), `task_updates`, `revises_step`, `plan_id`.
 
 - **Routing by goal.** The model repeats the same `goal` on every step (the system prompt tells
   it to), so a matching active plan *is* this session's plan. A different goal starts its own
@@ -30,6 +30,13 @@ Optional: `task_list` (required when finalizing), `revises_step`, `plan_id`.
   work). Goal matching ignores trailing punctuation/whitespace. See
   [05](05-concurrency-and-sessions.md#goal-drift).
 - On finalize → `plan_status: AWAITING_APPROVAL`, `next_action: CALL_REQUEST_USER_APPROVAL`.
+- **Targeted revision (1.9.x).** When the human commented on individual tasks on the approval
+  page, the plan carries `pending_revision` and the model finalizes with `task_updates`
+  (`[{"task_id": 3, "title": "..."}]`) instead of `task_list`. Only the flagged tasks are
+  rewritten — everything else keeps its id, position, status and `result_log`. An edit to an
+  unflagged task is dropped with a note; an unknown `task_id` is `TASK_NOT_FOUND` and **nothing
+  is written** (validation completes before any mutation). `task_updates` with no pending request
+  → `REVISION_NOT_REQUESTED`. See [06](06-human-in-the-loop.md#per-task-review-19x).
 - Guard rails: missing/empty `task_list` on finalize → `MISSING_TASK_LIST`; `step_number`
   jumps/repeats are auto-normalized (never an error); `revises_step` marks the old step
   superseded and reverts to `DRAFTING`; oversized `task_list` truncated to `max_tasks`.
@@ -43,7 +50,9 @@ Optional: `plan_summary` (required for `ASK_USER`), `user_comment`, `plan_id`.
   tool call open until a human decides** (see [06](06-human-in-the-loop.md)). Returns
   `next_action: STOP_AND_WAIT_FOR_USER` with a pre-rendered `display_to_user` and `approval_url`
   if the wait times out.
-- **`APPROVED`/`REJECTED`/`REVISE`**: report what the human actually said.
+- **`APPROVED`/`REJECTED`/`REVISE`**: report what the human actually said. A `REVISE` the model
+  reports itself is always a whole-plan revision; only the approval page can express a per-task
+  one, because only there can the human point at a specific task.
 - **Approval binds to the exact version shown** (goal + task-title fingerprint). Approving a
   plan version the human never saw → `APPROVAL_NOT_REQUESTED`. An approval left idle past
   `approval_ttl` → `APPROVAL_EXPIRED`.

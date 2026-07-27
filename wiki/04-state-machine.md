@@ -40,7 +40,10 @@ finished work — see below.
 | `DRAFTING` | `plan_and_think` (final+task_list) | `AWAITING_APPROVAL` | no task_list → `MISSING_TASK_LIST` |
 | `AWAITING_APPROVAL` | `approval` ASK_USER | `AWAITING_APPROVAL` (+ blocking wait) | — |
 | `AWAITING_APPROVAL` | `approval` APPROVED | `APPROVED` | version not shown → `APPROVAL_NOT_REQUESTED` |
-| `AWAITING_APPROVAL` | `approval` REVISE | `DRAFTING` | — |
+| `AWAITING_APPROVAL` | `approval` REVISE (scope `PLAN`) | `DRAFTING` | — |
+| `AWAITING_APPROVAL` | `approval` REVISE (scope `TASKS`) | `DRAFTING` + `pending_revision` | — |
+| `DRAFTING` + `pending_revision` | `plan_and_think` (final+`task_updates`) | `AWAITING_APPROVAL` (only flagged tasks rewritten) | no target addressed → `REVISION_INCOMPLETE` |
+| `DRAFTING` *without* `pending_revision` | `plan_and_think` (final+`task_updates`) | *(no change)* | `REVISION_NOT_REQUESTED` |
 | `AWAITING_APPROVAL` | `approval` REJECTED | `CANCELLED` | — |
 | `AWAITING_APPROVAL`/`DRAFTING` | `update_task_progress` | *(no change)* | `PLAN_NOT_APPROVED` ← **critical guard** |
 | `APPROVED` | `update_task_progress` IN_PROGRESS | `IN_EXECUTION` | — |

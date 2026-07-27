@@ -73,6 +73,14 @@ Blocking approval adds a third, physical layer on top of these.
 - Renders the **whole queue** (multiple concurrent sessions), each with 승인/수정요청/거절
   buttons and a comment box. Polls every 1.5 s. Tab title flashes `⚠ 승인 대기 N건` and a short
   tone plays on a new request.
+- A **PLAN** request renders a header — `계획 승인 요청 · <plan_id>`, the labelled 목표, and the
+  model's 개요 (`plan_summary`) — then the task list as rows, each with its own comment box (see
+  [Per-task review](#per-task-review-19x)). A **COMPLETION** request keeps the original single
+  `<pre>` + one comment box.
+- `plan_summary` travels as **its own field** on the request, not only inside the pre-rendered
+  `display`. It briefly did not: when the page stopped rendering `display` for PLAN requests, the
+  overview went with it and the human was left judging a bare task list. A field the page can
+  compose with is the fix; `display` remains what the model echoes into chat.
 - **HTML/XSS escaping** is client-side (`esc()`), verified in a real browser: a `<script>` in
   plan text renders as inert text, no console error. The `onclick` handlers pass the request's
   hex id (safe), so escaped plan content cannot break routing.
@@ -83,6 +91,49 @@ Blocking approval adds a third, physical layer on top of these.
 - If the page cannot start at all, the server **degrades loudly**: the response carries a
   `NOT hard-paused` warning in `input_notes` and audits `approval_ui_unavailable`. It never
   silently disarms.
+
+## Per-task review (1.9.x)
+
+REVISE used to mean one thing: throw the breakdown away and redraft it. For a mid-sized model
+that is a waste — the human objected to one line, and the model rewrites five, drifting on the
+four nobody questioned. Per-task review makes the narrow case narrow.
+
+**The human's side.** On a PLAN request each task is a row with its own comment box, plus the
+global box. The REVISE button **states its own consequence before it is clicked**:
+
+| what is typed | button label | `scope` sent |
+|---|---|---|
+| nothing per-task | `수정 요청 · 계획 전체 재작성` | `PLAN` |
+| task 3 only | `수정 요청 · 3번만` | `TASKS` |
+| tasks 2 and 3 | `수정 요청 · 2개 태스크만` | `TASKS` |
+| any, with `☐ 계획 전체를 다시 세우기` ticked | `수정 요청 · 계획 전체 재작성` | `PLAN` |
+
+That is why the server **never infers the scope**: the page already showed the human what would
+happen, and re-deriving it from "are there comments?" would overrule what they were shown.
+
+**The model's side.** `TASKS` scope records `plan.pending_revision = {"targets": {...}}`. While
+that is set, `next_action_hint` hands the model the literal argument to send —
+`task_updates=[{"task_id": 3, "title": "<the rewritten task>"}]` — and names the tasks it must
+not touch. `plan_and_think` then rewrites only the flagged tasks: **task ids, positions, and the
+`result_log` of untouched tasks all survive.** Unflagged edits are dropped with a note.
+
+**Boundaries, and why.**
+- **The completion phase is excluded.** A COMPLETION request asks whether work already done is
+  real; rewriting one line of the plan does not answer that. `record_decision` forces `scope =
+  PLAN` for any non-PLAN entry, so an older or hand-crafted client cannot get around it.
+- **Add / delete / reorder are excluded.** They renumber `task_id`, which breaks the ordering
+  invariants in `can_start_task` / `unfinished_before` and any id the model is holding. Those go
+  through 계획 전체 재작성; the checkbox label says so.
+- **A full `task_list` in answer to a targeted request is accepted**, with a note and an audited
+  `targeted_revision_ignored`. It is wasteful, not unsafe — the human re-approves every task
+  either way — and refusing would strand a model that cannot follow the hint. Auditing it is
+  what makes the waste measurable in the field.
+- **`task_updates` with no pending request is refused** (`REVISION_NOT_REQUESTED`). Otherwise the
+  model could edit an approved plan on its own authority.
+
+**Mixed versions.** An entry published by an older process has no `phase`; `/api/pending` returns
+it as `null` rather than guessing `PLAN`, and the page falls back to the original single-comment
+form. A decided entry with no `scope` reads as `PLAN`. Both directions degrade to 1.8 behaviour.
 
 ## Config knobs
 

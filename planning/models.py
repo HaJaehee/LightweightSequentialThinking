@@ -90,6 +90,8 @@ class ErrorCode(str, Enum):
     TASK_OUT_OF_ORDER = "TASK_OUT_OF_ORDER"
     MISSING_RESULT_LOG = "MISSING_RESULT_LOG"
     COMPLETION_PENDING = "COMPLETION_PENDING"
+    REVISION_NOT_REQUESTED = "REVISION_NOT_REQUESTED"
+    REVISION_INCOMPLETE = "REVISION_INCOMPLETE"
     INVALID_STATUS = "INVALID_STATUS"
     INVALID_DECISION = "INVALID_DECISION"
     INVALID_STEP = "INVALID_STEP"
@@ -108,6 +110,12 @@ class Task:
     result_log: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
+    # Set when the human commented on THIS task on the approval page and the model
+    # rewrote it in response. Both fields exist only for the re-approval window: they
+    # let the page show "this is the one you flagged, here is what changed" so the
+    # human re-reads one line instead of the whole plan. Cleared once approved.
+    revision_note: str | None = None
+    previous_title: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -117,6 +125,8 @@ class Task:
             "result_log": self.result_log,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "revision_note": self.revision_note,
+            "previous_title": self.previous_title,
         }
 
     @classmethod
@@ -128,7 +138,13 @@ class Task:
             result_log=raw.get("result_log"),
             started_at=raw.get("started_at"),
             finished_at=raw.get("finished_at"),
+            revision_note=raw.get("revision_note"),
+            previous_title=raw.get("previous_title"),
         )
+
+    def clear_revision_marks(self) -> None:
+        self.revision_note = None
+        self.previous_title = None
 
     def brief(self, log_limit: int = 200) -> dict[str, Any]:
         """Compact form sent to the LLM. result_log is capped to protect context."""
@@ -138,6 +154,10 @@ class Task:
         out: dict[str, Any] = {"task_id": self.task_id, "title": self.title, "status": self.status}
         if log:
             out["result_log"] = log
+        if self.revision_note:
+            out["revision_note"] = self.revision_note
+        if self.previous_title:
+            out["previous_title"] = self.previous_title
         return out
 
 
@@ -216,6 +236,11 @@ class Plan:
     tasks: list[Task] = field(default_factory=list)
     approval: Approval = field(default_factory=Approval)
     superseded_tasks: list[list[dict[str, Any]]] = field(default_factory=list)
+    # Set only when the human asked for a TARGETED revision: {"targets": {"3": "comment"}}.
+    # Its presence is what makes the server demand task_updates instead of a whole new
+    # task_list, and what tells it which tasks the model is allowed to touch. Cleared as
+    # soon as the revision is applied, so it can never authorize a later edit.
+    pending_revision: dict[str, Any] | None = None
 
     # ---- serialization -------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -230,6 +255,7 @@ class Plan:
             "tasks": [t.to_dict() for t in self.tasks],
             "approval": self.approval.to_dict(),
             "superseded_tasks": self.superseded_tasks,
+            "pending_revision": self.pending_revision,
         }
 
     @classmethod
@@ -245,6 +271,7 @@ class Plan:
             tasks=[Task.from_dict(t) for t in raw.get("tasks", [])],
             approval=Approval.from_dict(raw.get("approval")),
             superseded_tasks=raw.get("superseded_tasks", []),
+            pending_revision=raw.get("pending_revision") or None,
         )
 
     # ---- queries -------------------------------------------------------
@@ -330,3 +357,25 @@ class Plan:
 
     def tasks_brief(self) -> list[dict[str, Any]]:
         return [t.brief() for t in self.tasks]
+
+    # ---- targeted revision ---------------------------------------------
+    def revision_targets(self) -> dict[int, str]:
+        """{task_id: the human's comment} for a pending targeted revision, else {}.
+
+        JSON object keys are strings, so the ids arrive as text and are coerced back
+        here. An unreadable key is dropped rather than raised: a malformed marker must
+        not make the whole plan unloadable.
+        """
+        raw = (self.pending_revision or {}).get("targets") or {}
+        targets: dict[int, str] = {}
+        if isinstance(raw, dict):
+            for key, comment in raw.items():
+                try:
+                    targets[int(key)] = str(comment or "")
+                except (TypeError, ValueError):
+                    continue
+        return targets
+
+    def clear_revision_marks(self) -> None:
+        for task in self.tasks:
+            task.clear_revision_marks()

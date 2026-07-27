@@ -84,7 +84,12 @@ def render_completion_report(plan: Plan, plan_summary: str | None = None) -> str
 
 def render_plan_for_user(plan: Plan, plan_summary: str | None = None) -> str:
     """Pre-rendered approval block. The model only has to echo this string, which is the
-    single most reliable operation a weak model can perform."""
+    single most reliable operation a weak model can perform.
+
+    A task the human flagged and the model then rewrote is marked, with its old wording
+    underneath. Re-approving a revision should be a matter of reading the lines that
+    changed, not the whole plan again.
+    """
     lines = ["계획 승인 요청"]
     if plan.goal:
         lines.append(f"목표: {plan.goal}")
@@ -92,8 +97,17 @@ def render_plan_for_user(plan: Plan, plan_summary: str | None = None) -> str:
         lines.append("")
         lines.append(plan_summary.strip())
     lines.append("")
+    revised = 0
     for task in plan.tasks:
-        lines.append(f"{task.task_id}. {task.title}")
+        mark = "↻ " if task.revision_note else ""
+        lines.append(f"{mark}{task.task_id}. {task.title}")
+        if task.previous_title:
+            lines.append(f"   이전: {task.previous_title}")
+        if task.revision_note:
+            revised += 1
+            lines.append(f"   요청하신 내용: {task.revision_note}")
     lines.append("")
+    if revised:
+        lines.append(f"↻ 표시된 {revised}개 태스크만 수정했습니다. 나머지는 그대로입니다.")
     lines.append("이 계획을 승인합니까? (승인 / 수정 요청 / 거절)")
     return "\n".join(lines)

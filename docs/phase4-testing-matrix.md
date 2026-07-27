@@ -78,6 +78,18 @@ PASS criteria are written so they can be judged from the AnythingLLM transcript 
 | **Enforcement** | Server-blocked since 1.2.0: `APPROVED` without a fresh `ASK_USER` on the revised version returns `APPROVAL_NOT_REQUESTED` |
 | **Check in state** | `approval.revision_count == 1`, `user_comment` stored verbatim |
 
+### B2b. Per-task comment (targeted revision) — only the flagged task changes
+
+| | |
+|---|---|
+| **U (at gate)** | On the approval page, types `요약 말고 표를 그대로 넣어주세요` into **task 3's** box only, then clicks the button now labelled `수정 요청 · 3번만` |
+| **Expect** | `revision_scope: "TASKS"` + `revision_targets: [{task_id: 3, ...}]` → `plan_and_think` with **`task_updates`** (not `task_list`) → `ASK_USER` again |
+| **PASS** | (a) tasks 1, 2, 4 keep their exact titles **and their `task_id`**; (b) only task 3's title changed; (c) the re-approval screen marks task 3 with `↻` and shows its previous title; (d) a second approval gate occurs |
+| **FAIL mode** | Model sends a full `task_list` and rewrites all four tasks — accepted, but `input_notes` says so and the audit log records `targeted_revision_ignored`. This is the metric for whether the model is using the feature. |
+| **FAIL mode (blocked)** | Model sends `task_updates` for a task the user did **not** flag → the edit is dropped with a note, that task is unchanged |
+| **Check in state** | `plan.pending_revision` set on REVISE, cleared after the update; task 3 has `revision_note` + `previous_title`; untouched tasks keep `result_log` |
+| **Check the boundary** | Same comment typed on a **completion** report must fall back to whole-plan REVISE (`revision_scope: "PLAN"`, no `pending_revision`) — the page shows no per-task boxes there |
+
 ### B3. Ambiguous reply
 
 | | |

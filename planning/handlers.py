@@ -14,7 +14,15 @@ from typing import Any
 
 import time
 
-from .approval import ApprovalServer, ApprovalStore
+from .approval import (
+    PHASE_COMPLETION,
+    PHASE_PLAN,
+    SCOPE_PLAN,
+    SCOPE_TASKS,
+    ApprovalServer,
+    ApprovalStore,
+    Verdict,
+)
 from .config import NO_PROGRESS_WAIT_CEILING_SEC, Config
 from .leniency import normalize
 from .models import (
@@ -166,6 +174,11 @@ class PlanningHandlers:
         plan.approval.decided_at = now_iso()
         if comment:
             plan.approval.user_comment = comment
+        # The "you flagged this one" markers exist to guide a re-read of a revised plan.
+        # Once it is approved they are answered, and leaving them would decorate the
+        # completion report with stale complaints.
+        plan.clear_revision_marks()
+        plan.pending_revision = None
         # Approving a completion report closes the plan; approving a draft unlocks it.
         plan.set_status(
             PlanStatus.COMPLETED
@@ -181,12 +194,50 @@ class PlanningHandlers:
         plan.set_status(PlanStatus.CANCELLED)
         self._withdraw_approval_request(plan)
 
-    def _mutate_revise(self, plan: Plan, comment: str | None) -> None:
+    @staticmethod
+    def _revision_targets(plan: Plan, task_comments: dict[str, str] | None) -> dict[str, str]:
+        """Keep only comments that name a task this plan actually has.
+
+        A comment on a task that no longer exists cannot be answered by rewriting it, and
+        letting it through would leave a target the model can never satisfy.
+        """
+        targets: dict[str, str] = {}
+        for raw_id, text in (task_comments or {}).items():
+            try:
+                task_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            body = str(text or "").strip()
+            if body and plan.get_task(task_id) is not None:
+                targets[str(task_id)] = body
+        return targets
+
+    def _mutate_revise(
+        self,
+        plan: Plan,
+        comment: str | None,
+        task_comments: dict[str, str] | None = None,
+        scope: str = SCOPE_PLAN,
+    ) -> dict[str, str]:
+        """Send a plan back for changes. Returns the per-task targets, if any.
+
+        Two shapes of "no" share this path. A whole-plan revision is the original
+        behaviour: everything is redrafted. A targeted one records exactly which tasks
+        the human objected to, which is the only thing that later stops the model from
+        quietly rewriting the tasks they already accepted.
+        """
         plan.approval.revision_count += 1
         plan.approval.user_comment = comment or ""
         plan.approval.reset_request()
+        # Markers from a previous round would otherwise read as complaints about this one.
+        plan.clear_revision_marks()
+        targets = (
+            self._revision_targets(plan, task_comments) if scope == SCOPE_TASKS else {}
+        )
+        plan.pending_revision = {"targets": targets} if targets else None
         plan.set_status(PlanStatus.DRAFTING)
         self._withdraw_approval_request(plan)
+        return targets
 
     def _apply_late_decision(self) -> None:
         """Honour a decision the human made after the tool call had already returned.
@@ -210,18 +261,25 @@ class PlanningHandlers:
                 break
         else:
             return
-        decision, comment = taken
-        if decision == Decision.APPROVED.value:
-            self._mutate_approved(plan, comment)
-        elif decision == Decision.REJECTED.value:
-            self._mutate_rejected(plan, comment)
+        verdict: Verdict = taken
+        if verdict.decision == Decision.APPROVED.value:
+            self._mutate_approved(plan, verdict.comment)
+        elif verdict.decision == Decision.REJECTED.value:
+            self._mutate_rejected(plan, verdict.comment)
         else:
-            self._mutate_revise(plan, comment)
+            self._mutate_revise(
+                plan, verdict.comment, verdict.task_comments, verdict.scope
+            )
         self.store.save(state)
         self.store.audit(
-            "late_decision_applied", plan_id=plan.plan_id, decision=decision, comment=comment
+            "late_decision_applied",
+            plan_id=plan.plan_id,
+            decision=verdict.decision,
+            comment=verdict.comment,
+            scope=verdict.scope,
+            task_comments=verdict.task_comments or None,
         )
-        log.warning("Applied a late human decision for %s: %s", plan.plan_id, decision)
+        log.warning("Applied a late human decision for %s: %s", plan.plan_id, verdict.decision)
 
     # ---- plan routing ---------------------------------------------------
     _AMBIGUOUS = object()
@@ -464,11 +522,51 @@ class PlanningHandlers:
                 message=f"Thinking step {step_number} recorded.",
             )
 
-        # --- finalizing: a task_list is mandatory -----------------------------
+        # --- finalizing -------------------------------------------------------
         task_list = args.get("task_list") or []
+        task_updates = args.get("task_updates") or []
+        targets = plan.revision_targets()
+
+        if task_updates and not targets:
+            # Without a pending per-task request this would be the model editing an
+            # arbitrary task on its own authority - the plan the human saw would change
+            # underneath them. Refuse; a genuine re-plan goes through task_list.
+            plan.touch()
+            self.store.save(state)
+            self.store.audit("unrequested_task_updates", plan_id=plan.plan_id)
+            return error(
+                plan,
+                ErrorCode.REVISION_NOT_REQUESTED,
+                "task_updates was sent but the user has not asked for changes to any "
+                "specific task.",
+                notes=notes,
+                recorded_step=step_number,
+                tasks=plan.tasks_brief(),
+            )
+
+        if targets and task_updates:
+            if task_list:
+                notes.append(
+                    "Both task_updates and task_list were sent. task_list was ignored: "
+                    "the user only asked for changes to specific tasks."
+                )
+            return self._apply_task_updates(
+                state, plan, task_updates, targets, notes, step_number
+            )
+
         if not task_list:
             plan.touch()
             self.store.save(state)  # the thought is kept; only the finalization is refused
+            if targets:
+                return error(
+                    plan,
+                    ErrorCode.REVISION_INCOMPLETE,
+                    "The user asked for changes to specific tasks, but neither "
+                    "task_updates nor task_list was sent.",
+                    notes=notes,
+                    recorded_step=step_number,
+                    tasks=plan.tasks_brief(),
+                )
             return error(
                 plan,
                 ErrorCode.MISSING_TASK_LIST,
@@ -476,6 +574,23 @@ class PlanningHandlers:
                 notes=notes,
                 recorded_step=step_number,
             )
+
+        if targets:
+            # The model was asked to change two lines and rewrote the whole plan. That is
+            # wasteful rather than unsafe - the human still re-approves every task - so it
+            # is accepted, told, and recorded, which is what makes the waste measurable.
+            notes.append(
+                "The user only asked for changes to task(s) "
+                f"{', '.join(str(t) for t in sorted(targets))}, but you replaced the whole "
+                "task list. It was accepted; the user must now re-approve every task. "
+                "Next time send task_updates."
+            )
+            self.store.audit(
+                "targeted_revision_ignored",
+                plan_id=plan.plan_id,
+                targets=sorted(targets),
+            )
+            plan.pending_revision = None
 
         if len(task_list) > self.config.max_tasks:
             notes.append(
@@ -505,6 +620,113 @@ class PlanningHandlers:
             message=(
                 f"Plan created with {len(plan.tasks)} tasks. "
                 "Execution is locked until the user approves."
+            ),
+        )
+
+    def _apply_task_updates(
+        self,
+        state: State,
+        plan: Plan,
+        updates: list[dict[str, Any]],
+        targets: dict[int, str],
+        notes: list[str],
+        step_number: int,
+    ) -> dict[str, Any]:
+        """Rewrite only the tasks the human flagged, leaving the rest untouched.
+
+        This is the whole point of per-task review: the tasks the human already read and
+        accepted keep their identity, their position, and - if the plan had already been
+        running - their evidence. Only a flagged task is reset, because only a flagged
+        task is being asked to change.
+        """
+        # Validated in full before anything is written. A bad task_id halfway through a
+        # single-pass loop would persist half a revision and leave the plan in a state
+        # nobody approved.
+        planned: list[tuple[int, str]] = []
+        ignored: list[int] = []
+        for item in updates:
+            task_id = item.get("task_id")
+            title = str(item.get("title") or "").strip()
+            if not isinstance(task_id, int) or plan.get_task(task_id) is None:
+                plan.touch()
+                self.store.save(state)
+                valid = ", ".join(str(t.task_id) for t in plan.tasks) or "none"
+                return error(
+                    plan,
+                    ErrorCode.TASK_NOT_FOUND,
+                    f"No task with task_id={task_id} in this plan. Valid task_id "
+                    f"values are: {valid}.",
+                    notes=notes,
+                    recorded_step=step_number,
+                    tasks=plan.tasks_brief(),
+                )
+            if task_id not in targets or not title:
+                ignored.append(task_id)
+                continue
+            planned.append((task_id, title))
+
+        if not planned:
+            plan.touch()
+            self.store.save(state)
+            return error(
+                plan,
+                ErrorCode.REVISION_INCOMPLETE,
+                "None of the tasks the user commented on were rewritten.",
+                notes=notes,
+                recorded_step=step_number,
+                tasks=plan.tasks_brief(),
+            )
+
+        plan.superseded_tasks.append([t.to_dict() for t in plan.tasks])
+        for task_id, title in planned:
+            task = plan.get_task(task_id)
+            task.previous_title = task.title
+            task.title = title
+            task.revision_note = targets[task_id]
+            # A rewritten task is a different task, so whatever was done for the old one
+            # no longer counts. Untouched tasks keep their status and their result_log.
+            task.status = TaskStatus.PENDING.value
+            task.result_log = None
+            task.started_at = None
+            task.finished_at = None
+
+        applied = [task_id for task_id, _ in planned]
+        if ignored:
+            notes.append(
+                f"Ignored the change to task(s) {', '.join(str(t) for t in ignored)}: "
+                "the user did not ask for those to change."
+            )
+        unaddressed = [t for t in sorted(targets) if t not in applied]
+        if unaddressed:
+            notes.append(
+                "The user also commented on task(s) "
+                f"{', '.join(str(t) for t in unaddressed)}, which you did not rewrite. "
+                "They are unchanged and the user will see that when they review."
+            )
+
+        plan.pending_revision = None
+        plan.set_status(PlanStatus.AWAITING_APPROVAL)
+        plan.approval.reset_request()
+        self.store.save(state)
+        self.store.audit(
+            "tasks_revised",
+            plan_id=plan.plan_id,
+            applied=applied,
+            ignored=ignored or None,
+            unaddressed=unaddressed or None,
+        )
+        return build(
+            plan,
+            recorded_step=step_number,
+            total_steps=plan.total_steps,
+            tasks=plan.tasks_brief(),
+            notes=notes,
+            qualify=len(state.active_plans()) > 1,
+            revised_tasks=applied,
+            message=(
+                f"Rewrote task(s) {', '.join(str(t) for t in applied)} as the user asked. "
+                "Every other task is unchanged. Execution stays locked until the user "
+                "approves this version."
             ),
         )
 
@@ -624,9 +846,11 @@ class PlanningHandlers:
         if self.approval_ui is not None:
             fingerprint = self._fingerprint(plan)
             waited_plan_id = plan.plan_id
-            decided = self._wait_for_human(plan, display, progress_token, notifier, notes)
+            phase = PHASE_COMPLETION if completion_phase else PHASE_PLAN
+            decided = self._wait_for_human(
+                plan, display, progress_token, notifier, notes, phase, plan_summary
+            )
             if decided is not None:
-                decision, comment = decided
                 # The transaction was released while waiting, so another session may
                 # have moved things on. Re-read THIS plan by id - resolving "the active
                 # plan" would pick up a concurrent session's plan instead - and verify
@@ -637,7 +861,7 @@ class PlanningHandlers:
                     self.store.audit(
                         "approval_discarded_plan_changed",
                         plan_id=plan.plan_id if plan else None,
-                        decision=decision,
+                        decision=decided.decision,
                     )
                     notes.append(
                         "The plan changed while the user was deciding, so that decision "
@@ -651,13 +875,13 @@ class PlanningHandlers:
                     )
                 # Reuse the already-tested transitions so the blocking path and the
                 # two-phase path can never diverge.
-                forwarded = {"user_comment": comment} if comment else {}
-                if decision == Decision.APPROVED.value:
+                forwarded = {"user_comment": decided.comment} if decided.comment else {}
+                if decided.decision == Decision.APPROVED.value:
                     return self._approve(state, plan, forwarded, notes)
-                if decision == Decision.REJECTED.value:
+                if decided.decision == Decision.REJECTED.value:
                     return self._reject(state, plan, forwarded, notes)
-                if decision == Decision.REVISE.value:
-                    return self._revise(state, plan, forwarded, notes)
+                if decided.decision == Decision.REVISE.value:
+                    return self._revise(state, plan, forwarded, notes, verdict=decided)
             notes.append(
                 "No human decision arrived before the wait expired. The plan is still "
                 "LOCKED. Show the plan to the user and stop; do not execute anything."
@@ -678,7 +902,9 @@ class PlanningHandlers:
         progress_token: Any,
         notifier: Any,
         notes: list[str],
-    ) -> tuple[str, str] | None:
+        phase: str = PHASE_PLAN,
+        summary: str = "",
+    ) -> Verdict | None:
         """Block this tool call until a human decides. Returns None on timeout.
 
         This is what actually stops the agent: AnythingLLM's loop waits synchronously
@@ -689,7 +915,8 @@ class PlanningHandlers:
         timeout = self.effective_timeout(can_heartbeat)
 
         request_id = self.approval_ui.open_request(
-            plan.plan_id, plan.goal, display, plan.tasks_brief(), self._fingerprint(plan)
+            plan.plan_id, plan.goal, display, plan.tasks_brief(),
+            self._fingerprint(plan), phase, summary,
         )
         if request_id is None:
             # Degrading quietly would remove the hard pause without anyone noticing -
@@ -721,7 +948,7 @@ class PlanningHandlers:
             timeout,
             "on" if can_heartbeat else "off - no progressToken from client",
         )
-        decided: tuple[str, str] | None = None
+        decided: Verdict | None = None
         try:
             # Let every other session through while this one waits on a person.
             with self.store.paused():
@@ -746,8 +973,10 @@ class PlanningHandlers:
         self.store.audit(
             "approval_decided_out_of_band",
             plan_id=plan.plan_id,
-            decision=decided[0],
-            comment=decided[1],
+            decision=decided.decision,
+            comment=decided.comment,
+            scope=decided.scope,
+            task_comments=decided.task_comments or None,
         )
         return decided
 
@@ -840,17 +1069,62 @@ class PlanningHandlers:
         )
 
     def _revise(
-        self, state: State, plan: Plan, args: dict[str, Any], notes: list[str]
+        self,
+        state: State,
+        plan: Plan,
+        args: dict[str, Any],
+        notes: list[str],
+        verdict: Verdict | None = None,
     ) -> dict[str, Any]:
+        """Record a request for changes.
+
+        `verdict` is present only when the decision came from the approval page, which is
+        the only place per-task comments can be written. When the model reports the
+        decision itself (the two-phase path) there is no such detail, so the plan is
+        redrafted whole - exactly as it always was.
+        """
         comment = args.get("user_comment") or ""
-        self._mutate_revise(plan, comment)
+        targets = self._mutate_revise(
+            plan,
+            comment,
+            verdict.task_comments if verdict else None,
+            verdict.scope if verdict else SCOPE_PLAN,
+        )
         self.store.save(state)
         self.store.audit(
             "revision_requested",
             plan_id=plan.plan_id,
             revision_count=plan.approval.revision_count,
             user_comment=comment,
+            scope=SCOPE_TASKS if targets else SCOPE_PLAN,
+            task_comments=(verdict.task_comments or None) if verdict else None,
         )
+
+        if targets:
+            flagged = plan.revision_targets()
+            return build(
+                plan,
+                message=(
+                    "The user asked for changes to specific tasks. Rewrite ONLY those "
+                    "tasks and send them back as task_updates. Every other task was "
+                    "accepted and must stay exactly as it is."
+                ),
+                notes=notes,
+                user_comment=comment or None,
+                revision_count=plan.approval.revision_count,
+                revision_scope=SCOPE_TASKS,
+                revision_targets=[
+                    {
+                        "task_id": task_id,
+                        "title": plan.get_task(task_id).title,
+                        "user_comment": body,
+                    }
+                    for task_id, body in sorted(flagged.items())
+                ],
+                tasks_unchanged=[t.task_id for t in plan.tasks if t.task_id not in flagged],
+                tasks=plan.tasks_brief(),
+            )
+
         return build(
             plan,
             message=(
@@ -860,6 +1134,10 @@ class PlanningHandlers:
             notes=notes,
             user_comment=comment or None,
             revision_count=plan.approval.revision_count,
+            revision_scope=SCOPE_PLAN,
+            # Even a whole-plan rewrite benefits from knowing what the human said about
+            # each task; it just does not constrain which tasks may change.
+            task_comments=(verdict.task_comments or None) if verdict else None,
         )
 
     def _reject(

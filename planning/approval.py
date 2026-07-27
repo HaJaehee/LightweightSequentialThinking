@@ -33,6 +33,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,32 @@ DECISIONS = ("APPROVED", "REJECTED", "REVISE")
 APPROVAL_FILENAME = "approval.json"
 APPROVAL_LOCK_FILENAME = ".approvallock"
 SERVER_SIGNATURE = "planning-mcp-approval"
+
+# Which question the human is being asked. A PLAN request is a task list they may
+# comment on line by line; a COMPLETION request is a report on work already done, where
+# per-task rewriting is meaningless - the plan is right, the execution is in dispute.
+PHASE_PLAN = "PLAN"
+PHASE_COMPLETION = "COMPLETION"
+
+# How much of the plan one REVISE is allowed to change.
+SCOPE_PLAN = "PLAN"    # rewrite the whole breakdown (the original behaviour)
+SCOPE_TASKS = "TASKS"  # rewrite only the tasks the human commented on
+SCOPES = (SCOPE_PLAN, SCOPE_TASKS)
+
+
+@dataclass
+class Verdict:
+    """What the human decided, and how far it reaches.
+
+    A plain tuple grew a third and fourth member as the page learned to carry per-task
+    feedback, and every silent arity change is a chance to drop the human's words on the
+    floor. Named fields make an omission a visible error instead.
+    """
+
+    decision: str
+    comment: str = ""
+    task_comments: dict[str, str] = field(default_factory=dict)
+    scope: str = SCOPE_PLAN
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +140,8 @@ class ApprovalStore:
         display: str,
         tasks: list[dict[str, Any]],
         fingerprint: str,
+        phase: str = PHASE_PLAN,
+        summary: str = "",
     ) -> str | None:
         """Queue a request for the human. Returns its id, or None if it could not be saved.
 
@@ -125,13 +154,20 @@ class ApprovalStore:
             "id": request_id,
             "plan_id": plan_id,
             "goal": goal,
+            # The model's plain-language overview. It used to reach the human only inside
+            # `display`; once the page started rendering tasks as rows that blob was no
+            # longer shown, and the overview vanished with it. It is its own field now.
+            "summary": summary,
             "display": display,
             "tasks": tasks,
             "fingerprint": fingerprint,
+            "phase": phase if phase in (PHASE_PLAN, PHASE_COMPLETION) else PHASE_PLAN,
             "created_at": time.time(),
             "created_by_pid": os.getpid(),
             "decision": None,
             "comment": "",
+            "task_comments": {},
+            "scope": SCOPE_PLAN,
             "decided_at": None,
         }
         with exclusive(self.lock_path) as got:
@@ -143,17 +179,56 @@ class ApprovalStore:
             log.warning("Published an approval request without the write lock")
         return request_id if written else None
 
-    def record_decision(self, request_id: str, decision: str, comment: str) -> bool:
-        """Called by the page, for one specific queued request."""
+    @staticmethod
+    def _clean_task_comments(raw: Any) -> dict[str, str]:
+        """{task_id: comment} with blanks dropped. Ids are kept as text (JSON keys)."""
+        if not isinstance(raw, dict):
+            return {}
+        cleaned: dict[str, str] = {}
+        for key, value in raw.items():
+            try:
+                task_id = str(int(str(key).strip()))
+            except (TypeError, ValueError):
+                continue
+            text = str(value or "").strip()
+            if text:
+                cleaned[task_id] = text
+        return cleaned
+
+    def record_decision(
+        self,
+        request_id: str,
+        decision: str,
+        comment: str,
+        task_comments: Any = None,
+        scope: Any = None,
+    ) -> bool:
+        """Called by the page, for one specific queued request.
+
+        `scope` comes from the page, which labels its own button with the consequence
+        before the human clicks it. The server never re-derives it from whether comments
+        happen to be present - that would silently overrule what the human was shown.
+        The one thing it does enforce is that a COMPLETION request can only ever be
+        PLAN-scoped, so an older or hand-crafted client cannot request a per-task
+        rewrite of work that has already run.
+        """
         if decision not in DECISIONS:
             return False
+        cleaned = self._clean_task_comments(task_comments)
         with exclusive(self.lock_path):
             record = self.read()
             queue = self._requests(record)
             for entry in queue:
                 if entry.get("id") == request_id and entry.get("decision") is None:
+                    wanted = scope if scope in SCOPES else SCOPE_PLAN
+                    # Strict equality, so an entry with no phase at all (written by an
+                    # older process) also falls back to a whole-plan rewrite.
+                    if entry.get("phase") != PHASE_PLAN:
+                        wanted = SCOPE_PLAN
                     entry["decision"] = decision
                     entry["comment"] = comment or ""
+                    entry["task_comments"] = cleaned
+                    entry["scope"] = wanted
                     entry["decided_at"] = time.time()
                     # If this cannot be saved the click did nothing; say so rather than
                     # letting the page claim the decision was recorded.
@@ -164,7 +239,19 @@ class ApprovalStore:
         """Everything currently queued, oldest first."""
         return sorted(self._requests(self.read()), key=lambda r: r.get("created_at", 0))
 
-    def _take(self, match) -> tuple[str, str] | None:
+    @staticmethod
+    def _verdict(entry: dict[str, Any]) -> Verdict:
+        """Read a decided entry. Old entries have no scope/task_comments: they predate
+        per-task review and mean exactly what they always meant - rewrite the plan."""
+        scope = entry.get("scope")
+        return Verdict(
+            decision=entry["decision"],
+            comment=entry.get("comment", "") or "",
+            task_comments=ApprovalStore._clean_task_comments(entry.get("task_comments")),
+            scope=scope if scope in SCOPES else SCOPE_PLAN,
+        )
+
+    def _take(self, match) -> Verdict | None:
         with exclusive(self.lock_path):
             queue = self._requests(self.read())
             for entry in queue:
@@ -173,20 +260,20 @@ class ApprovalStore:
                     continue
                 queue = [r for r in queue if r.get("id") != entry.get("id")]
                 self._write({"requests": queue})
-                return verdict if verdict != "drop" else None
+                return verdict if isinstance(verdict, Verdict) else None
             return None
 
-    def claim(self, request_id: str) -> tuple[str, str] | None:
+    def claim(self, request_id: str) -> Verdict | None:
         """Consume the decision for a specific request. Used by the blocking waiter."""
 
         def match(entry):
             if entry.get("id") != request_id or not entry.get("decision"):
                 return None
-            return entry["decision"], entry.get("comment", "")
+            return self._verdict(entry)
 
         return self._take(match)
 
-    def claim_for_plan(self, plan_id: str, fingerprint: str) -> tuple[str, str] | None:
+    def claim_for_plan(self, plan_id: str, fingerprint: str) -> Verdict | None:
         """Consume a decision made after the tool call already returned.
 
         Only honoured for the exact plan version that was on screen - the human agreed
@@ -199,7 +286,7 @@ class ApprovalStore:
             if entry.get("fingerprint") != fingerprint:
                 log.warning("Discarding a decision for a plan that has since changed (%s)", plan_id)
                 return "drop"
-            return entry["decision"], entry.get("comment", "")
+            return self._verdict(entry)
 
         return self._take(match)
 
@@ -238,7 +325,16 @@ body{font-family:system-ui,"Segoe UI","Malgun Gothic",sans-serif;margin:0;paddin
       box-shadow:0 1px 3px rgba(0,0,0,.12)}
 @media(prefers-color-scheme:dark){.card{background:#1e2126;box-shadow:none;border:1px solid #2c3038}}
 h1{font-size:1.05rem;margin:0 0 .35rem;letter-spacing:.02em;text-transform:uppercase;opacity:.6}
-.goal{font-size:1.15rem;font-weight:600;margin:0 0 1.25rem;line-height:1.4}
+.goal{font-size:1.15rem;font-weight:600;margin:0 0 1rem;line-height:1.4}
+.goal .lbl{font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
+           opacity:.5;margin-right:.5rem;vertical-align:.08em}
+.summary{background:#f2f3f5;border-radius:8px;padding:.85rem 1rem;margin:0 0 1.25rem;
+         font-size:.94rem;line-height:1.65;white-space:pre-wrap;word-break:break-word}
+@media(prefers-color-scheme:dark){.summary{background:#15171c}}
+.summary .lbl{display:block;font-size:.72rem;font-weight:600;text-transform:uppercase;
+              letter-spacing:.04em;opacity:.5;margin-bottom:.35rem}
+.tasklabel{font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
+           opacity:.5;margin:0 0 .2rem}
 pre{white-space:pre-wrap;word-break:break-word;background:#f2f3f5;border-radius:8px;
     padding:1rem;font-size:.92rem;line-height:1.6;margin:0 0 1.25rem;
     font-family:ui-monospace,Consolas,monospace}
@@ -255,6 +351,22 @@ button:disabled{opacity:.5;cursor:default}
 .idle{text-align:center;opacity:.6;padding:2.5rem 0;font-size:.95rem}
 .done{text-align:center;padding:2rem 0;font-size:1.05rem;font-weight:600}
 .hint{margin-top:1rem;font-size:.82rem;opacity:.55;line-height:1.5}
+.tasks{margin:0 0 1.25rem}
+.task{padding:.7rem 0;border-top:1px solid #e6e8eb}
+@media(prefers-color-scheme:dark){.task{border-top-color:#2c3038}}
+.task:first-child{border-top:0}
+.tt{display:flex;gap:.55rem;align-items:baseline;line-height:1.45;font-size:.95rem}
+.tn{opacity:.5;font-variant-numeric:tabular-nums;min-width:1.4em}
+.badge{font-size:.72rem;padding:.1rem .4rem;border-radius:4px;background:#e6e8eb;opacity:.8}
+@media(prefers-color-scheme:dark){.badge{background:#2c3038}}
+.was{font-size:.82rem;opacity:.55;margin:.25rem 0 0 1.95em;text-decoration:line-through}
+.note{font-size:.82rem;margin:.25rem 0 0 1.95em;color:#8a5a00}
+@media(prefers-color-scheme:dark){.note{color:#d9a441}}
+textarea.tc{min-height:2.4rem;margin:.4rem 0 0 1.95em;width:calc(100% - 1.95em);
+            font-size:.86rem;padding:.4rem .55rem}
+.scope{display:flex;align-items:center;gap:.45rem;margin:-.5rem 0 1rem;font-size:.86rem;
+       opacity:.75}
+.scope input{margin:0}
 </style></head><body><div class="card" id="root">
 <div class="idle">현재 승인 요청 메시지가 없습니다.<br>
 <span style="font-size:.85rem">에이전트가 계획을 제출하면 여기에 표시됩니다.</span></div></div>
@@ -295,7 +407,67 @@ async function poll(){
     if(undecided.length)alertOn();else alertOff();
   }catch(e){}
 }
-function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+// Quotes are escaped too so the same helper is safe inside an attribute value.
+function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',
+  '"':'&quot;',"'":'&#39;'}[c]));}
+
+// ---- per-task review -----------------------------------------------------
+// Only a PLAN request can be reviewed task by task. A COMPLETION request asks whether
+// work already done is real; rewriting one line of the plan does not answer that, so
+// that phase keeps the original single-comment form.
+function comments(id){
+  const out={};
+  document.querySelectorAll('textarea[data-req="'+id+'"]').forEach(b=>{
+    const v=b.value.trim();
+    if(v)out[b.getAttribute('data-tid')]=v;
+  });
+  return out;
+}
+function wholePlan(id){
+  const box=document.getElementById('all-'+id);
+  return !!(box&&box.checked);
+}
+function scopeOf(id){
+  if(wholePlan(id))return 'PLAN';
+  return Object.keys(comments(id)).length?'TASKS':'PLAN';
+}
+// The button says what it will do BEFORE it is clicked, so choosing the scope is an
+// explicit act by the human rather than something the server infers afterwards.
+function relabel(id){
+  const btn=document.getElementById('rev-'+id);
+  if(!btn)return;
+  const ids=Object.keys(comments(id));
+  if(wholePlan(id)||!ids.length){btn.textContent='수정 요청 · 계획 전체 재작성';return;}
+  btn.textContent=ids.length===1?'수정 요청 · '+ids[0]+'번만'
+                                :'수정 요청 · '+ids.length+'개 태스크만';
+}
+// The header a human needs before they can judge a task list at all: what is being
+// asked, what the goal is, and the model's own overview of how it intends to get there.
+// All three used to arrive inside the pre-rendered `display` blob; rendering tasks as
+// rows dropped that blob, so they are composed here from their own fields instead.
+function header(d){
+  const title=d.phase==='COMPLETION'?'완료 확인':'계획 승인 요청';
+  let h='<h1>'+title+' · '+esc(d.plan_id)+'</h1>'+
+    '<p class="goal"><span class="lbl">목표</span>'+esc(d.goal)+'</p>';
+  if(d.summary)h+='<div class="summary"><span class="lbl">개요</span>'+esc(d.summary)+'</div>';
+  return h;
+}
+function taskRows(d){
+  return '<p class="tasklabel">태스크 '+(d.tasks||[]).length+'개</p>'+
+    '<div class="tasks">'+(d.tasks||[]).map(t=>{
+    let row='<div class="task"><div class="tt"><span class="tn">'+esc(String(t.task_id))+
+      '.</span><span>'+esc(t.title)+'</span>'+
+      (t.status&&t.status!=='PENDING'?'<span class="badge">'+esc(t.status)+'</span>':'')+
+      '</div>';
+    if(t.previous_title)row+='<div class="was">'+esc(t.previous_title)+'</div>';
+    if(t.revision_note)row+='<div class="note">\\u21BB 요청하신 내용: '+
+      esc(t.revision_note)+'</div>';
+    row+='<textarea class="tc" data-req="'+esc(d.id)+'" data-tid="'+esc(String(t.task_id))+
+      '" placeholder="이 태스크에 대한 의견 (선택)" oninput="relabel(\\''+esc(d.id)+
+      '\\')"></textarea>';
+    return row+'</div>';
+  }).join('')+'</div>';
+}
 function render(list){
   const root=document.getElementById('root');
   // Matches the static placeholder above, so the page does not flicker between two
@@ -310,14 +482,27 @@ function render(list){
         '<br><span style="font-weight:400;opacity:.6;font-size:.9rem">'+
         '에이전트가 이 결정을 반영합니다.</span></div>';
     }
-    return '<h1>승인 요청 · '+esc(d.plan_id)+'</h1>'+
-      '<p class="goal">'+esc(d.goal)+'</p>'+
-      '<pre>'+esc(d.display)+'</pre>'+
-      '<textarea id="c-'+d.id+'" placeholder="수정 요청 시 내용을 적어주세요 (거절 사유도 여기에)"></textarea>'+
-      '<div class="row">'+
-      '<button class="ok" onclick="decide(\\''+d.id+'\\',\\'APPROVED\\')">승인</button>'+
-      '<button class="rev" onclick="decide(\\''+d.id+'\\',\\'REVISE\\')">수정 요청</button>'+
-      '<button class="no" onclick="decide(\\''+d.id+'\\',\\'REJECTED\\')">거절</button></div>';
+    // An entry with no phase was published by an older server process on this same
+    // state directory. It has no per-task review, so fall back to the original form.
+    const perTask=d.phase==='PLAN'&&d.tasks&&d.tasks.length;
+    // The fallback path keeps the original layout on purpose: `display` already opens
+    // with its own title, 목표 and summary, so composing a header above it would repeat
+    // all three.
+    let html=perTask?header(d)+taskRows(d)
+      :'<h1>'+(d.phase==='COMPLETION'?'완료 확인':'승인 요청')+' · '+esc(d.plan_id)+
+       '</h1><p class="goal">'+esc(d.goal)+'</p><pre>'+esc(d.display)+'</pre>';
+    html+='<textarea id="c-'+esc(d.id)+
+      '" placeholder="전체 의견 (거절 사유도 여기에)"'+
+      (perTask?' oninput="relabel(\\''+esc(d.id)+'\\')"':'')+'></textarea>';
+    if(perTask)html+='<label class="scope"><input type="checkbox" id="all-'+esc(d.id)+
+      '" onchange="relabel(\\''+esc(d.id)+'\\')"> 계획 전체를 다시 세우기 '+
+      '(태스크 추가·삭제·순서 변경은 이쪽)</label>';
+    return html+'<div class="row">'+
+      '<button class="ok" onclick="decide(\\''+esc(d.id)+'\\',\\'APPROVED\\')">승인</button>'+
+      '<button class="rev" id="rev-'+esc(d.id)+'" onclick="decide(\\''+esc(d.id)+
+      '\\',\\'REVISE\\')">수정 요청'+(perTask?' · 계획 전체 재작성':'')+'</button>'+
+      '<button class="no" onclick="decide(\\''+esc(d.id)+
+      '\\',\\'REJECTED\\')">거절</button></div>';
   }).join('<hr style="border:0;border-top:1px solid #ccd0d5;margin:1.75rem 0">')+
     '<p class="hint">결정하기 전까지 해당 에이전트는 아무것도 실행하지 못합니다. '+
     '요청은 응답하실 때까지 사라지지 않으니 천천히 검토하셔도 됩니다.</p>';
@@ -327,9 +512,12 @@ async function decide(id,dec){
   document.querySelectorAll('button').forEach(b=>b.disabled=true);
   const box=document.getElementById('c-'+id);
   const c=box?box.value:'';
+  // Task comments travel with every decision, not just a targeted one: even when the
+  // whole plan is being rewritten, what the human said about task 3 is useful context.
   try{
     await fetch('/api/decide',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({id:id,decision:dec,comment:c})});
+      body:JSON.stringify({id:id,decision:dec,comment:c,
+        task_comments:comments(id),scope:scopeOf(id)})});
   }catch(e){}
   busy=false;seen='';poll();
 }
@@ -463,16 +651,18 @@ class ApprovalServer:
     # ---- request flow --------------------------------------------------
     def open_request(
         self, plan_id: str, goal: str, display: str, tasks: list[dict[str, Any]],
-        fingerprint: str = "",
+        fingerprint: str = "", phase: str = PHASE_PLAN, summary: str = "",
     ) -> str | None:
-        request_id = self.store.publish(plan_id, goal, display, tasks, fingerprint)
+        request_id = self.store.publish(
+            plan_id, goal, display, tasks, fingerprint, phase, summary
+        )
         self._surface()
         return request_id
 
-    def claim(self, request_id: str) -> tuple[str, str] | None:
+    def claim(self, request_id: str) -> Verdict | None:
         return self.store.claim(request_id)
 
-    def take_decision(self, plan_id: str, fingerprint: str) -> tuple[str, str] | None:
+    def take_decision(self, plan_id: str, fingerprint: str) -> Verdict | None:
         return self.store.claim_for_plan(plan_id, fingerprint)
 
     def drop_for_plan(self, plan_id: str) -> None:
@@ -539,7 +729,16 @@ class ApprovalServer:
                             "id": e["id"],
                             "plan_id": e.get("plan_id"),
                             "goal": e.get("goal"),
+                            "summary": e.get("summary") or "",
                             "display": e.get("display"),
+                            # The task list was already being persisted for the
+                            # fingerprint; the page needs it to offer per-task review.
+                            "tasks": e.get("tasks") or [],
+                            # Deliberately NOT defaulted. An entry written by an older
+                            # process has no phase, and guessing PLAN would offer
+                            # per-task review on what may be a completion report. The
+                            # page treats a missing phase as "use the original form".
+                            "phase": e.get("phase"),
                             "decided": e.get("decision"),
                         }
                         for e in server.store.peek()
@@ -561,6 +760,8 @@ class ApprovalServer:
                     str(body.get("id", "")),
                     str(body.get("decision", "")).upper(),
                     body.get("comment", ""),
+                    body.get("task_comments"),
+                    body.get("scope"),
                 )
                 self._json({"ok": ok})
 

@@ -75,6 +75,20 @@ When the server replies with next_action = "CALL_REQUEST_USER_APPROVAL":
              -> decision = "REVISE", user_comment = <the user's exact words>
      If the reply is ambiguous, ask one short clarifying question. Never guess.
 
+--- PHASE 2b: TARGETED REVISION ---
+The user can comment on INDIVIDUAL tasks on the approval page. When they do, the
+server replies with revision_scope = "TASKS" and lists revision_targets.
+  1. Re-plan as usual with `plan_and_think`.
+  2. On your FINAL step send `task_updates` - NOT `task_list`:
+       task_updates = [{"task_id": 3, "title": "<the rewritten task>"}]
+     Rewrite ONLY the tasks named in revision_targets. `next_action_hint`
+     contains the exact argument to send - copy it and fill in the titles.
+  3. Every other task was already accepted by the user. Do not change it, do not
+     renumber it, do not reorder it, do not resend it.
+  4. Then ask for approval again as in Phase 2.
+If the user instead wants tasks added, removed or reordered, the server will say
+revision_scope = "PLAN" - then send a full task_list as normal.
+
 --- PHASE 3: EXECUTE ---
 Only after the server tells you execution is unlocked.
 For each task, in order, one at a time:
@@ -255,6 +269,16 @@ R7. "ok": false 가 오면 포기하거나 답변하지 말고 `next_action_hint
     취소/아니오/하지마   -> decision = "REJECTED"
     수정 요청           -> decision = "REVISE", user_comment = 사용자의 원문
   모호하면 짧게 되묻습니다. 절대 추측하지 않습니다.
+
+[2b단계 태스크별 수정] 사용자는 승인 페이지에서 태스크 하나하나에 의견을 달 수
+  있습니다. 그러면 서버가 revision_scope = "TASKS" 와 revision_targets 를 줍니다.
+  이때는 마지막 plan_and_think 호출에서 task_list 가 아니라 task_updates 를 보냅니다:
+    task_updates = [{"task_id": 3, "title": "새로 쓴 태스크"}]
+  revision_targets 에 없는 태스크는 사용자가 이미 승인한 것입니다. 제목을 바꾸지도,
+  번호를 다시 매기지도, 순서를 바꾸지도, 다시 보내지도 않습니다.
+  next_action_hint 에 보낼 인자가 그대로 들어 있으니 복사해서 제목만 채웁니다.
+  태스크 추가/삭제/순서 변경이 필요하면 서버가 revision_scope = "PLAN" 을 주며,
+  그때는 평소처럼 task_list 전체를 보냅니다.
 
 [3단계 실행] 승인 후에만, 작업 하나씩 순서대로:
   1) update_task_progress (status="IN_PROGRESS")

@@ -62,6 +62,25 @@ Writing tests for untested seams surfaced **8 more defects**:
 
 Plus real-browser verification of the approval page and a fuzz suite for leniency.
 
+### 1.10.0 — per-task plan review
+`REVISE` used to mean one thing: throw the breakdown away and redraft it. A mid-sized model then
+rewrites five tasks because the human objected to one, drifting on the four nobody questioned.
+
+The approval page now renders a **PLAN** request as task rows, each with its own comment box, and
+the REVISE button **states its consequence before it is clicked** (`수정 요청 · 3번만` vs
+`수정 요청 · 계획 전체 재작성`, with a `☐ 계획 전체를 다시 세우기` override). The page sends that
+`scope`; the server never infers it. `scope=TASKS` records `plan.pending_revision`, and
+`plan_and_think` finalizes with the new `task_updates` parameter, rewriting **only** the flagged
+tasks — ids, positions, and the `result_log` of untouched tasks all survive.
+
+Deliberately out of scope, both for the same reason (each would answer a question the human did
+not ask): the **completion phase** stays whole-plan — a completion report disputes whether work
+happened, which rewriting a plan line cannot address — and **add/delete/reorder** stay whole-plan
+because they renumber `task_id` and break the ordering invariants. A full `task_list` sent in
+answer to a targeted request is accepted with a note and audited `targeted_revision_ignored`:
+wasteful, not unsafe, and now measurable. See
+[06](06-human-in-the-loop.md#per-task-review-19x).
+
 ---
 
 ## Git commit ↔ version map

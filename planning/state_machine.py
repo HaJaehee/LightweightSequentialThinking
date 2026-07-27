@@ -131,6 +131,21 @@ def _error_action(plan: Plan | None, code: ErrorCode) -> tuple[str, str]:
             "verify the completion report. Do not change tasks now. Call "
             "request_user_approval with decision='ASK_USER'.",
         )
+    if code is ErrorCode.REVISION_NOT_REQUESTED:
+        return (
+            NextAction.CALL_PLAN_AND_THINK.value,
+            "You sent task_updates, but the user has not asked for changes to specific "
+            "tasks. task_updates may ONLY be used to answer a per-task revision request. "
+            "If you are re-planning, send a full task_list instead.",
+        )
+    if code is ErrorCode.REVISION_INCOMPLETE:
+        targets = plan.revision_targets() if plan else {}
+        which = ", ".join(str(t) for t in sorted(targets)) or "the flagged tasks"
+        return (
+            NextAction.CALL_PLAN_AND_THINK.value,
+            f"None of the tasks the user commented on were rewritten. Send task_updates "
+            f"containing task_id {which} - those are the only tasks you may change.",
+        )
     if code is ErrorCode.INVALID_STATUS:
         return (
             NextAction.CALL_UPDATE_TASK_PROGRESS.value,
@@ -173,6 +188,32 @@ def _status_action(plan: Plan | None) -> tuple[str, str]:
     status = plan.status
 
     if status is PlanStatus.DRAFTING:
+        # A targeted revision is still DRAFTING - locked, nothing executable - but the
+        # instruction is completely different: rewrite the flagged tasks, leave the rest
+        # alone. Handing a weak model the literal argument to send is what makes this
+        # usable at all; it copies the hint far more reliably than it composes one.
+        targets = plan.revision_targets()
+        if targets:
+            listed = "; ".join(
+                f"task {tid}: \"{comment}\"" for tid, comment in sorted(targets.items())
+            )
+            example = ", ".join(
+                '{"task_id": %d, "title": "<the rewritten task>"}' % tid
+                for tid in sorted(targets)
+            )
+            keep = [t.task_id for t in plan.tasks if t.task_id not in targets]
+            untouched = (
+                " Task(s) " + ", ".join(str(k) for k in keep) + " were accepted by the "
+                "user as they stand - do NOT change, renumber, reorder or resend them."
+                if keep
+                else ""
+            )
+            return (
+                NextAction.CALL_PLAN_AND_THINK.value,
+                f"The user commented on specific tasks ({listed}). Call plan_and_think "
+                "with need_more_thinking=false and "
+                f"task_updates=[{example}] - do NOT send task_list.{untouched}",
+            )
         nxt = plan.last_step_number() + 1
         return (
             NextAction.CALL_PLAN_AND_THINK.value,

@@ -1,6 +1,6 @@
 # planning-mcp (LightweightSequentialThinking)
 
-**버전: 1.9.0** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
+**버전: 1.10.0** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
 `SERVER_VERSION` (MCP `initialize` 응답의 `serverInfo.version` 으로 보고됨)
 
 AnythingLLM Agent Mode용 경량 **계획·작업 관리 MCP 서버**. 폐쇄망의 성능이 약한 사내 LLM이
@@ -106,6 +106,7 @@ Usage Rules:
 - Set `need_more_thinking = false` AND provide `task_list` on your FINAL step.
 - Set `revises_step = [step number]` to correct a previously generated step.
 - DO NOT execute tasks or answer the user directly while thinking.
+- TARGETED REVISION: if the server reports that the user commented on specific tasks, send `task_updates` (NOT `task_list`) on your final step, rewriting ONLY those tasks. Every other task was already accepted by the user - do not change, renumber, reorder or resend it. `next_action_hint` contains the exact argument to send.
 </tool_protocol>
 <tool_protocol name="update_task_progress">
 Usage Rules:
@@ -129,7 +130,7 @@ Usage Rules:
 
 | 도구 | 역할 |
 |---|---|
-| `plan_and_think` | 필수 진입점. 호출당 사고 1스텝, 마지막 호출에 `task_list` 제출 |
+| `plan_and_think` | 필수 진입점. 호출당 사고 1스텝, 마지막 호출에 `task_list` 제출. 태스크별 수정 요청에는 `task_updates` |
 | `request_user_approval` | HITL 게이트. `ASK_USER` → 정지 → `APPROVED` / `REJECTED` / `REVISE` |
 | `update_task_progress` | 작업마다 `IN_PROGRESS` 선행, 종료 시 `DONE`/`FAILED`. 미승인 시 거부 |
 | `get_current_plan` | 컨텍스트 절단 후 복구. 언제 호출해도 안전 |

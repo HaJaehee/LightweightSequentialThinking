@@ -8,6 +8,7 @@ what it repaired; it never raises and never rejects.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -21,6 +22,7 @@ _ALLOWED_KEYS: dict[str, set[str]] = {
         "total_steps",
         "need_more_thinking",
         "task_list",
+        "task_updates",
         "revises_step",
         "plan_id",
     },
@@ -178,6 +180,58 @@ def _coerce_task_list(value: Any) -> list[str] | None:
     return cleaned
 
 
+_TASK_ID_KEYS = ("task_id", "taskId", "taskid", "id", "task_number", "number", "task")
+
+
+def _coerce_task_updates(value: Any) -> list[dict[str, Any]] | None:
+    """Into [{"task_id": int, "title": str}]. Returns None only if unreadable.
+
+    Weak models express "change task 3 to X" every way imaginable: a bare object, a
+    JSON string, or {"3": "X"}. Each of those is unambiguous, so each is accepted.
+    Entries missing an id or a title are dropped rather than guessed at - inventing a
+    task_id here would rewrite a task the human never flagged.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            return _coerce_task_updates(json.loads(text))
+        except ValueError:
+            return None
+
+    items: list[Any]
+    if isinstance(value, dict):
+        if any(k in value for k in _TASK_ID_KEYS[:4]):
+            items = [value]  # one bare update, not wrapped in a list
+        else:
+            items = []
+            for key, entry in value.items():  # {"3": "new title"} / {"3": {...}}
+                if isinstance(entry, dict):
+                    merged = dict(entry)
+                    merged.setdefault("task_id", key)
+                    items.append(merged)
+                else:
+                    items.append({"task_id": key, "title": entry})
+    elif isinstance(value, list):
+        items = value
+    else:
+        return None
+
+    # Keyed by task_id so a model that repeats itself does not queue the same edit twice.
+    out: dict[int, dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_id = next((item[k] for k in _TASK_ID_KEYS if item.get(k) is not None), None)
+        task_id = _coerce_int(raw_id)
+        title = _clean_title(item)
+        if task_id is None or task_id < 1 or not title:
+            continue
+        out[task_id] = {"task_id": task_id, "title": title}
+    return list(out.values())
+
+
 def _normalize_enum(value: Any, aliases: dict[str, Any]) -> str | None:
     if not isinstance(value, str):
         return None
@@ -261,6 +315,22 @@ def normalize(tool_name: str, args: Any) -> tuple[dict[str, Any], list[str]]:
             if coerced_list != clean["task_list"]:
                 notes.append(f"Normalized 'task_list' into {len(coerced_list)} plain strings.")
             clean["task_list"] = coerced_list
+
+    if "task_updates" in clean:
+        coerced_updates = _coerce_task_updates(clean["task_updates"])
+        if coerced_updates is None:
+            clean.pop("task_updates")
+            notes.append(
+                "Could not read 'task_updates'; ignored it. Expected "
+                '[{"task_id": 3, "title": "the rewritten task"}].'
+            )
+        else:
+            if coerced_updates != clean["task_updates"]:
+                notes.append(
+                    f"Normalized 'task_updates' into {len(coerced_updates)} "
+                    "{task_id, title} entries."
+                )
+            clean["task_updates"] = coerced_updates
 
     if "status" in clean:
         normalized = _normalize_enum(clean["status"], _STATUS_ALIASES)
