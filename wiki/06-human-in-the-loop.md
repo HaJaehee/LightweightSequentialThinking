@@ -74,9 +74,9 @@ Blocking approval adds a third, physical layer on top of these.
   buttons and a comment box. Polls every 1.5 s. Tab title flashes `⚠ 승인 대기 N건` and a short
   tone plays on a new request.
 - A **PLAN** request renders a header — `계획 승인 요청 · <plan_id>`, the labelled 목표, and the
-  model's 개요 (`plan_summary`) — then the task list as rows, each with its own comment box (see
-  [Per-task review](#per-task-review-19x)). A **COMPLETION** request keeps the original single
-  `<pre>` + one comment box.
+  model's 개요 (`plan_summary`) — then the task list as rows, each with a collapsed comment box
+  behind an [의견] button (see [Per-task review](#per-task-review-19x)). A **COMPLETION** request
+  keeps the original single `<pre>` + one comment box.
 - `plan_summary` travels as **its own field** on the request, not only inside the pre-rendered
   `display`. It briefly did not: when the page stopped rendering `display` for PLAN requests, the
   overview went with it and the human was left judging a bare task list. A field the page can
@@ -99,7 +99,13 @@ that is a waste — the human objected to one line, and the model rewrites five,
 four nobody questioned. Per-task review makes the narrow case narrow.
 
 **The human's side.** On a PLAN request each task is a row with its own comment box, plus the
-global box. The REVISE button **states its own consequence before it is clicked**:
+global box. The per-task boxes are **collapsed behind an [의견] button** (1.11.0): rendered open,
+five to twelve textareas turned the plan into a form and buried the thing the human came to
+read. The textarea stays in the DOM whether or not it is revealed, so `comments()` collects it
+either way — which means a comment written and then collapsed would otherwise vanish from view
+while still being submitted. The row therefore keeps a `filled` marker (amber button) once it
+has text, and the REVISE label below counts it regardless. The REVISE button **states its own
+consequence before it is clicked**:
 
 | what is typed | button label | `scope` sent |
 |---|---|---|

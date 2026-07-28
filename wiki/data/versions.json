@@ -1,6 +1,6 @@
 {
-  "_comment": "Version history. Prose detail in wiki/08-changelog.md; root causes in wiki/09-defects-and-lessons.md. current = 1.10.0.",
-  "current": "1.10.0",
+  "_comment": "Version history. Prose detail in wiki/08-changelog.md; root causes in wiki/09-defects-and-lessons.md. current = 1.11.0.",
+  "current": "1.11.0",
   "branch": "develop",
   "remote": "github.com/HaJaehee/LightweightSequentialThinking",
   "pushed": false,
@@ -15,7 +15,8 @@
     { "version": "1.8.1", "commit": "046a75e..6d3748b", "theme": "Edge-case hunt (4 commits): thread-safe transaction, file-lock timeout, SSE fixes, failure-path honesty, leniency safety, approval-page browser verification.", "defects_fixed": ["D5", "D8", "D9", "D10", "D11", "D12"] },
     { "version": "1.8.2", "theme": "Goal-drift routing: continuing (step>1) with an unmatched goal returns the active-goal list to pick from instead of forking a plan; plan_and_think accepts plan_id; goal matching ignores trailing punctuation.", "defects_fixed": ["D13"] },
     { "version": "1.9.0", "theme": "Task completion enforced: DONE requires a prior IN_PROGRESS, in-order completion, and content-checked result_log evidence; the last DONE enters AWAITING_COMPLETION where a human verifies a per-task completion report before COMPLETED.", "defects_fixed": ["D14"] },
-    { "version": "1.10.0", "theme": "Per-task plan review: the approval page collects a comment per task on a PLAN request, and REVISE with scope=TASKS rewrites only the flagged tasks via plan_and_think's new task_updates parameter - ids, positions and untouched evidence survive. The completion phase is deliberately excluded and stays whole-plan.", "defects_fixed": [] }
+    { "version": "1.10.0", "theme": "Per-task plan review: the approval page collects a comment per task on a PLAN request, and REVISE with scope=TASKS rewrites only the flagged tasks via plan_and_think's new task_updates parameter - ids, positions and untouched evidence survive. The completion phase is deliberately excluded and stays whole-plan.", "defects_fixed": [] },
+    { "version": "1.11.0", "theme": "Call-count reduction without weakening enforcement: auto_advance starts the next task as part of accepting a DONE (5 tasks = 6 execution calls, was 10), the tool description follows the mode via build_tool_definitions, a redundant IN_PROGRESS is idempotent, and task_updates sent without a task_id is paired with the single flagged task instead of dropped. Rejected from the same review: batch DONE marking, and merging task_list with task_updates.", "defects_fixed": [] }
   ],
-  "test_counts": { "unit": 211, "smoke": 5 }
+  "test_counts": { "unit": 228, "smoke": 5 }
 }

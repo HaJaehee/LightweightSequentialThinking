@@ -24,7 +24,7 @@ from .approval import (
     Verdict,
 )
 from .config import NO_PROGRESS_WAIT_CEILING_SEC, Config
-from .leniency import normalize
+from .leniency import UNMATCHED_TITLES_KEY, normalize
 from .models import (
     Approval,
     Decision,
@@ -526,6 +526,27 @@ class PlanningHandlers:
         task_list = args.get("task_list") or []
         task_updates = args.get("task_updates") or []
         targets = plan.revision_targets()
+
+        # A model told to rewrite one flagged task frequently sends only the new wording -
+        # task_updates=["the rewritten task"] - because that is what it was asked for.
+        # With exactly one flagged task there is exactly one task it can mean, so pairing
+        # them is a reading, not a guess. With more than one it WOULD be a guess, and the
+        # model is sent back to try again rather than have the wrong task rewritten.
+        unmatched = args.get(UNMATCHED_TITLES_KEY) or []
+        if not task_updates and len(targets) == 1 and len(unmatched) == 1:
+            only = next(iter(targets))
+            task_updates = [{"task_id": only, "title": unmatched[0]}]
+            notes.append(
+                f"task_updates arrived with no task_id. The user commented on task {only} "
+                f"only, so it was applied there. Next time send "
+                f'[{{"task_id": {only}, "title": "..."}}].'
+            )
+        elif unmatched and targets:
+            notes.append(
+                f"{len(unmatched)} entry/entries in task_updates had no task_id and were "
+                f"ignored: the user commented on {len(targets)} tasks, so there is no way "
+                'to tell which one you meant. Send [{"task_id": <number>, "title": "..."}].'
+            )
 
         if task_updates and not targets:
             # Without a pending per-task request this would be the model editing an
@@ -1231,6 +1252,23 @@ class PlanningHandlers:
                 progress=plan.progress(),
                 next_task={"task_id": nxt.task_id, "title": nxt.title} if nxt else None,
             )
+        if task.status == TaskStatus.IN_PROGRESS.value:
+            # Already running - usually because the server started it (auto-advance) and
+            # the model sent IN_PROGRESS out of habit. Rewriting started_at here would
+            # backdate nothing useful and lose the real start time.
+            return build(
+                plan,
+                task_id=task.task_id,
+                task_status=task.status,
+                progress=plan.progress(),
+                tasks=plan.tasks_brief(),
+                notes=notes,
+                qualify=len(state.active_plans()) > 1,
+                message=(
+                    f"Task {task.task_id} was already IN_PROGRESS. Do the work now, then "
+                    "report it DONE with a result_log."
+                ),
+            )
         if not can_start_task(plan, task.task_id):
             # Redirect rather than reject: rejecting strands the model.
             correct = plan.current_task()
@@ -1351,8 +1389,10 @@ class PlanningHandlers:
             else:
                 plan.set_status(PlanStatus.COMPLETED)
                 self._withdraw_approval_request(plan)
+            advanced = None
         else:
             plan.set_status(PlanStatus.IN_EXECUTION)
+            advanced = self._auto_advance(plan)
         self.store.save(state)
         self.store.audit(
             "task_done",
@@ -1371,7 +1411,39 @@ class PlanningHandlers:
             notes=notes,
             qualify=len(state.active_plans()) > 1,
             next_task={"task_id": nxt.task_id, "title": nxt.title} if nxt else None,
+            message=(
+                f"Task {task.task_id} is DONE. Task {advanced.task_id} "
+                f"('{advanced.title}') has been started for you - do that work NOW, then "
+                "report it DONE with its own result_log. Do not send IN_PROGRESS again."
+            )
+            if advanced is not None
+            else None,
         )
+
+    def _auto_advance(self, plan: Plan) -> Task | None:
+        """Start the next task as part of reporting the previous one DONE.
+
+        The separate IN_PROGRESS call exists to force a turn boundary between "I am
+        starting" and "I am finished" - but reporting DONE already *is* that boundary
+        for the next task: the model receives "task N is in progress, do the work" and
+        still cannot claim DONE until a later call, with its own evidence. So the
+        boundary survives intact and one round trip per task disappears, which is what a
+        small model's context and error rate actually pay for.
+
+        Nothing here relaxes the DONE guard: _finish_task's checks are unchanged, and a
+        task is only ever advanced into once every earlier task is finished.
+        """
+        if not self.config.auto_advance:
+            return None
+        nxt = plan.current_task()
+        if nxt is None or nxt.status != TaskStatus.PENDING.value:
+            return None
+        if not can_start_task(plan, nxt.task_id):
+            return None
+        nxt.status = TaskStatus.IN_PROGRESS.value
+        nxt.started_at = now_iso()
+        self.store.audit("task_auto_started", plan_id=plan.plan_id, task_id=nxt.task_id)
+        return nxt
 
     def _fail_task(
         self, state: State, plan: Plan, task: Task, args: dict[str, Any], notes: list[str]

@@ -81,6 +81,38 @@ answer to a targeted request is accepted with a note and audited `targeted_revis
 wasteful, not unsafe, and now measurable. See
 [06](06-human-in-the-loop.md#per-task-review-19x).
 
+### 1.11.0 — fewer calls, same enforcement
+An external review of the 1.10.0 tool surface raised two objections on behalf of small models:
+14+ tool calls for a 5-task plan, and the `task_list` (strings) vs `task_updates` (objects) type
+split. Its proposed fixes — a `batch_update` that marks several tasks `DONE` at once, and merging
+the two parameters into one shape — were both rejected, and both for the same reason: the thing
+being called overhead is the enforcement.
+
+`DONE` in a batch is precisely the 1.9.0 field failure ([09](09-defects-and-lessons.md)), and
+the two task parameters differ in *authority*, not format — `task_list` costs a full
+re-approval, `task_updates` may only answer a request the human made. What did survive review:
+
+- **Auto-advance** (`PLANNING_MCP_AUTO_ADVANCE`, default on). Accepting a `DONE` also puts the
+  next task into `IN_PROGRESS`. The separate start call was a round trip, not a safeguard: the
+  model still gets one "do the work" instruction per task and still cannot claim `DONE` without
+  its own evidence, so 5 tasks cost 6 execution calls instead of 10 with nothing given up. A
+  redundant `IN_PROGRESS` is accepted without resetting `started_at`, and
+  `build_tool_definitions(auto_advance=...)` swaps the tool description so the advertised
+  contract cannot contradict the running server.
+- **Bare `task_updates` are read, not guessed.** A model asked to rewrite one task often sends
+  just the new wording (`["the rewritten task"]`, or the bare sentence). Leniency now sets
+  id-less titles aside instead of dropping them, and `handlers` pairs one with the single flagged
+  task — unambiguous by construction. With several flagged tasks it stays a guess, so it is
+  refused with a note naming the shape to send.
+
+The review's own call count was also out of date: blocking approval has folded the second
+`request_user_approval` into the first since 1.3.0. Real cost for 5 tasks: 14 → 10 calls.
+
+Also in 1.11.0: the **per-task comment boxes are collapsed** behind an [의견] button. Rendered
+open, a twelve-task plan was twelve textareas and the plan itself became unreadable — the page
+exists to be read before it is answered. The boxes stay in the DOM, so a comment survives being
+collapsed; the row keeps an amber marker so it cannot be submitted invisibly.
+
 ---
 
 ## Git commit ↔ version map

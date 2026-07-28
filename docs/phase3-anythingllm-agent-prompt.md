@@ -91,18 +91,20 @@ revision_scope = "PLAN" - then send a full task_list as normal.
 
 --- PHASE 3: EXECUTE ---
 Only after the server tells you execution is unlocked.
-For each task, in order, one at a time:
-  1. `update_task_progress` (task_id = N, status = "IN_PROGRESS")
+Start the FIRST task, then work one task at a time:
+  1. `update_task_progress` (task_id = 1, status = "IN_PROGRESS")   <- once, at the start
   2. Actually perform the work for that task.
   3. `update_task_progress` (task_id = N, status = "DONE",
                              result_log = what you actually did)
+  4. The server starts the NEXT task for you and names it in `next_task`.
+     Go back to step 2 for that task. Do NOT send "IN_PROGRESS" again.
 Never mark DONE before doing the work. Never skip ahead. Never batch tasks.
 
-YOU MUST FINISH EVERY TASK. A plan with 5 tasks needs 5 IN_PROGRESS calls and 5
-DONE calls - ten calls in total. The server counts them and will tell you how many
+YOU MUST FINISH EVERY TASK. A plan with 5 tasks needs 1 IN_PROGRESS call and 5
+DONE calls - six calls in total. The server counts them and will tell you how many
 remain in `next_action_hint`. Keep going until it stops naming a next_task.
 The server REFUSES a DONE that is not real work:
-  error_code = "TASK_NOT_STARTED"   -> you never sent IN_PROGRESS for that task
+  error_code = "TASK_NOT_STARTED"   -> that task is not the one in progress
   error_code = "TASK_OUT_OF_ORDER"  -> an earlier task is still unfinished
   error_code = "MISSING_RESULT_LOG" -> result_log did not say what you produced
 result_log must state the concrete outcome ("saved the summary to /tmp/a.txt",
@@ -281,14 +283,16 @@ R7. "ok": false 가 오면 포기하거나 답변하지 말고 `next_action_hint
   그때는 평소처럼 task_list 전체를 보냅니다.
 
 [3단계 실행] 승인 후에만, 작업 하나씩 순서대로:
-  1) update_task_progress (status="IN_PROGRESS")
+  1) update_task_progress (task_id=1, status="IN_PROGRESS")  <- 처음 한 번만
   2) 실제 작업 수행
   3) update_task_progress (status="DONE", result_log=실제로 한 일)
-  모든 작업을 끝까지 수행해야 합니다. 작업이 5개면 IN_PROGRESS 5회 + DONE 5회,
-  총 10회 호출입니다. 서버가 next_action_hint 에 남은 개수를 알려주니
+  4) 서버가 다음 작업을 대신 시작하고 next_task 로 알려줍니다. 그 작업을 가지고
+     2)로 돌아갑니다. IN_PROGRESS 를 다시 보내지 않습니다.
+  모든 작업을 끝까지 수행해야 합니다. 작업이 5개면 IN_PROGRESS 1회 + DONE 5회,
+  총 6회 호출입니다. 서버가 next_action_hint 에 남은 개수를 알려주니
   next_task 가 사라질 때까지 계속 진행합니다.
   서버는 실제 작업이 아닌 DONE 을 거부합니다:
-    TASK_NOT_STARTED   -> 그 작업에 IN_PROGRESS 를 보내지 않았음
+    TASK_NOT_STARTED   -> 그 작업은 지금 진행 중인 작업이 아님
     TASK_OUT_OF_ORDER  -> 앞 작업이 아직 안 끝났음
     MISSING_RESULT_LOG -> result_log 가 결과를 말하지 않음
   result_log 는 구체적 결과여야 합니다("매출 표 12행을 추출함"). "완료"/"done"/

@@ -1,25 +1,37 @@
 # 11 · Status and Next Steps
 
-## Current state (as of version 1.10.0)
+## Current state (as of version 1.11.0)
 
 - **Code:** feature-complete for the design. All four tools, blocking approval, multi-plan,
   shared approval surface, cross-process locking, failure-path hardening, leniency fuzzing,
-  per-task plan review (1.10.0).
-- **Tests:** 211 unit + 5 smoke, all passing. `verify_install.py` runs everything.
+  per-task plan review (1.10.0), auto-advance (1.11.0).
+- **Tests:** 228 unit + 5 smoke, all passing. `verify_install.py` runs everything.
 - **Git:** on `develop`. Remote is `github.com/HaJaehee/LightweightSequentialThinking`.
   **NOT pushed.** Pushing is a user decision — the repo may be public and `docs/` contains
   deployment/security material; confirm before pushing.
-- **Build artifacts (1.10.0, built 2026-07-28):**
+- **Build artifacts (1.11.0, built 2026-07-28):**
 
   | archive | size | sha256 |
   |---|---|---|
-  | `dist/planning-mcp-1.10.0-20260728.zip` | 174,148 B | `dfc165297527ddd5263c954f70a3d4d1d4804e445ba1f3c3286f53e9ec047e9e` |
-  | `dist/planning-mcp-1.10.0-20260728-with-python.zip` | 13,150,276 B | `8ab237b1797b390e43dbbfbfa86f2a210fde9ec025c5f78146ab4458f30efe09` |
+  | `dist/planning-mcp-1.11.0-20260728.zip` | 179,601 B | `0e7ba4a24d43b21cca2b4fa484c3f0496e98adc99ee48ffc69bbf9c26ed451c0` |
+
+  The `--with-python` variant has **not** been rebuilt for 1.11.0 — the 1.10.0 one is the latest
+  bundled-runtime archive. Build it before the next corporate transfer (and see open item 1
+  about build order).
 
   Every archive embeds its own `MANIFEST.txt`, which carries a build timestamp — so **the zip
   hash changes on every rebuild even when no source changed.** Re-record after building, and
   hand the hash to the corporate side out-of-band.
-- **Live install:** `D:\planning-mcp` synced to 1.10.0 and verified GO with its bundled runtime.
+- **Live install:** `D:\planning-mcp` synced to 1.11.0 (2026-07-28) and verified **GO** with its
+  bundled runtime: 31 manifest files match, 228 unit + 5 smoke tests pass. `state/` and
+  `runtime/` were not touched by the sync; the previous code is at
+  `D:\planning-mcp.backup-1.10.0-20260728-110855`.
+
+  **The running processes are still on the old code until AnythingLLM restarts them** — Python
+  reads a module once at import, so overwriting the files changes nothing already in memory.
+  Restart AnythingLLM, and **repaste the agent prompt**: an agent still running the 1.10.0 prompt
+  sends a redundant `IN_PROGRESS` per task (accepted, but it hands back the round trip
+  auto-advance exists to save).
 
 ## Known open items
 

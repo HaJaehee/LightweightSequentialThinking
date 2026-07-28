@@ -32,10 +32,10 @@ from planning.approval import ApprovalServer, ApprovalStore, Verdict  # noqa: E4
 from planning.config import SDK_REQUEST_TIMEOUT_SEC, Config  # noqa: E402
 from planning.filelock import exclusive  # noqa: E402
 from planning.handlers import PlanningHandlers  # noqa: E402
-from planning.leniency import normalize  # noqa: E402
+from planning.leniency import UNMATCHED_TITLES_KEY, normalize  # noqa: E402
 from planning.protocol import McpProtocol  # noqa: E402
 from planning.responses import render_plan_for_user  # noqa: E402
-from planning.schemas import TOOL_DEFINITIONS  # noqa: E402
+from planning.schemas import TOOL_DEFINITIONS, build_tool_definitions  # noqa: E402
 from planning.store import Store  # noqa: E402
 
 REQUIRED_FIELDS = ("ok", "plan_status", "next_action", "next_action_hint")
@@ -1834,6 +1834,23 @@ class TestApprovalPageSurface(HandlerTestCase):
         finally:
             srv.shutdown()
 
+    def test_per_task_comment_boxes_are_collapsed_by_default(self):
+        """Nine open textareas bury the plan the human came here to read."""
+        srv = self.serve()
+        try:
+            html = self.get(srv, "")
+            self.assertIn("textarea.tc{display:none", html)
+            self.assertIn(".task.open textarea.tc{display:block}", html)
+            self.assertIn("function toggleComment(", html)
+            self.assertIn('onclick="toggleComment(this)"', html)
+            # Hidden boxes are still submitted, so a filled row must stay marked.
+            self.assertIn(".task.filled .tcbtn", html)
+            self.assertIn("classList.toggle('filled'", html)
+            # And a hidden feature nobody is told about is a removed feature.
+            self.assertIn("[의견]", html)
+        finally:
+            srv.shutdown()
+
     def test_api_returns_content_raw_for_the_client_to_escape(self):
         """Escaping is the page's job; the API must not double-escape or drop content."""
         srv = self.serve()
@@ -1896,13 +1913,8 @@ class TestApprovalPageSurface(HandlerTestCase):
             srv.shutdown()
 
 
-class TestTargetedRevision(HandlerTestCase):
-    """Per-task review.
-
-    The human comments on individual tasks on the approval page; only those tasks are
-    rewritten. The tasks they read and accepted keep their wording, their number, and -
-    if the plan had already been running - their evidence.
-    """
+class TargetedRevisionFixture(HandlerTestCase):
+    """Helpers for driving a plan to a per-task revision request. Holds no tests."""
 
     TASKS = ["보고서 찾기", "표 추출", "요약 작성"]
 
@@ -1937,6 +1949,15 @@ class TestTargetedRevision(HandlerTestCase):
 
     def audit(self):
         return (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
+
+
+class TestTargetedRevision(TargetedRevisionFixture):
+    """Per-task review.
+
+    The human comments on individual tasks on the approval page; only those tasks are
+    rewritten. The tasks they read and accepted keep their wording, their number, and -
+    if the plan had already been running - their evidence.
+    """
 
     # ---- the request ---------------------------------------------------
     def test_the_summary_reaches_the_approval_page(self):
@@ -2598,6 +2619,182 @@ class TestFileLockEdges(HandlerTestCase):
         missing = self.state_dir / "no" / "such" / "dir" / "lock"
         with exclusive(missing) as got:
             self.assertFalse(got)
+
+
+class TestAutoAdvance(HandlerTestCase):
+    """Reporting a task DONE also starts the next one.
+
+    The separate IN_PROGRESS call was a round trip, not a safeguard: the safeguard is
+    that DONE is refused unless the task is the one in progress AND carries evidence.
+    These tests exist to prove the round trip went away and the safeguard did not.
+    """
+
+    def approved(self, n=5):
+        return self.approve_flow([f"작업{i}" for i in range(1, n + 1)])
+
+    def statuses(self):
+        return [t.status for t in self.h.store.load().active_plan.tasks]
+
+    def finish(self, task_id):
+        return self.h.dispatch("update_task_progress", {
+            "task_id": task_id, "status": "DONE",
+            "result_log": f"작업{task_id} 결과를 /tmp/out{task_id}.txt 에 저장함"})
+
+    def test_done_starts_the_next_task(self):
+        self.approved(3)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        res = self.finish(1)
+        self.assertTrue(res["ok"], res.get("message"))
+        self.assertEqual(self.statuses(), ["DONE", "IN_PROGRESS", "PENDING"])
+        self.assertEqual(res["next_task"]["task_id"], 2)
+        self.assertIn("task_auto_started", (self.state_dir / "audit.jsonl").read_text("utf-8"))
+
+    def test_five_tasks_take_six_calls(self):
+        """The whole point of the change: 10 execution round trips become 6."""
+        self.approved(5)
+        calls = [{"task_id": 1, "status": "IN_PROGRESS"}]
+        calls += [
+            {"task_id": i, "status": "DONE", "result_log": f"결과 {i} 를 파일로 저장함"}
+            for i in range(1, 6)
+        ]
+        for args in calls:
+            res = self.h.dispatch("update_task_progress", args)
+            self.assertTrue(res["ok"], f"{args} -> {res.get('message')}")
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(self.statuses(), ["DONE"] * 5)
+        self.assertEqual(
+            self.h.store.load().active_plan.plan_status, "AWAITING_COMPLETION"
+        )
+
+    def test_bare_done_at_every_task_is_still_refused(self):
+        """Gemini's batch_update, attempted through the back door. Must not work."""
+        self.approved(4)
+        first = self.h.dispatch("update_task_progress", {
+            "task_id": 1, "status": "DONE", "result_log": "1번 결과를 저장함"})
+        self.assertFalse(first["ok"])
+        self.assertEqual(first["error_code"], "TASK_NOT_STARTED")
+        for tid in (2, 3, 4):
+            res = self.h.dispatch("update_task_progress", {
+                "task_id": tid, "status": "DONE", "result_log": f"{tid}번 결과를 저장함"})
+            self.assertFalse(res["ok"], f"task {tid} accepted a DONE it never started")
+        self.assertEqual(self.statuses(), ["PENDING"] * 4)
+
+    def test_advanced_task_still_needs_its_own_evidence(self):
+        """Auto-advance hands out IN_PROGRESS, never a free DONE."""
+        self.approved(2)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.finish(1)
+        res = self.h.dispatch("update_task_progress", {
+            "task_id": 2, "status": "DONE", "result_log": "완료"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "MISSING_RESULT_LOG")
+
+    def test_cannot_jump_past_the_advanced_task(self):
+        self.approved(3)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.finish(1)  # task 2 is now IN_PROGRESS, task 3 is PENDING
+        res = self.finish(3)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "TASK_NOT_STARTED")
+
+    def test_redundant_in_progress_is_idempotent(self):
+        """A model that sends IN_PROGRESS out of habit must not rewind the clock."""
+        self.approved(2)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.finish(1)
+        started = self.h.store.load().active_plan.get_task(2).started_at
+        res = self.h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
+        self.assertTrue(res["ok"])
+        self.assertIn("already IN_PROGRESS", res["message"])
+        self.assertEqual(self.h.store.load().active_plan.get_task(2).started_at, started)
+
+    def test_last_task_advances_into_nothing(self):
+        self.approved(2)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        res = self.finish(2 - 1)  # task 1
+        self.assertEqual(res["next_task"]["task_id"], 2)
+        res = self.finish(2)
+        self.assertEqual(res["plan_status"], "AWAITING_COMPLETION")
+        self.assertIsNone(res.get("next_task"))
+
+    def test_failure_does_not_advance(self):
+        """A blocked plan must not have its next task quietly started."""
+        self.approved(3)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.h.dispatch("update_task_progress", {
+            "task_id": 1, "status": "FAILED", "result_log": "파일을 찾지 못함"})
+        self.assertEqual(self.statuses(), ["FAILED", "PENDING", "PENDING"])
+
+    def test_can_be_disabled(self):
+        cfg = Config(state_dir=self.state_dir, blocking_approval=False, auto_advance=False)
+        self.h = PlanningHandlers(Store(self.state_dir), cfg)
+        self.approved(2)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.finish(1)
+        self.assertEqual(self.statuses(), ["DONE", "PENDING"])
+
+    def test_the_description_matches_the_mode(self):
+        """A tool description that contradicts the server is worse than a long one."""
+        auto = build_tool_definitions(auto_advance=True)[2]["description"]
+        manual = build_tool_definitions(auto_advance=False)[2]["description"]
+        self.assertIn("You do NOT send \"IN_PROGRESS\" again", auto)
+        self.assertIn("Call this tool TWICE for every task", manual)
+
+
+class TestUnmatchedTaskUpdates(TargetedRevisionFixture):
+    """task_updates sent as bare text, with no task_id.
+
+    The model was asked to rewrite one task, so it sends one rewritten task. Pairing that
+    with the single flagged id is a reading; pairing it with one of several is a guess,
+    and a wrong guess rewrites a task the human accepted.
+    """
+
+    def test_leniency_separates_titles_that_have_no_id(self):
+        clean, _ = normalize("plan_and_think", {"task_updates": ["아이디 없는 제목"]})
+        self.assertNotIn("task_updates", clean)
+        self.assertEqual(clean[UNMATCHED_TITLES_KEY], ["아이디 없는 제목"])
+
+    def test_leniency_keeps_good_entries_and_sets_the_rest_aside(self):
+        clean, _ = normalize("plan_and_think", {"task_updates": [
+            {"task_id": 2, "title": "제대로 된 항목"},
+            "아이디 없음",
+        ]})
+        self.assertEqual(clean["task_updates"], [{"task_id": 2, "title": "제대로 된 항목"}])
+        self.assertEqual(clean[UNMATCHED_TITLES_KEY], ["아이디 없음"])
+
+    def test_single_target_pairs_a_bare_title(self):
+        h, _ = self.flagged({"2": "표를 그대로 넣어주세요"})
+        res = self.update(h, ["표를 원본 그대로 삽입"])
+        self.assertTrue(res["ok"], res.get("message"))
+        self.assertEqual(res["revised_tasks"], [2])
+        self.assertEqual(
+            [t.title for t in self.plan(h).tasks],
+            ["보고서 찾기", "표를 원본 그대로 삽입", "요약 작성"],
+        )
+        self.assertTrue(any("no task_id" in n for n in res["input_notes"]))
+
+    def test_single_target_pairs_a_bare_string(self):
+        """Not even a list - just the sentence."""
+        h, _ = self.flagged({"3": "더 짧게"})
+        res = self.update(h, "요약을 3줄로 작성")
+        self.assertTrue(res["ok"], res.get("message"))
+        self.assertEqual(self.plan(h).get_task(3).title, "요약을 3줄로 작성")
+
+    def test_several_targets_are_never_guessed(self):
+        h, _ = self.flagged({"1": "다르게", "3": "더 짧게"})
+        res = self.update(h, ["첫 번째 수정본", "세 번째 수정본"])
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "REVISION_INCOMPLETE")
+        self.assertEqual([t.title for t in self.plan(h).tasks], self.TASKS)
+        self.assertTrue(any("no task_id" in n for n in res["input_notes"]))
+
+    def test_a_bare_title_with_no_pending_revision_changes_nothing(self):
+        h = self.blocking(FakeApprovalUI(decision=None))
+        self.draft(h)
+        res = self.update(h, ["아무도 요청하지 않은 수정"])
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "MISSING_TASK_LIST")
+        self.assertEqual([t.title for t in self.plan(h).tasks], self.TASKS)
 
 
 if __name__ == "__main__":

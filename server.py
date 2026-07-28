@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from planning.config import SERVER_NAME, SERVER_VERSION, Config, setup_logging  # noqa: E402
 from planning.handlers import PlanningHandlers  # noqa: E402
 from planning.protocol import McpProtocol  # noqa: E402
-from planning.schemas import TOOL_DEFINITIONS  # noqa: E402
+from planning.schemas import build_tool_definitions  # noqa: E402
 from planning.store import Store  # noqa: E402
 from planning.transport import serve_sse, serve_stdio  # noqa: E402
 
@@ -48,7 +48,12 @@ def build_protocol(config: Config, log=None) -> McpProtocol:
                 "approval cannot show anything to the user. Set PLANNING_MCP_APPROVAL_PORT.",
                 config.approval_port,
             )
-    return McpProtocol(handlers, TOOL_DEFINITIONS, SERVER_NAME, SERVER_VERSION)
+    return McpProtocol(
+        handlers,
+        build_tool_definitions(auto_advance=config.auto_advance),
+        SERVER_NAME,
+        SERVER_VERSION,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

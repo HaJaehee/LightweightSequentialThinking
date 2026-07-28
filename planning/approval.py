@@ -362,8 +362,20 @@ button:disabled{opacity:.5;cursor:default}
 .was{font-size:.82rem;opacity:.55;margin:.25rem 0 0 1.95em;text-decoration:line-through}
 .note{font-size:.82rem;margin:.25rem 0 0 1.95em;color:#8a5a00}
 @media(prefers-color-scheme:dark){.note{color:#d9a441}}
-textarea.tc{min-height:2.4rem;margin:.4rem 0 0 1.95em;width:calc(100% - 1.95em);
+/* Per-task comment boxes are collapsed by default. Nine open textareas turn a task list
+   into a form; the plan itself is what the human came here to read. */
+textarea.tc{display:none;min-height:2.4rem;margin:.4rem 0 0 1.95em;width:calc(100% - 1.95em);
             font-size:.86rem;padding:.4rem .55rem}
+.task.open textarea.tc{display:block}
+.tcbtn{flex:0 0 auto;min-width:0;margin-left:auto;align-self:center;padding:.15rem .5rem;
+       font-size:.76rem;font-weight:500;border-radius:6px;background:#e6e8eb;color:inherit;
+       opacity:.65}
+.tcbtn:hover{opacity:1}
+.task.open .tcbtn{opacity:1}
+/* A comment written and then collapsed is still submitted, so the row has to keep saying
+   so - otherwise the human sends a targeted revision they can no longer see. */
+.task.filled .tcbtn{background:#8a5a00;color:#fff;opacity:1}
+@media(prefers-color-scheme:dark){.tcbtn{background:#2c3038}}
 .scope{display:flex;align-items:center;gap:.45rem;margin:-.5rem 0 1rem;font-size:.86rem;
        opacity:.75}
 .scope input{margin:0}
@@ -423,6 +435,16 @@ function comments(id){
   });
   return out;
 }
+// Reveal one task's comment box. The textarea stays in the DOM either way, so a comment
+// written and then collapsed is still collected by comments() - the row keeps its 'filled'
+// marker precisely so that cannot happen silently.
+function toggleComment(btn){
+  const task=btn.closest('.task');
+  if(!task)return;
+  const open=task.classList.toggle('open');
+  btn.setAttribute('aria-expanded',open?'true':'false');
+  if(open){const ta=task.querySelector('textarea.tc');if(ta)ta.focus();}
+}
 function wholePlan(id){
   const box=document.getElementById('all-'+id);
   return !!(box&&box.checked);
@@ -434,6 +456,11 @@ function scopeOf(id){
 // The button says what it will do BEFORE it is clicked, so choosing the scope is an
 // explicit act by the human rather than something the server infers afterwards.
 function relabel(id){
+  // Mark the rows that carry a comment, so a collapsed one is still visible as such.
+  document.querySelectorAll('textarea[data-req="'+id+'"]').forEach(b=>{
+    const task=b.closest('.task');
+    if(task)task.classList.toggle('filled',!!b.value.trim());
+  });
   const btn=document.getElementById('rev-'+id);
   if(!btn)return;
   const ids=Object.keys(comments(id));
@@ -458,7 +485,8 @@ function taskRows(d){
     let row='<div class="task"><div class="tt"><span class="tn">'+esc(String(t.task_id))+
       '.</span><span>'+esc(t.title)+'</span>'+
       (t.status&&t.status!=='PENDING'?'<span class="badge">'+esc(t.status)+'</span>':'')+
-      '</div>';
+      '<button class="tcbtn" type="button" aria-expanded="false" '+
+      'onclick="toggleComment(this)">의견</button></div>';
     if(t.previous_title)row+='<div class="was">'+esc(t.previous_title)+'</div>';
     if(t.revision_note)row+='<div class="note">\\u21BB 요청하신 내용: '+
       esc(t.revision_note)+'</div>';
@@ -504,7 +532,9 @@ function render(list){
       '<button class="no" onclick="decide(\\''+esc(d.id)+
       '\\',\\'REJECTED\\')">거절</button></div>';
   }).join('<hr style="border:0;border-top:1px solid #ccd0d5;margin:1.75rem 0">')+
-    '<p class="hint">결정하기 전까지 해당 에이전트는 아무것도 실행하지 못합니다. '+
+    '<p class="hint">태스크의 [의견] 을 누르면 그 태스크에만 수정 요청을 남길 수 있습니다. '+
+    '나머지 태스크는 그대로 유지됩니다.<br>'+
+    '결정하기 전까지 해당 에이전트는 아무것도 실행하지 못합니다. '+
     '요청은 응답하실 때까지 사라지지 않으니 천천히 검토하셔도 됩니다.</p>';
 }
 async function decide(id,dec){

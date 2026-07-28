@@ -43,6 +43,29 @@ Phase B - REPORT: after the user replies in chat, call this tool AGAIN with
 NEVER guess the user's answer. NEVER call APPROVED unless the user actually said so."""
 
 UPDATE_TASK_PROGRESS_DESCRIPTION = """STEP 3 - EXECUTION TRACKING.
+Handle exactly ONE task per call.
+
+  1. Start the FIRST task: status = "IN_PROGRESS". Then do the work.
+  2. Report it: status = "DONE" + a result_log saying what you actually produced.
+  3. The server then starts the NEXT task for you and names it in next_task.
+     Do that work, then report it "DONE" the same way.
+     You do NOT send "IN_PROGRESS" again - just keep reporting DONE, one call per
+     task, until the server tells you no tasks remain.
+Use status = "FAILED" instead of "DONE" if the task did not work.
+
+DONE IS ENFORCED. The server REFUSES a DONE for a task that:
+  - is not the task currently in progress,
+  - skips ahead while an earlier task is unfinished,
+  - has no result_log describing the real outcome.
+Never mark a task DONE before you actually did it. You must work through EVERY task in
+order, one at a time. You are not finished until the server tells you so - keep going
+while it says tasks remain.
+If a task fails, set status = "FAILED" and explain in result_log - then follow the
+next_action the server gives you back."""
+
+# Used when PLANNING_MCP_AUTO_ADVANCE=false. The server then starts nothing on its own,
+# so the description must ask for both calls or every DONE is refused.
+UPDATE_TASK_PROGRESS_DESCRIPTION_MANUAL = """STEP 3 - EXECUTION TRACKING.
 Call this tool TWICE for every task:
   1. BEFORE you start the task  -> status = "IN_PROGRESS"
   2. AFTER you finish the task  -> status = "DONE"  (or "FAILED" if it did not work)
@@ -253,27 +276,45 @@ GET_CURRENT_PLAN_SCHEMA: dict[str, Any] = {
 }
 
 
-TOOL_DEFINITIONS: list[dict[str, Any]] = [
-    {
-        "name": "plan_and_think",
-        "description": PLAN_AND_THINK_DESCRIPTION,
-        "inputSchema": PLAN_AND_THINK_SCHEMA,
-    },
-    {
-        "name": "request_user_approval",
-        "description": REQUEST_USER_APPROVAL_DESCRIPTION,
-        "inputSchema": REQUEST_USER_APPROVAL_SCHEMA,
-    },
-    {
-        "name": "update_task_progress",
-        "description": UPDATE_TASK_PROGRESS_DESCRIPTION,
-        "inputSchema": UPDATE_TASK_PROGRESS_SCHEMA,
-    },
-    {
-        "name": "get_current_plan",
-        "description": GET_CURRENT_PLAN_DESCRIPTION,
-        "inputSchema": GET_CURRENT_PLAN_SCHEMA,
-    },
-]
+def build_tool_definitions(auto_advance: bool = True) -> list[dict[str, Any]]:
+    """The advertised tool list for a given configuration.
+
+    Only update_task_progress varies: whether the server starts the next task itself
+    changes what the model is supposed to send, and a description that contradicts the
+    running server is worse for a weak model than a slightly long one.
+    """
+    return [
+        {
+            "name": "plan_and_think",
+            "description": PLAN_AND_THINK_DESCRIPTION,
+            "inputSchema": PLAN_AND_THINK_SCHEMA,
+        },
+        {
+            "name": "request_user_approval",
+            "description": REQUEST_USER_APPROVAL_DESCRIPTION,
+            "inputSchema": REQUEST_USER_APPROVAL_SCHEMA,
+        },
+        {
+            "name": "update_task_progress",
+            "description": UPDATE_TASK_PROGRESS_DESCRIPTION
+            if auto_advance
+            else UPDATE_TASK_PROGRESS_DESCRIPTION_MANUAL,
+            "inputSchema": UPDATE_TASK_PROGRESS_SCHEMA,
+        },
+        {
+            "name": "get_current_plan",
+            "description": GET_CURRENT_PLAN_DESCRIPTION,
+            "inputSchema": GET_CURRENT_PLAN_SCHEMA,
+        },
+    ]
+
+
+TOOL_DEFINITIONS: list[dict[str, Any]] = build_tool_definitions()
 
 TOOL_NAMES = tuple(t["name"] for t in TOOL_DEFINITIONS)
+
+__all__ = [
+    "TOOL_DEFINITIONS",
+    "TOOL_NAMES",
+    "build_tool_definitions",
+]

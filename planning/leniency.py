@@ -182,23 +182,31 @@ def _coerce_task_list(value: Any) -> list[str] | None:
 
 _TASK_ID_KEYS = ("task_id", "taskId", "taskid", "id", "task_number", "number", "task")
 
+# Titles that arrived with no task_id. This layer is stateless and cannot know which
+# task the human flagged, so it never guesses - it hands them to handlers.py, which
+# pairs them only when the plan makes the pairing unambiguous.
+UNMATCHED_TITLES_KEY = "_unmatched_titles"
 
-def _coerce_task_updates(value: Any) -> list[dict[str, Any]] | None:
-    """Into [{"task_id": int, "title": str}]. Returns None only if unreadable.
+
+def _coerce_task_updates(value: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    """Into ([{"task_id": int, "title": str}], [titles with no id]).
 
     Weak models express "change task 3 to X" every way imaginable: a bare object, a
     JSON string, or {"3": "X"}. Each of those is unambiguous, so each is accepted.
-    Entries missing an id or a title are dropped rather than guessed at - inventing a
-    task_id here would rewrite a task the human never flagged.
+    An entry with a title but no id is NOT guessed at here - inventing a task_id would
+    rewrite a task the human never flagged - so it goes to the second list instead.
     """
     if isinstance(value, str):
         text = value.strip()
         if not text:
-            return []
+            return [], []
         try:
             return _coerce_task_updates(json.loads(text))
         except ValueError:
-            return None
+            # Not JSON, so it is prose: the rewritten task itself, sent bare. Useless on
+            # its own, usable when exactly one task was flagged.
+            title = _clean_title(text)
+            return [], ([title] if title else [])
 
     items: list[Any]
     if isinstance(value, dict):
@@ -216,20 +224,25 @@ def _coerce_task_updates(value: Any) -> list[dict[str, Any]] | None:
     elif isinstance(value, list):
         items = value
     else:
-        return None
+        return [], []
 
     # Keyed by task_id so a model that repeats itself does not queue the same edit twice.
     out: dict[int, dict[str, Any]] = {}
+    unmatched: list[str] = []
     for item in items:
-        if not isinstance(item, dict):
-            continue
-        raw_id = next((item[k] for k in _TASK_ID_KEYS if item.get(k) is not None), None)
-        task_id = _coerce_int(raw_id)
+        if isinstance(item, dict):
+            raw_id = next((item[k] for k in _TASK_ID_KEYS if item.get(k) is not None), None)
+            task_id = _coerce_int(raw_id)
+        else:
+            task_id = None  # e.g. task_updates=["the rewritten task"]
         title = _clean_title(item)
-        if task_id is None or task_id < 1 or not title:
+        if not title:
+            continue
+        if task_id is None or task_id < 1:
+            unmatched.append(title)
             continue
         out[task_id] = {"task_id": task_id, "title": title}
-    return list(out.values())
+    return list(out.values()), unmatched
 
 
 def _normalize_enum(value: Any, aliases: dict[str, Any]) -> str | None:
@@ -317,20 +330,24 @@ def normalize(tool_name: str, args: Any) -> tuple[dict[str, Any], list[str]]:
             clean["task_list"] = coerced_list
 
     if "task_updates" in clean:
-        coerced_updates = _coerce_task_updates(clean["task_updates"])
-        if coerced_updates is None:
-            clean.pop("task_updates")
-            notes.append(
-                "Could not read 'task_updates'; ignored it. Expected "
-                '[{"task_id": 3, "title": "the rewritten task"}].'
-            )
-        else:
-            if coerced_updates != clean["task_updates"]:
+        raw_updates = clean["task_updates"]
+        coerced_updates, unmatched_titles = _coerce_task_updates(raw_updates)
+        if coerced_updates:
+            if coerced_updates != raw_updates:
                 notes.append(
                     f"Normalized 'task_updates' into {len(coerced_updates)} "
                     "{task_id, title} entries."
                 )
             clean["task_updates"] = coerced_updates
+        else:
+            clean.pop("task_updates")
+            if raw_updates:
+                notes.append(
+                    "Could not read 'task_updates'; ignored it. Expected "
+                    '[{"task_id": 3, "title": "the rewritten task"}].'
+                )
+        if unmatched_titles:
+            clean[UNMATCHED_TITLES_KEY] = unmatched_titles
 
     if "status" in clean:
         normalized = _normalize_enum(clean["status"], _STATUS_ALIASES)

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SERVER_NAME = "planning-mcp"
-SERVER_VERSION = "1.10.0"
+SERVER_VERSION = "1.11.0"
 
 # The state dir is resolved from this file, NOT from the working directory.
 # AnythingLLM spawns the server with its own CWD, which is why plans "disappear"
@@ -59,6 +59,9 @@ class Config:
     max_active_plans: int = 5
     completion_approval: bool = True
     min_result_log: int = 8
+    # Put the next task straight into IN_PROGRESS when one is reported DONE. Halves the
+    # execution round trips without weakening the DONE guard - see _auto_advance.
+    auto_advance: bool = True
     # SSE transport. CLI flags still win; these exist because AnythingLLM's MCP config
     # sets `env` more naturally than it sets `args`.
     sse_host: str = "127.0.0.1"
@@ -83,6 +86,7 @@ class Config:
             max_active_plans=_env_int("PLANNING_MCP_MAX_ACTIVE_PLANS", 5),
             completion_approval=_env_bool("PLANNING_MCP_COMPLETION_APPROVAL", True),
             min_result_log=_env_int("PLANNING_MCP_MIN_RESULT_LOG", 8),
+            auto_advance=_env_bool("PLANNING_MCP_AUTO_ADVANCE", True),
             sse_host=os.environ.get("PLANNING_MCP_SSE_HOST", "127.0.0.1"),
             sse_port=_env_int("PLANNING_MCP_SSE_PORT", 8931),
         )

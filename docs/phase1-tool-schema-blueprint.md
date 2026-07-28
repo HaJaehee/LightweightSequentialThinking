@@ -278,13 +278,24 @@ approval lock.
 
 ```
 STEP 3 — EXECUTION TRACKING.
-Call this tool TWICE for every task:
-  1. BEFORE you start the task  -> status = "IN_PROGRESS"
-  2. AFTER you finish the task  -> status = "DONE"  (or "FAILED" if it did not work)
-Handle exactly ONE task per call. Never mark a task DONE before you actually did it.
+Handle exactly ONE task per call.
+
+  1. Start the FIRST task: status = "IN_PROGRESS". Then do the work.
+  2. Report it: status = "DONE" + a result_log saying what you actually produced.
+  3. The server then starts the NEXT task for you and names it in next_task.
+     Do that work, then report it "DONE" the same way.
+     You do NOT send "IN_PROGRESS" again - just keep reporting DONE, one call per
+     task, until the server tells you no tasks remain.
+Use status = "FAILED" instead of "DONE" if the task did not work.
+Never mark a task DONE before you actually did it.
 If a task fails, set status = "FAILED" and explain in result_log - then follow the
 next_action the server gives you back.
 ```
+
+Two descriptions exist: the one above (server auto-starts the next task, the default) and a
+"call this tool TWICE for every task" variant used when `PLANNING_MCP_AUTO_ADVANCE=false`.
+`schemas.build_tool_definitions(auto_advance=...)` picks one, so the advertised contract can
+never contradict the running server.
 
 ### JSON Schema
 

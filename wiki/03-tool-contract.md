@@ -65,8 +65,14 @@ Optional: `result_log`, `plan_id`.
 - **The enforcement half of the HITL gate.** Until `plan_status` is `APPROVED`/`IN_EXECUTION`,
   every call returns `ok:false` / `PLAN_NOT_APPROVED`. The model cannot execute early even if it
   ignores the instruction.
-- Call twice per task: `IN_PROGRESS` before, `DONE`/`FAILED` after.
-- Out-of-order starts are **redirected**, not rejected. Duplicate `DONE` is idempotent.
+- `IN_PROGRESS` before the work, `DONE`/`FAILED` after. With `auto_advance` on (default) the
+  server puts the next task into `IN_PROGRESS` as part of accepting a `DONE`, so only the first
+  task needs an explicit start: a 5-task plan costs 1 + 5 calls instead of 5 + 5. The `DONE`
+  guard is untouched — a task still has to be the one in progress, in order, with evidence —
+  because the boundary that guard relies on is the `DONE` call itself, not the `IN_PROGRESS` one.
+  Set `PLANNING_MCP_AUTO_ADVANCE=false` to require both calls; the tool description follows.
+- Out-of-order starts are **redirected**, not rejected. Duplicate `DONE` is idempotent, and a
+  redundant `IN_PROGRESS` on a running task is accepted without resetting `started_at`.
 - `FAILED` → `plan_status: BLOCKED`; `next_action: CALL_PLAN_AND_THINK` (re-plan, do not
   continue). Attempting another task while `BLOCKED` → `PLAN_BLOCKED`.
 - All tasks `DONE` → `COMPLETED`, `next_action: ANSWER_USER`.

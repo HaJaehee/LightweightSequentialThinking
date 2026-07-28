@@ -47,7 +47,8 @@ finished work — see below.
 | `AWAITING_APPROVAL` | `approval` REJECTED | `CANCELLED` | — |
 | `AWAITING_APPROVAL`/`DRAFTING` | `update_task_progress` | *(no change)* | `PLAN_NOT_APPROVED` ← **critical guard** |
 | `APPROVED` | `update_task_progress` IN_PROGRESS | `IN_EXECUTION` | — |
-| `IN_EXECUTION` | `update_task_progress` DONE (last) | `COMPLETED` | — |
+| `IN_EXECUTION` | `update_task_progress` DONE (not last) | `IN_EXECUTION`, next task auto-started `IN_PROGRESS` | — |
+| `IN_EXECUTION` | `update_task_progress` DONE (last) | `AWAITING_COMPLETION` | — |
 | `IN_EXECUTION` | `update_task_progress` FAILED | `BLOCKED` | — |
 | `BLOCKED` | `plan_and_think` | `DRAFTING` (same plan_id) | — |
 | `BLOCKED` | `update_task_progress` on another task | *(no change)* | `PLAN_BLOCKED` |
@@ -57,7 +58,9 @@ finished work — see below.
 
 - **Out-of-order task start** → redirected to the correct `task_id`, `ok:true`.
 - **Duplicate `DONE`** → idempotent, points at the next pending task.
-- **`DONE` without prior `IN_PROGRESS`** → accepted, audited `skipped_in_progress`.
+- **Redundant `IN_PROGRESS` on a task already running** → accepted, `started_at` preserved. This
+  is the normal shape once auto-advance is on: the server started the task and the model sends
+  the call anyway, out of habit or because its prompt predates the change.
 - **`plan_and_think` while `APPROVED`/`IN_EXECUTION` with the *same* goal** → not a new plan;
   redirect to the in-flight task.
 
@@ -77,8 +80,23 @@ check is content-based (an exact-match phrase filter plus a low length floor,
 `PLANNING_MCP_MIN_RESULT_LOG`, default 8 normalized characters). Starting the wrong task is
 still forgiven with a redirect; *claiming* the wrong task is finished is not.
 
-Because each `DONE` now requires a preceding `IN_PROGRESS`, and `IN_PROGRESS` already enforces
-order, batch-marking is structurally impossible.
+Because each `DONE` now requires the task to be the one in progress, and starting a task already
+enforces order, batch-marking is structurally impossible.
+
+## Auto-advance (1.11.0)
+
+Accepting a `DONE` also puts the next task into `IN_PROGRESS` (`PLANNING_MCP_AUTO_ADVANCE`,
+default on). This is a round-trip cut, not a relaxation. The `IN_PROGRESS` call was never the
+thing stopping a model from claiming work it had not done — the evidence check is — and the turn
+boundary it provided survives: the model still receives one "task N is in progress, do the work"
+instruction per task and still cannot claim `DONE` for it until a later call, with its own
+`result_log`. What disappears is one empty round trip per task: 5 tasks cost 6 execution calls
+instead of 10, which is context and error surface a small model does not have to spend.
+
+Rejected alternative: a `batch_update` that marks several tasks `DONE` in one call. It would
+delete the enforcement outright — the failure mode in the section above is exactly a model
+firing `DONE` at every task at once — and the models it was proposed to help are the ones most
+likely to do it.
 
 **And `COMPLETED` is no longer self-awarded.** When the last task is `DONE` the plan enters
 `AWAITING_COMPLETION`; the model must call `request_user_approval(ASK_USER)`, which shows the

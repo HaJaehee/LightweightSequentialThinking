@@ -1,6 +1,6 @@
 # planning-mcp (LightweightSequentialThinking)
 
-**버전: 1.10.0** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
+**버전: 1.11.0** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
 `SERVER_VERSION` (MCP `initialize` 응답의 `serverInfo.version` 으로 보고됨)
 
 AnythingLLM Agent Mode용 경량 **계획·작업 관리 MCP 서버**. 폐쇄망의 성능이 약한 사내 LLM이
@@ -110,11 +110,12 @@ Usage Rules:
 </tool_protocol>
 <tool_protocol name="update_task_progress">
 Usage Rules:
-- You MUST complete EVERY task in the plan, one at a time, in order. A 5-task plan requires 5 IN_PROGRESS calls and 5 DONE calls.
-- Set `status = "IN_PROGRESS"` BEFORE working, then do the real work, then set `status = "DONE"`.
+- You MUST complete EVERY task in the plan, one at a time, in order.
+- Send `status = "IN_PROGRESS"` for the FIRST task only. Then do the real work, then send `status = "DONE"`.
+- The server then starts the NEXT task itself and names it in `next_task`. Do that work and send `status = "DONE"` for it too. DO NOT send IN_PROGRESS again - one call per task from here on. A 5-task plan is 1 IN_PROGRESS call and 5 DONE calls.
 - `result_log` is MANDATORY for DONE and must state the CONCRETE outcome: what you produced, found, or saved.
 - These are REJECTED as evidence: "done", "ok", "완료", or repeating the task title. If you cannot write a real outcome, the task is NOT done.
-- The server REFUSES a false DONE: TASK_NOT_STARTED (no IN_PROGRESS), TASK_OUT_OF_ORDER (an earlier task is unfinished), MISSING_RESULT_LOG (no evidence). Fix the cause and retry that task.
+- The server REFUSES a false DONE: TASK_NOT_STARTED (that task is not the one in progress), TASK_OUT_OF_ORDER (an earlier task is unfinished), MISSING_RESULT_LOG (no evidence). Fix the cause and retry that task.
 - NEVER mark tasks DONE in a batch. NEVER tell the user the work is finished while `next_action_hint` still reports remaining tasks.
 </tool_protocol>
 <strict_constraints>
@@ -132,7 +133,7 @@ Usage Rules:
 |---|---|
 | `plan_and_think` | 필수 진입점. 호출당 사고 1스텝, 마지막 호출에 `task_list` 제출. 태스크별 수정 요청에는 `task_updates` |
 | `request_user_approval` | HITL 게이트. `ASK_USER` → 정지 → `APPROVED` / `REJECTED` / `REVISE` |
-| `update_task_progress` | 작업마다 `IN_PROGRESS` 선행, 종료 시 `DONE`/`FAILED`. 미승인 시 거부 |
+| `update_task_progress` | 첫 작업만 `IN_PROGRESS`, 이후는 작업당 `DONE`/`FAILED` 1회 (다음 작업은 서버가 시작). 미승인 시 거부 |
 | `get_current_plan` | 컨텍스트 절단 후 복구. 언제 호출해도 안전 |
 
 전체 스키마와 응답 계약: [docs/phase1-tool-schema-blueprint.md](docs/phase1-tool-schema-blueprint.md)
@@ -183,6 +184,7 @@ docs/                     Phase 1~4: 스키마, 아키텍처, 에이전트 프�
 | `PLANNING_MCP_MAX_ACTIVE_PLANS` | `5` | 동시에 진행할 수 있는 계획 수 상한 |
 | `PLANNING_MCP_COMPLETION_APPROVAL` | `true` | 마지막 작업이 DONE 되어도 바로 완료되지 않고, 사람이 작업별 증거를 확인해야 COMPLETED |
 | `PLANNING_MCP_MIN_RESULT_LOG` | `8` | DONE 에 필요한 최소 증거 길이(공백·문장부호 제외). 상투어구("완료", "done")는 길이와 무관하게 거부 |
+| `PLANNING_MCP_AUTO_ADVANCE` | `true` | 작업을 DONE 보고하면 다음 작업을 서버가 `IN_PROGRESS`로 시작. 5개 작업 기준 실행 호출 10회 → 6회. `false`면 작업마다 `IN_PROGRESS`를 직접 보내야 함 (도구 설명도 그에 맞게 바뀜) |
 | `PLANNING_MCP_AUTOAPPROVE` | `false` | **테스트 전용** — HITL 게이트 우회. 호출마다 경고 로그 |
 
 CLI: `--transport stdio|sse`, `--host`, `--port`, `--state-dir`, `--log-level`
