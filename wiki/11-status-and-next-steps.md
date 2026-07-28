@@ -9,33 +9,31 @@
 - **Git:** on `develop`. Remote is `github.com/HaJaehee/LightweightSequentialThinking`.
   **NOT pushed.** Pushing is a user decision — the repo may be public and `docs/` contains
   deployment/security material; confirm before pushing.
-- **1.12.0 is not packaged or deployed yet.** No archive has been built for it and
-  `D:\planning-mcp` is still on 1.11.0; the artifacts and live-install notes below describe
-  1.11.0. Rebuild, re-verify and **repaste the agent prompt** (it now teaches `revised_goal`)
-  before the next transfer.
-- **Build artifacts (1.11.0, built 2026-07-28):**
+- **Build artifacts (1.12.0, built 2026-07-28):**
 
   | archive | size | sha256 |
   |---|---|---|
-  | `dist/planning-mcp-1.11.0-20260728.zip` | 179,601 B | `0e7ba4a24d43b21cca2b4fa484c3f0496e98adc99ee48ffc69bbf9c26ed451c0` |
+  | `dist/planning-mcp-1.12.0-20260728.zip` | 184,383 B | `8f976bc0618327bde7fa24e27ace231a62fcbd2bf92bbf617bb2213e4692f120` |
+  | `dist/planning-mcp-1.12.0-20260728-with-python.zip` | 13,160,512 B | `db3f87fe3469673cfab1636ef2d0166178b23a44ccd8e62a9c6533df58942845` |
 
-  The `--with-python` variant has **not** been rebuilt for 1.11.0 — the 1.10.0 one is the latest
-  bundled-runtime archive. Build it before the next corporate transfer (and see open item 1
-  about build order).
+  Both were built from commit `74572a3`. The source-only archive was extracted to a scratch
+  directory and `verify_install.py` returned **GO** there: 31 manifest files match, all modules
+  import, 237 unit + 5 smoke tests pass. The `--with-python` variant is current again (1.11.0
+  never had one).
 
   Every archive embeds its own `MANIFEST.txt`, which carries a build timestamp — so **the zip
   hash changes on every rebuild even when no source changed.** Re-record after building, and
   hand the hash to the corporate side out-of-band.
-- **Live install:** `D:\planning-mcp` synced to 1.11.0 (2026-07-28) and verified **GO** with its
-  bundled runtime: 31 manifest files match, 228 unit + 5 smoke tests pass. `state/` and
-  `runtime/` were not touched by the sync; the previous code is at
-  `D:\planning-mcp.backup-1.10.0-20260728-110855`.
+- **Live install:** `D:\planning-mcp` is **still on 1.11.0** — 1.12.0 has not been synced there.
+  The 1.11.0 sync (2026-07-28) verified **GO** with its bundled runtime: 31 manifest files match,
+  228 unit + 5 smoke tests pass. `state/` and `runtime/` were not touched by that sync; the
+  previous code is at `D:\planning-mcp.backup-1.10.0-20260728-110855`.
 
-  **The running processes are still on the old code until AnythingLLM restarts them** — Python
-  reads a module once at import, so overwriting the files changes nothing already in memory.
-  Restart AnythingLLM, and **repaste the agent prompt**: an agent still running the 1.10.0 prompt
-  sends a redundant `IN_PROGRESS` per task (accepted, but it hands back the round trip
-  auto-advance exists to save).
+  **The running processes stay on the old code until AnythingLLM restarts them** — Python reads a
+  module once at import, so overwriting the files changes nothing already in memory. After
+  syncing to 1.12.0, restart AnythingLLM and **repaste the agent prompt**: an agent still running
+  the 1.11.0 prompt never sends `revised_goal`, so a user correcting the goal still leaves the
+  old goal in the metadata — the server-side fix alone does not produce the behaviour.
 
 ## Known open items
 
