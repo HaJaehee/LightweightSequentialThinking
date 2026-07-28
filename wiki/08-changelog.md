@@ -115,6 +115,30 @@ collapsed; the row keeps an amber marker so it cannot be submitted invisibly.
 
 ---
 
+### 1.12.0 — the goal became mutable
+
+Every other part of the plan could be corrected by the human; the one thing that could not was
+the sentence saying what the plan was *for*. `goal` was frozen at creation and doubled as the
+routing key, so a user saying "that is not what I meant — Q4, not Q3" left the server in the one
+state nobody can act on: correct tasks under a goal the user had already disowned, shown back to
+them on every response and on the approval page. Drift protection (1.8.2) had quietly hardened
+into an inability to be corrected.
+
+The fix separates the two things immutability was conflating. **Identity** stays fixed — the
+plan keeps its `plan_id`, tasks, evidence and history. **Wording** follows the user: the new
+optional `revised_goal` parameter updates `goal` in place, and the audit anchor moves into
+`original_goal` + a `goal_history` of `{at, from, to, source}` hops with a `goal_revised` audit
+event. Auditability was never a reason to freeze the field; it is a reason to record the change.
+
+Routing absorbs the correction rather than punishing it: a plan answers to its previous goal
+text for as long as it is active, so a model still echoing the old wording continues its plan
+instead of being told it does not exist. A "revision" that only adds punctuation is not
+recorded. And a goal revised on an already-approved plan is taken, but the response says
+outright that the human approved the *previous* goal — the correction updates the metadata, it
+does not extend the mandate.
+
+---
+
 ## Git commit ↔ version map
 
 | Commit | Version / theme |

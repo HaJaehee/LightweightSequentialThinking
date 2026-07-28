@@ -1,6 +1,6 @@
 {
-  "_comment": "Version history. Prose detail in wiki/08-changelog.md; root causes in wiki/09-defects-and-lessons.md. current = 1.11.0.",
-  "current": "1.11.0",
+  "_comment": "Version history. Prose detail in wiki/08-changelog.md; root causes in wiki/09-defects-and-lessons.md. current = 1.12.0.",
+  "current": "1.12.0",
   "branch": "develop",
   "remote": "github.com/HaJaehee/LightweightSequentialThinking",
   "pushed": false,
@@ -16,7 +16,8 @@
     { "version": "1.8.2", "theme": "Goal-drift routing: continuing (step>1) with an unmatched goal returns the active-goal list to pick from instead of forking a plan; plan_and_think accepts plan_id; goal matching ignores trailing punctuation.", "defects_fixed": ["D13"] },
     { "version": "1.9.0", "theme": "Task completion enforced: DONE requires a prior IN_PROGRESS, in-order completion, and content-checked result_log evidence; the last DONE enters AWAITING_COMPLETION where a human verifies a per-task completion report before COMPLETED.", "defects_fixed": ["D14"] },
     { "version": "1.10.0", "theme": "Per-task plan review: the approval page collects a comment per task on a PLAN request, and REVISE with scope=TASKS rewrites only the flagged tasks via plan_and_think's new task_updates parameter - ids, positions and untouched evidence survive. The completion phase is deliberately excluded and stays whole-plan.", "defects_fixed": [] },
-    { "version": "1.11.0", "theme": "Call-count reduction without weakening enforcement: auto_advance starts the next task as part of accepting a DONE (5 tasks = 6 execution calls, was 10), the tool description follows the mode via build_tool_definitions, a redundant IN_PROGRESS is idempotent, and task_updates sent without a task_id is paired with the single flagged task instead of dropped. Rejected from the same review: batch DONE marking, and merging task_list with task_updates.", "defects_fixed": [] }
+    { "version": "1.11.0", "theme": "Call-count reduction without weakening enforcement: auto_advance starts the next task as part of accepting a DONE (5 tasks = 6 execution calls, was 10), the tool description follows the mode via build_tool_definitions, a redundant IN_PROGRESS is idempotent, and task_updates sent without a task_id is paired with the single flagged task instead of dropped. Rejected from the same review: batch DONE marking, and merging task_list with task_updates.", "defects_fixed": [] },
+    { "version": "1.12.0", "theme": "Mutable goal: plan_and_think takes revised_goal, which updates the plan's goal in place (same plan_id and tasks) and keeps original_goal + goal_history as the audit anchor. A plan still answers to its former goal text, so a model one turn behind a correction does not lose its plan; a punctuation-only 'revision' is not recorded; a revision on an approved plan is taken but explicitly does not extend the approval. Drift protection had hardened into an inability to be corrected.", "defects_fixed": ["D15"] }
   ],
-  "test_counts": { "unit": 228, "smoke": 5 }
+  "test_counts": { "unit": 237, "smoke": 5 }
 }

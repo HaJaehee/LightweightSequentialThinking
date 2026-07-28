@@ -17,7 +17,8 @@ One thinking step per call. `need_more_thinking=true` to continue; on the final 
 `false` **and** provide `task_list`.
 
 Required: `goal`, `thought`, `step_number`, `total_steps`, `need_more_thinking`.
-Optional: `task_list` (required when finalizing), `task_updates`, `revises_step`, `plan_id`.
+Optional: `task_list` (required when finalizing), `task_updates`, `revised_goal`, `revises_step`,
+`plan_id`.
 
 - **Routing by goal.** The model repeats the same `goal` on every step (the system prompt tells
   it to), so a matching active plan *is* this session's plan. A different goal starts its own
@@ -29,6 +30,20 @@ Optional: `task_list` (required when finalizing), `task_updates`, `revises_step`
   new plan. `step_number == 1` with a new goal always starts a new plan (so new conversations
   work). Goal matching ignores trailing punctuation/whitespace. See
   [05](05-concurrency-and-sessions.md#goal-drift).
+- **Goal revision (1.12.0).** Drift protection must not become an inability to be corrected.
+  When the *user* says the goal itself was wrong ("I meant Q4, not Q3"), the model sends
+  `revised_goal` alongside the `goal` it has been using: the plan is found by the old text and
+  its `goal` is **updated in place** — same `plan_id`, same tasks, no fork. The anchor survives
+  as `original_goal` plus a `goal_history` of `{at, from, to, source}` hops (audit event
+  `goal_revised`), which is what immutability was really protecting. Routing then accepts the
+  new text; the *old* text keeps resolving to the plan for as long as it stays active, so a
+  model one turn behind the correction is not sent back to re-select. A `revised_goal` equal to
+  the current goal after normalization is not a correction and is not recorded. If the model
+  puts the corrected text in both fields it matches nothing by name, so with exactly one active
+  plan the server applies it there; with several it returns `GOAL_NOT_MATCHED` to pick from.
+  Revising the goal of an `APPROVED`/`IN_EXECUTION` plan is accepted and recorded but does not
+  silently widen the approval: the response says the human approved the *previous* goal and
+  tells the model to re-plan and re-approve if the tasks no longer serve the corrected one.
 - On finalize → `plan_status: AWAITING_APPROVAL`, `next_action: CALL_REQUEST_USER_APPROVAL`.
 - **Targeted revision (1.9.x).** When the human commented on individual tasks on the approval
   page, the plan carries `pending_revision` and the model finalizes with `task_updates`

@@ -92,7 +92,14 @@ def render_plan_for_user(plan: Plan, plan_summary: str | None = None) -> str:
     """
     lines = ["계획 승인 요청"]
     if plan.goal:
-        lines.append(f"목표: {plan.goal}")
+        # A corrected goal is shown as corrected. The human who said "that is not what I
+        # meant" needs to see that the system took it, not just a goal line that silently
+        # differs from the one they read last time.
+        if plan.goal_history:
+            lines.append(f"목표(수정됨): {plan.goal}")
+            lines.append(f"   최초 목표: {plan.original_goal}")
+        else:
+            lines.append(f"목표: {plan.goal}")
     if plan_summary:
         lines.append("")
         lines.append(plan_summary.strip())

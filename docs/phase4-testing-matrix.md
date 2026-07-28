@@ -164,6 +164,17 @@ PASS criteria are written so they can be judged from the AnythingLLM transcript 
 | **PASS** | Model does not silently abandon plan A. Acceptable: finish A first, or ask which to do, or explicitly re-plan. Unacceptable: overwriting A with no acknowledgement. |
 | **Server behavior** | `plan_and_think` while `IN_EXECUTION` returns the *current* plan and redirects to the in-flight task (Phase 2 §4 leniency) |
 
+### C4b. User corrects the goal itself (1.12.0)
+
+| | |
+|---|---|
+| **Setup** | Plan A is drafting or awaiting approval with goal `Q3 리포트를 요약한다` |
+| **U** | `아니, Q3가 아니라 Q4 리포트야` |
+| **PASS** | Model calls `plan_and_think` with `goal` = the old text and `revised_goal` = the corrected goal. Same `plan_id`, no second plan. Every later response — and the approval page — shows the corrected goal, marked `목표(수정됨)` with the original underneath. |
+| **Server behavior** | `goal` updated in place; `original_goal` + `goal_history` record the hop; audit event `goal_revised`. The old text still routes to the plan, so a lagging call is not refused. |
+| **FAIL mode** | A second plan appears (model sent the corrected goal with `step_number=1`), or the metadata still shows the old goal (model never sent `revised_goal`) |
+| **Also check** | Correcting the goal of an already-`APPROVED` plan: it is accepted, and the response tells the model the human approved the *previous* goal. If the tasks no longer fit, the model must re-plan and ask again — it must not keep executing on the old approval. |
+
 ### C5. Repeated revision loop
 
 | | |

@@ -224,6 +224,9 @@ class Approval:
         self.decision = None
 
 
+MAX_GOAL_HISTORY = 20
+
+
 @dataclass
 class Plan:
     plan_id: str
@@ -236,6 +239,12 @@ class Plan:
     tasks: list[Task] = field(default_factory=list)
     approval: Approval = field(default_factory=Approval)
     superseded_tasks: list[list[dict[str, Any]]] = field(default_factory=list)
+    # The goal as first stated, kept as the audit anchor. `goal` itself is mutable: an
+    # agent's first reading of an ambiguous request is often wrong, and a system that
+    # cannot absorb "no, I meant B" ends up carrying the wrong goal in its metadata
+    # while executing the right tasks. Correction is recorded, not forbidden.
+    original_goal: str = ""
+    goal_history: list[dict[str, Any]] = field(default_factory=list)
     # Set only when the human asked for a TARGETED revision: {"targets": {"3": "comment"}}.
     # Its presence is what makes the server demand task_updates instead of a whole new
     # task_list, and what tells it which tasks the model is allowed to touch. Cleared as
@@ -256,6 +265,8 @@ class Plan:
             "approval": self.approval.to_dict(),
             "superseded_tasks": self.superseded_tasks,
             "pending_revision": self.pending_revision,
+            "original_goal": self.original_goal or self.goal,
+            "goal_history": self.goal_history,
         }
 
     @classmethod
@@ -272,6 +283,10 @@ class Plan:
             approval=Approval.from_dict(raw.get("approval")),
             superseded_tasks=raw.get("superseded_tasks", []),
             pending_revision=raw.get("pending_revision") or None,
+            # A state file written before goal revision existed has neither field; its
+            # goal has never changed, so it *is* the original.
+            original_goal=str(raw.get("original_goal") or raw.get("goal", "")),
+            goal_history=[h for h in (raw.get("goal_history") or []) if isinstance(h, dict)],
         )
 
     # ---- queries -------------------------------------------------------
@@ -299,6 +314,37 @@ class Plan:
         if self.status not in EXECUTABLE_PLAN_STATUSES:
             return False
         return self.idle_seconds() > ttl_seconds
+
+    def revise_goal(self, new_goal: str, source: str = "model") -> bool:
+        """Adopt a corrected goal, keeping the change on the record. False = no change.
+
+        Auditability is what immutability was really protecting, and it survives here:
+        `original_goal` is the untouched anchor and every hop is in `goal_history`. The
+        history is capped, the anchor is not - trimming can lose intermediate wording but
+        never the question "what was this plan originally started for?".
+        """
+        new = (new_goal or "").strip()
+        if not new or new == self.goal:
+            return False
+        if not self.original_goal:
+            self.original_goal = self.goal
+        self.goal_history.append(
+            {"at": now_iso(), "from": self.goal, "to": new, "source": source}
+        )
+        if len(self.goal_history) > MAX_GOAL_HISTORY:
+            del self.goal_history[: -MAX_GOAL_HISTORY]
+        self.goal = new
+        self.touch()
+        return True
+
+    def former_goals(self) -> list[str]:
+        """Every goal text this plan has previously answered to, newest first."""
+        seen: list[str] = []
+        for entry in reversed(self.goal_history):
+            previous = str(entry.get("from") or "")
+            if previous and previous not in seen:
+                seen.append(previous)
+        return seen
 
     def set_status(self, status: PlanStatus) -> None:
         self.plan_status = status.value

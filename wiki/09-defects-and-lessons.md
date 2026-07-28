@@ -168,6 +168,26 @@ awarded `COMPLETED` on the model's word alone. The server treated a **claim** as
 either carry evidence or be verified by a human. Accepting an unverifiable claim with a
 warning note is the same as accepting it.
 
+<a id="d15"></a>
+## D15 — The goal could not be corrected (1.12.0)
+**Symptom:** the user says "that is not what I meant — Q4, not Q3". The model re-plans and the
+tasks change, but the plan's `goal` cannot: it is fixed at creation. The server then shows the
+disowned goal on every response, in `get_current_plan`, and at the top of the approval page,
+while executing tasks written for the corrected one.
+**Root cause:** `goal` was doing two jobs — the routing key (D13) and the human-facing statement
+of intent. Freezing it protected the first job and broke the second. The stated justification,
+auditability, does not actually require immutability; it requires a *record*.
+**Fix:** `revised_goal` on `plan_and_think` updates `goal` in place while `original_goal` and
+`goal_history` keep the anchor and every hop (`goal_revised` audit event). Identity (`plan_id`,
+tasks, evidence) is what stays fixed. Former goal texts keep routing to the plan so a model one
+turn behind the correction does not lose it; punctuation-only changes are not recorded; and a
+revision on an `APPROVED` plan is recorded with an explicit note that the human approved the
+*previous* goal.
+**Lesson:** "immutable for audit" is usually a record-keeping requirement wearing a constraint's
+clothes. In a conversational system the user's intent is discovered, not declared — any field
+holding that intent must be able to follow a correction, or the metadata starts describing a
+plan that no longer exists.
+
 ## Where the next bug probably is
 
 Judging by the pattern (bugs cluster in untested seams and failure paths), the thinner-covered

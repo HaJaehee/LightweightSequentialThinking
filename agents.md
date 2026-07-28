@@ -15,6 +15,7 @@ Usage Rules:
 - Set `need_more_thinking = true` for intermediate steps.
 - Set `need_more_thinking = false` AND provide `task_list` on your FINAL step.
 - Set `revises_step = [step number]` to correct a previously generated step.
+- Repeat the SAME `goal` text on every step. If the USER corrects the goal itself ("I meant Q4, not Q3"), keep sending the old text as `goal` and send the corrected one as `revised_goal` - do NOT start a second plan. Use the corrected text from the next call on. Never use `revised_goal` to merely reword the same goal.
 - DO NOT execute tasks or answer the user directly while thinking.
 - TARGETED REVISION: if the server reports that the user commented on specific tasks, send `task_updates` (NOT `task_list`) on your final step, rewriting ONLY those tasks. Every other task was already accepted by the user - do not change, renumber, reorder or resend it. `next_action_hint` contains the exact argument to send.
 </tool_protocol>

@@ -107,7 +107,19 @@ PLAN_AND_THINK_SCHEMA: dict[str, Any] = {
             "description": (
                 "One sentence restating what the user ultimately wants. Repeat the SAME goal "
                 "text on every step. Example: 'Summarize the Q3 sales report and email it to "
-                "the team lead.'"
+                "the team lead.' If the user CORRECTS the goal, keep sending the old text here "
+                "and put the corrected one in revised_goal."
+            ),
+        },
+        "revised_goal": {
+            "type": "string",
+            "description": (
+                "OPTIONAL. Use ONLY when the user says the goal itself was wrong or has "
+                "changed - for example 'no, I meant the Q4 report, not Q3'. Put the corrected "
+                "goal here and leave 'goal' as the text you have been sending, so the server "
+                "can find the plan and record the change. Do NOT use it to reword or "
+                "paraphrase the same goal. Example: 'Summarize the Q4 sales report and email "
+                "it to the team lead.'"
             ),
         },
         "thought": {

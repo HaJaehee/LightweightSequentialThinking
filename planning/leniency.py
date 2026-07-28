@@ -17,6 +17,7 @@ from .models import Decision, TaskStatus
 _ALLOWED_KEYS: dict[str, set[str]] = {
     "plan_and_think": {
         "goal",
+        "revised_goal",
         "thought",
         "step_number",
         "total_steps",
@@ -289,6 +290,12 @@ def normalize(tool_name: str, args: Any) -> tuple[dict[str, Any], list[str]]:
             "tasklist": "task_list",
             "tasks": "task_list",
             "planid": "plan_id",
+            "newgoal": "revised_goal",
+            "correctedgoal": "revised_goal",
+            "updatedgoal": "revised_goal",
+            "changedgoal": "revised_goal",
+            "goalrevision": "revised_goal",
+            "revisegoal": "revised_goal",
             "summary": "plan_summary",
             "comment": "user_comment",
             "log": "result_log",
@@ -363,7 +370,9 @@ def normalize(tool_name: str, args: Any) -> tuple[dict[str, Any], list[str]]:
                 notes.append(f"Read decision '{clean['decision']}' as '{normalized}'.")
             clean["decision"] = normalized
 
-    for str_key in ("goal", "thought", "plan_summary", "user_comment", "result_log", "plan_id"):
+    for str_key in (
+        "goal", "revised_goal", "thought", "plan_summary", "user_comment", "result_log", "plan_id",
+    ):
         if str_key in clean and clean[str_key] is not None and not isinstance(clean[str_key], str):
             clean[str_key] = str(clean[str_key])
             notes.append(f"Converted '{str_key}' to text.")

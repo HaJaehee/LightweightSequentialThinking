@@ -853,6 +853,112 @@ class TestGoalDriftRouting(HandlerTestCase):
         )
         self.assertEqual(blocked["error_code"], "PLAN_NOT_APPROVED")
 
+    def test_revised_goal_updates_the_plan_and_keeps_the_history(self):
+        """The user corrected their intent; the metadata must follow it (1.12.0)."""
+        r1 = self.step("Q3 리포트를 요약한다", 1)
+        r2 = self.h.dispatch("plan_and_think", {
+            "goal": "Q3 리포트를 요약한다",
+            "revised_goal": "Q4 리포트를 요약한다",
+            "thought": "사용자가 Q4라고 정정했다", "step_number": 2, "total_steps": 3,
+            "need_more_thinking": True,
+        })
+        self.assertTrue(r2["ok"])
+        self.assertEqual(r2["plan_id"], r1["plan_id"])   # corrected, not forked
+        self.assertEqual(r2["goal"], "Q4 리포트를 요약한다")
+
+        raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(raw["plans"]), 1)
+        plan = raw["plans"][r1["plan_id"]]
+        self.assertEqual(plan["goal"], "Q4 리포트를 요약한다")
+        self.assertEqual(plan["original_goal"], "Q3 리포트를 요약한다")
+        self.assertEqual(
+            [(h["from"], h["to"]) for h in plan["goal_history"]],
+            [("Q3 리포트를 요약한다", "Q4 리포트를 요약한다")],
+        )
+        audit = (self.state_dir / "audit.jsonl").read_text(encoding="utf-8")
+        self.assertIn("goal_revised", audit)
+
+    def test_corrected_goal_routes_the_next_step(self):
+        r1 = self.step("원래 목표", 1)
+        self.h.dispatch("plan_and_think", {
+            "goal": "원래 목표", "revised_goal": "정정된 목표", "thought": "t",
+            "step_number": 2, "total_steps": 3, "need_more_thinking": True,
+        })
+        after = self.step("정정된 목표", 3, more=False, tasks=["작업"])
+        self.assertTrue(after["ok"])
+        self.assertEqual(after["plan_id"], r1["plan_id"])
+
+    def test_the_old_goal_still_finds_the_plan_for_one_more_turn(self):
+        """A model lagging one turn behind a correction must not be told to re-select."""
+        r1 = self.step("원래 목표", 1)
+        self.h.dispatch("plan_and_think", {
+            "goal": "원래 목표", "revised_goal": "정정된 목표", "thought": "t",
+            "step_number": 2, "total_steps": 3, "need_more_thinking": True,
+        })
+        lagging = self.step("원래 목표", 3, more=False, tasks=["작업"])
+        self.assertTrue(lagging["ok"])
+        self.assertEqual(lagging["plan_id"], r1["plan_id"])
+        self.assertEqual(lagging["plan_status"], "AWAITING_APPROVAL")
+
+    def test_revised_goal_in_both_fields_still_finds_the_plan(self):
+        r1 = self.step("원래 목표", 1)
+        r2 = self.h.dispatch("plan_and_think", {
+            "goal": "정정된 목표", "revised_goal": "정정된 목표", "thought": "t",
+            "step_number": 2, "total_steps": 3, "need_more_thinking": True,
+        })
+        self.assertTrue(r2["ok"])
+        self.assertEqual(r2["plan_id"], r1["plan_id"])
+        self.assertEqual(r2["goal"], "정정된 목표")
+
+    def test_revised_goal_with_no_plan_yet_just_starts_one(self):
+        r = self.h.dispatch("plan_and_think", {
+            "goal": "", "revised_goal": "정정된 목표", "thought": "t",
+            "step_number": 1, "total_steps": 1, "need_more_thinking": False,
+            "task_list": ["작업"],
+        })
+        self.assertTrue(r["ok"])
+        res = self.h.dispatch("get_current_plan", {"plan_id": r["plan_id"]})
+        self.assertEqual(res["goal"], "정정된 목표")
+        self.assertNotIn("original_goal", res)   # nothing was revised
+
+    def test_paraphrase_only_revision_is_not_recorded(self):
+        """Trailing punctuation is not a correction; history must stay meaningful."""
+        r1 = self.step("파일을 찾는다", 1)
+        self.h.dispatch("plan_and_think", {
+            "goal": "파일을 찾는다", "revised_goal": "파일을 찾는다.", "thought": "t",
+            "step_number": 2, "total_steps": 2, "need_more_thinking": True,
+        })
+        raw = json.loads((self.state_dir / "plan_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(raw["plans"][r1["plan_id"]]["goal_history"], [])
+
+    def test_get_current_plan_reports_the_original_goal(self):
+        r1 = self.step("원래 목표", 1)
+        self.h.dispatch("plan_and_think", {
+            "goal": "원래 목표", "revised_goal": "정정된 목표", "thought": "t",
+            "step_number": 2, "total_steps": 3, "need_more_thinking": True,
+        })
+        res = self.h.dispatch("get_current_plan", {"plan_id": r1["plan_id"]})
+        self.assertEqual(res["goal"], "정정된 목표")
+        self.assertEqual(res["original_goal"], "원래 목표")
+        self.assertEqual(res["goal_revisions"], 1)
+
+    def test_revising_the_goal_mid_execution_warns_about_the_approval(self):
+        """The human approved the OLD goal; the correction is taken but flagged."""
+        self.approve_flow(["a", "b"])
+        res = self.h.dispatch("plan_and_think", {
+            "goal": "Summarize the Q3 sales report.",
+            "revised_goal": "Summarize the Q4 sales report.",
+            "thought": "사용자가 Q4라고 정정했다", "step_number": 3, "total_steps": 3,
+            "need_more_thinking": True,
+        })
+        self.assertEqual(res["plan_status"], "APPROVED")
+        self.assertEqual(res["goal"], "Summarize the Q4 sales report.")
+        self.assertTrue(any("approved this plan under the previous goal" in n
+                            for n in res["input_notes"]))
+        # The correction really was persisted, not just described.
+        stored = self.h.dispatch("get_current_plan", {"plan_id": res["plan_id"]})
+        self.assertEqual(stored["goal"], "Summarize the Q4 sales report.")
+
     def test_separate_state_dirs_are_fully_isolated(self):
         other_dir = self.state_dir / "other"
         other = PlanningHandlers(
@@ -1006,6 +1112,19 @@ class TestStaleApproval(HandlerTestCase):
         self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
         self.assertEqual(res["next_action"], "STOP_AND_WAIT_FOR_USER")
         self.assertNotIn("already approved", (res.get("message") or "").lower())
+
+    def test_revising_the_goal_cannot_un_expire_an_approval(self):
+        """Revising touches the plan; the touch must not reset the staleness clock."""
+        self.approved_plan_aged(hours=5)
+        res = self.h.dispatch("plan_and_think", {
+            "goal": "오전 작업: 로그 정리", "revised_goal": "오전 작업: 로그 아카이빙",
+            "thought": "사용자가 정정했다", "step_number": 2, "total_steps": 2,
+            "need_more_thinking": True,
+        })
+        self.assertEqual(res["goal"], "오전 작업: 로그 아카이빙")   # correction taken
+        blocked = self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.assertFalse(blocked["ok"])                          # approval still gone
+        self.assertIn(blocked["error_code"], ("APPROVAL_EXPIRED", "PLAN_NOT_APPROVED"))
 
     def test_fresh_approval_still_works(self):
         """The TTL must not break a plan being executed right now."""

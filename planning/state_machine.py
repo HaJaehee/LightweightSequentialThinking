@@ -96,8 +96,11 @@ def _error_action(plan: Plan | None, code: ErrorCode) -> tuple[str, str]:
             "You said you are continuing (step_number > 1), but no active plan has this "
             "goal. Do not start a new plan by drifting the goal. Look at active_plans "
             "below: if one of them is what you are working on, call plan_and_think again "
-            "with its EXACT goal text (or its plan_id). If this really is a brand-new "
-            "plan, call again with step_number=1.",
+            "with its EXACT goal text (or its plan_id). If the USER actually corrected "
+            "the goal, call again with that plan's EXACT goal text plus "
+            "revised_goal='<the corrected goal>' - the server will update it and keep "
+            "the old one on record. If this really is a brand-new plan, call again with "
+            "step_number=1.",
         )
     if code is ErrorCode.TASK_NOT_STARTED:
         task = plan.current_task() if plan else None

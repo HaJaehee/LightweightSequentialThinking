@@ -55,6 +55,14 @@ Goal matching normalizes trailing punctuation/whitespace (a period-only differen
 forks) but stays conservative on case and wording, so two genuinely different conversations are
 never merged. `plan_id` is now also accepted by `plan_and_think` to continue explicitly.
 
+**Drift is not the same as correction (1.12.0).** Everything above is about the *model* losing
+the goal, and the answer is to refuse the fork. When the *user* changes the goal, refusing is
+wrong: the model sends `revised_goal` and the plan's goal is updated in place (see
+[03](03-tool-contract.md#1-plan_and_think--the-mandatory-entry-point)). Routing then accepts
+either text — the current goal for as long as the plan lives, and each former goal for as long
+as the plan stays active — so the correction never costs the model its plan. Current goals are
+matched first, so a former goal can never steal a match from another conversation's live one.
+
 **Safety net regardless:** `get_current_plan` always echoes the exact goal, and after
 finalization the approval/execution tools route by `plan_id` or the-only-active-plan — so a
 forgotten goal during *execution* of a single plan is harmless.

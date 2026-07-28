@@ -39,7 +39,7 @@ from .models import (
 )
 from .responses import build, error, render_completion_report, render_plan_for_user
 from .state_machine import can_start_task, execution_guard
-from .store import State, Store
+from .store import State, Store, goal_key
 
 log = logging.getLogger("planning-mcp.handlers")
 
@@ -365,6 +365,7 @@ class PlanningHandlers:
     def _plan_and_think(self, args: dict[str, Any], notes: list[str]) -> dict[str, Any]:
         state = self.store.load()
         goal = (args.get("goal") or "").strip()
+        revised_goal = (args.get("revised_goal") or "").strip()
         thought = (args.get("thought") or "").strip()
         step_number = args.get("step_number")
         continuing = isinstance(step_number, int) and step_number > 1
@@ -372,9 +373,11 @@ class PlanningHandlers:
         # Routing, in priority order:
         #   1. explicit plan_id wins;
         #   2. exact (normalized) goal match - the model repeats its goal each step;
-        #   3. no match while CONTINUING (step > 1) - do not fork a plan on drifted goal;
+        #   3. the corrected goal, for a model that put it in both fields;
+        #   4. a goal this plan has since revised away from;
+        #   5. no match while CONTINUING (step > 1) - do not fork a plan on drifted goal;
         #      hand the model the list of active goals so it picks the exact one;
-        #   4. no match while STARTING (step 1) - a genuinely new plan.
+        #   6. no match while STARTING (step 1) - a genuinely new plan.
         plan = None
         pid_arg = args.get("plan_id")
         if isinstance(pid_arg, str) and pid_arg.strip().lower() not in (
@@ -383,6 +386,27 @@ class PlanningHandlers:
             plan = state.plans.get(pid_arg.strip())
         if plan is None:
             plan = state.plan_for_goal(goal)
+        if plan is None and revised_goal:
+            plan = state.plan_for_goal(revised_goal)
+        if plan is None and goal:
+            # One turn of grace after a correction: the model is still echoing the
+            # wording it has used all conversation. Continue the plan, do not fork it.
+            plan = state.plan_for_former_goal(goal)
+            if plan is not None:
+                notes.append(
+                    f"'{goal}' is this plan's previous goal; it was corrected to "
+                    f"'{plan.goal}'. Send the corrected text from now on."
+                )
+        if plan is None and revised_goal and len(state.active_plans()) == 1:
+            # A correction with the corrected text in BOTH fields matches nothing by
+            # name. But asking to correct a goal presupposes a plan that has one, and
+            # with exactly one in flight there is no other plan it could mean. With
+            # several active this stays unresolved and the model is asked to pick.
+            plan = state.active_plans()[0]
+            notes.append(
+                "'goal' matched no plan, so 'revised_goal' was applied to the only "
+                "active plan. Send the goal already on record next time."
+            )
         if plan is None and not goal:
             resolved = self._resolve_plan(state, pid_arg)
             plan = None if resolved is self._AMBIGUOUS else resolved
@@ -408,9 +432,47 @@ class PlanningHandlers:
                 "authorizes any execution."
             )
 
+        # --- goal revision --------------------------------------------------
+        # The user said the goal itself was wrong. Refusing the edit would leave the
+        # server describing the plan by a goal the user has already disowned while it
+        # executes tasks written for the corrected one - a state nobody can act on. So
+        # the goal moves; `original_goal` and `goal_history` carry the audit trail that
+        # freezing it used to provide.
+        #
+        # Deliberately AFTER the staleness check: revising touches the plan, and a touch
+        # before the check would let a wording fix silently un-expire an approval that
+        # had already sat idle past its TTL.
+        goal_was_revised = False
+        if plan is not None and revised_goal and goal_key(revised_goal) != goal_key(plan.goal):
+            previous_goal = plan.goal
+            goal_was_revised = plan.revise_goal(revised_goal)
+            if goal_was_revised:
+                self.store.save(state)
+                self.store.audit(
+                    "goal_revised",
+                    plan_id=plan.plan_id,
+                    previous_goal=previous_goal,
+                    goal=plan.goal,
+                    original_goal=plan.original_goal,
+                    plan_status=plan.plan_status,
+                )
+                notes.append(
+                    f"The goal was corrected to '{plan.goal}'. The previous wording is "
+                    "kept in this plan's history. Send the corrected text as 'goal' from "
+                    "now on."
+                )
+
         if plan is not None and plan.status in (PlanStatus.APPROVED, PlanStatus.IN_EXECUTION):
             self.store.audit("plan_and_think_redirected", plan_id=plan.plan_id)
             task = plan.current_task()
+            if goal_was_revised:
+                # The approval on file was given for the OLD goal. Recording the
+                # correction must not quietly widen what the human agreed to.
+                notes.append(
+                    "The user approved this plan under the previous goal. Check whether "
+                    "the remaining tasks still serve the corrected goal - if they do "
+                    "not, re-plan and call request_user_approval again."
+                )
             return build(
                 plan,
                 message=(
@@ -418,6 +480,7 @@ class PlanningHandlers:
                     "planning again. Use get_current_plan if you need the details."
                 ),
                 notes=notes,
+                goal=plan.goal if goal_was_revised else None,
                 qualify=len(state.active_plans()) > 1,
                 tasks=plan.tasks_brief(),
                 progress=plan.progress(),
@@ -442,6 +505,14 @@ class PlanningHandlers:
             if not goal:
                 goal = plan.goal
                 notes.append("No goal was sent; reused the goal already on record.")
+        elif revised_goal:
+            # A correction with nothing to correct: there is no plan yet, so the
+            # corrected text is simply the goal of the one about to be created.
+            goal = revised_goal
+            notes.append(
+                "There was no existing plan to correct, so 'revised_goal' was used as "
+                "the goal of this new plan."
+            )
         if not goal:
             goal = thought[:120] or "(goal not stated)"
             notes.append("No goal was sent; derived one from your thought. Send 'goal' next time.")
@@ -519,6 +590,7 @@ class PlanningHandlers:
                 tasks=plan.tasks_brief(),
                 notes=notes,
                 qualify=len(state.active_plans()) > 1,
+                goal=plan.goal if goal_was_revised else None,
                 message=f"Thinking step {step_number} recorded.",
             )
 
@@ -638,6 +710,7 @@ class PlanningHandlers:
             tasks=plan.tasks_brief(),
             notes=notes,
             qualify=len(state.active_plans()) > 1,
+            goal=plan.goal if goal_was_revised else None,
             message=(
                 f"Plan created with {len(plan.tasks)} tasks. "
                 "Execution is locked until the user approves."
@@ -1527,6 +1600,10 @@ class PlanningHandlers:
         return build(
             plan,
             goal=plan.goal,
+            # Only when it actually moved: an unchanged goal repeated twice reads as two
+            # different goals to a weak model.
+            original_goal=plan.original_goal if plan.goal_history else None,
+            goal_revisions=len(plan.goal_history) or None,
             thinking_steps=thinking,
             superseded_steps=f"{superseded_count} earlier steps superseded"
             if superseded_count

@@ -1,14 +1,18 @@
 # 11 · Status and Next Steps
 
-## Current state (as of version 1.11.0)
+## Current state (as of version 1.12.0)
 
 - **Code:** feature-complete for the design. All four tools, blocking approval, multi-plan,
   shared approval surface, cross-process locking, failure-path hardening, leniency fuzzing,
-  per-task plan review (1.10.0), auto-advance (1.11.0).
-- **Tests:** 228 unit + 5 smoke, all passing. `verify_install.py` runs everything.
+  per-task plan review (1.10.0), auto-advance (1.11.0), goal revision (1.12.0).
+- **Tests:** 237 unit + 5 smoke, all passing. `verify_install.py` runs everything.
 - **Git:** on `develop`. Remote is `github.com/HaJaehee/LightweightSequentialThinking`.
   **NOT pushed.** Pushing is a user decision — the repo may be public and `docs/` contains
   deployment/security material; confirm before pushing.
+- **1.12.0 is not packaged or deployed yet.** No archive has been built for it and
+  `D:\planning-mcp` is still on 1.11.0; the artifacts and live-install notes below describe
+  1.11.0. Rebuild, re-verify and **repaste the agent prompt** (it now teaches `revised_goal`)
+  before the next transfer.
 - **Build artifacts (1.11.0, built 2026-07-28):**
 
   | archive | size | sha256 |

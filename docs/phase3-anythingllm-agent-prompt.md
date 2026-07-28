@@ -52,6 +52,12 @@ text mid-plan. Look at the `active_plans` list in the reply, copy the EXACT `goa
 of the plan you are continuing, and call `plan_and_think` again with that exact goal
 (or set `plan_id` to that plan's id). Only use step_number = 1 if you truly want a
 brand-new, separate plan.
+If the USER tells you the goal itself was wrong or has changed ("no, I meant the Q4
+report, not Q3"), do NOT start a second plan and do NOT keep the old goal. Call
+`plan_and_think` again with `goal` = the text you have been sending and
+`revised_goal` = the corrected goal. The server updates the plan's goal, keeps the
+old one on record, and answers with the corrected text - use it from then on. Never
+use `revised_goal` just to reword the same goal.
 If the server replies with error_code = "PLAN_AMBIGUOUS", more than one plan is
 active. Read the `active_plans` list, decide which one this turn is about, and repeat
 your call with `plan_id` set to that plan's id. Every response you get already tells
@@ -257,6 +263,10 @@ R7. "ok": false 가 오면 포기하거나 답변하지 말고 `next_action_hint
   error_code = "GOAL_NOT_MATCHED" 가 오면 도중에 goal 을 바꾼 것입니다. 응답의
   active_plans 목록에서 이어가려는 계획의 goal 을 그대로 복사해 다시 호출하거나
   plan_id 를 지정합니다. 정말 새 계획이면 step_number = 1 로 시작합니다.
+  사용자가 목표 자체를 정정하면("Q3 아니라 Q4야") 새 계획을 만들지 말고, goal 에는
+  기존 텍스트를, revised_goal 에는 정정된 목표를 넣어 `plan_and_think`를 호출합니다.
+  서버가 목표를 갱신하고 이전 목표를 이력으로 보관하며, 이후에는 정정된 목표를
+  사용합니다. 같은 목표를 다르게 표현하려고 revised_goal 을 쓰지 않습니다.
   error_code = "PLAN_AMBIGUOUS" 가 오면 활성 계획이 여러 개입니다. active_plans
   에서 이번 턴의 계획을 고르고 plan_id 를 넣어 다시 호출합니다.
 

@@ -96,6 +96,22 @@ class State:
                 return plan
         return None
 
+    def plan_for_former_goal(self, goal: str) -> Plan | None:
+        """Route by a goal this plan has since revised away from.
+
+        Only consulted after `plan_for_goal` misses. Right after a correction the model
+        is still repeating the old wording it has been echoing all conversation; without
+        this it would be told its own plan does not exist and burn a turn re-selecting
+        it. Current goals always win, so this can never steal a match from another plan.
+        """
+        key = goal_key(goal)
+        if not key:
+            return None
+        for plan in self.active_plans():
+            if any(goal_key(former) == key for former in plan.former_goals()):
+                return plan
+        return None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
