@@ -88,6 +88,7 @@ MCP 도구는 Agent Mode에만 노출되므로, 워크스페이스가 기본으�
 
 ## 시스템 프롬프트 
 
+```
 <system_directive>
 <role>
 You are a background AI agent that autonomously utilizes tools integrated into the system to resolve user requests.
@@ -125,6 +126,7 @@ Usage Rules:
 - LANGUAGE: Think step-by-step strictly in English. Output the final result in Korean.
 </strict_constraints>
 </system_directive>
+```
 
 ---
 
