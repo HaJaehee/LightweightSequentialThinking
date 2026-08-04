@@ -139,6 +139,31 @@ does not extend the mandate.
 
 ---
 
+### 1.12.1 — the last DONE stopped being silent
+
+Auto-advance (1.11.0) made the `message` field on a DONE response carry the instruction for the
+next step: "task N has been started for you — do that work NOW." When there is no next task,
+there was nothing to advance into, so the field went to `None` — and the response that says
+*every task is finished* was the one response in the whole execution loop that told the model
+nothing. `next_action`/`next_action_hint` still said the right thing, but the final step is
+exactly where a weak model stops reading the envelope and starts writing its own ending: it has
+just satisfied the last task, and declaring victory is the cheapest continuation available to it.
+
+`_finish_task` now always says what happens next. With every task DONE it asks for the
+completion report explicitly — `request_user_approval` with `decision='ASK_USER'` and a per-task
+`plan_summary` under `completion_approval`, or the final answer to the user when that gate is
+off — and adds "do not declare success yourself".
+
+The branch is on `advanced is None`, but that condition is not the same as "the plan is
+finished": with `auto_advance` off, nothing is auto-started even when tasks remain. Collapsing
+the two would have made a manual-mode server tell the model to report completion halfway through
+the plan — the exact failure 1.9.0 was built to prevent. So the empty-`advanced` case splits
+three ways: work left (name the next task), all done + `AWAITING_COMPLETION` (ask for the
+report), all done + `COMPLETED` (write the final answer). `next_action` is untouched;
+`resolve_next_action` remains its single producer.
+
+---
+
 ## Git commit ↔ version map
 
 | Commit | Version / theme |

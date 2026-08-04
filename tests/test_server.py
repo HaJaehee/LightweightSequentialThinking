@@ -2836,6 +2836,40 @@ class TestAutoAdvance(HandlerTestCase):
         self.assertEqual(res["plan_status"], "AWAITING_COMPLETION")
         self.assertIsNone(res.get("next_task"))
 
+    def test_last_done_tells_the_model_to_report_completion(self):
+        """Nothing is auto-started after the final task, so message said nothing at all
+        - at the one step where a weak model is most likely to invent its own ending
+        (1.12.1)."""
+        self.approved(2)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        self.finish(1)
+        res = self.finish(2)
+        self.assertEqual(res["plan_status"], "AWAITING_COMPLETION")
+        self.assertIn("every task in this plan is finished", res["message"])
+        self.assertIn("request_user_approval", res["message"])
+
+    def test_last_done_without_completion_approval_asks_for_the_final_answer(self):
+        cfg = Config(state_dir=self.state_dir, blocking_approval=False,
+                     completion_approval=False)
+        self.h = PlanningHandlers(Store(self.state_dir), cfg)
+        self.approved(1)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        res = self.finish(1)
+        self.assertEqual(res["plan_status"], "COMPLETED")
+        self.assertIn("every task in this plan is finished", res["message"])
+        self.assertIn("final answer", res["message"])
+
+    def test_manual_mode_done_names_the_next_task_not_completion(self):
+        """advanced is None with work left must never read as 'report completion'."""
+        cfg = Config(state_dir=self.state_dir, blocking_approval=False, auto_advance=False)
+        self.h = PlanningHandlers(Store(self.state_dir), cfg)
+        self.approved(2)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        res = self.finish(1)
+        self.assertIn("NOT finished", res["message"])
+        self.assertIn("IN_PROGRESS", res["message"])
+        self.assertNotIn("finished. Report completion", res["message"])
+
     def test_failure_does_not_advance(self):
         """A blocked plan must not have its next task quietly started."""
         self.approved(3)

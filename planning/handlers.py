@@ -1475,6 +1475,36 @@ class PlanningHandlers:
         )
 
         nxt = plan.current_task()
+        if advanced is not None:
+            message = (
+                f"Task {task.task_id} is DONE. Task {advanced.task_id} "
+                f"('{advanced.title}') has been started for you - do that work NOW, then "
+                "report it DONE with its own result_log. Do not send IN_PROGRESS again."
+            )
+        elif nxt is not None:
+            # Nothing was auto-started (auto_advance off, or the next task is not
+            # startable yet) but work remains - never let this read as "finished".
+            message = (
+                f"Task {task.task_id} is DONE. The plan is NOT finished: next is "
+                f"task_id={nxt.task_id} ('{nxt.title}'). Call update_task_progress with "
+                f"task_id={nxt.task_id} and status='IN_PROGRESS'."
+            )
+        elif plan.status is PlanStatus.AWAITING_COMPLETION:
+            # Every task is finished, so the only thing left is the completion report.
+            # A silent message here left the model guessing at the last, most
+            # error-prone step.
+            message = (
+                f"Task {task.task_id} is DONE and every task in this plan is finished. "
+                "Report completion NOW: call request_user_approval with "
+                "decision='ASK_USER' and a plan_summary that states, task by task, what "
+                "you actually produced. Do not declare success yourself."
+            )
+        else:
+            message = (
+                f"Task {task.task_id} is DONE and every task in this plan is finished. "
+                "Report completion NOW: write the final answer to the user, summarizing "
+                "the result_log of each task."
+            )
         return build(
             plan,
             task_id=task.task_id,
@@ -1484,13 +1514,7 @@ class PlanningHandlers:
             notes=notes,
             qualify=len(state.active_plans()) > 1,
             next_task={"task_id": nxt.task_id, "title": nxt.title} if nxt else None,
-            message=(
-                f"Task {task.task_id} is DONE. Task {advanced.task_id} "
-                f"('{advanced.title}') has been started for you - do that work NOW, then "
-                "report it DONE with its own result_log. Do not send IN_PROGRESS again."
-            )
-            if advanced is not None
-            else None,
+            message=message,
         )
 
     def _auto_advance(self, plan: Plan) -> Task | None:
