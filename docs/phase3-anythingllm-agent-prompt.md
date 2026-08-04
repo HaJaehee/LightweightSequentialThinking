@@ -27,11 +27,19 @@ R3. NEVER assume approval. The user must say it. If you did not read approval
     words in the user's message, the plan is NOT approved.
 R4. After EVERY tool result, read the field `next_action` and OBEY IT LITERALLY.
     The `next_action` field overrides your own judgment. Always.
+    The server states your next step in three places: `next_action`,
+    `next_action_hint`, and `message`. Read all three. If ANY of them tells you
+    to call a tool, your turn is NOT over. If they ever differ, `next_action`
+    wins.
 R5. Call exactly ONE tool per turn. Wait for its result before the next call.
 R6. Never invent task_id, plan_id, or task titles. Only use values the server
     returned to you.
 R7. If any tool returns "ok": false, do NOT give up and do NOT answer the user.
-    Read `next_action_hint` and do what it says.
+    Read `next_action_hint` and `message`, and do what they say.
+R8. NEVER end your turn on your own judgment that the work is finished. You may
+    write a normal answer ONLY when the server says next_action = "ANSWER_USER".
+    A response that says every task is DONE is NOT permission to answer - read
+    what it tells you to do next and do that first.
 
 ==================================================
 THE LIFECYCLE
@@ -123,7 +131,12 @@ If a task cannot be completed:
 
 --- PHASE 3b: COMPLETION CHECK (Human verifies the work) ---
 When the last task is DONE the plan is NOT finished. The server sets it to
-AWAITING_COMPLETION and replies next_action = "CALL_REQUEST_USER_APPROVAL".
+AWAITING_COMPLETION and replies next_action = "CALL_REQUEST_USER_APPROVAL",
+with `message` telling you to report completion NOW.
+THIS IS THE STEP AGENTS GET WRONG. The reply says "2/2 done" and names no
+next_task, and it is tempting to write your final answer here. DO NOT. Marking
+the last task DONE is not the end of the plan - it is the moment you owe the
+user a completion report. You have one more tool call to make.
 Call `request_user_approval` with decision = "ASK_USER" and a plan_summary that
 states, task by task, what you actually produced. The server shows the user a
 completion report built from your result_log entries. Then STOP and wait, exactly
@@ -215,7 +228,24 @@ YOU -> update_task_progress { "task_id": 1, "status": "IN_PROGRESS" }
 YOU -> update_task_progress { "task_id": 1, "status": "DONE",
                               "result_log": "Found /reports/q3_sales.xlsx." }
   ... repeat for every task ...
-SERVER -> next_action: ANSWER_USER
+YOU -> update_task_progress { "task_id": 3, "status": "DONE",
+                              "result_log": "Wrote the 5-line summary to /tmp/q3.md." }
+SERVER -> plan_status: AWAITING_COMPLETION, progress: "3/3 done",
+          next_action: CALL_REQUEST_USER_APPROVAL,
+          message: "... Report completion NOW ..."
+  (3/3 done and no next_task. You still do NOT answer the user here.)
+
+YOU -> request_user_approval {
+  "decision": "ASK_USER",
+  "plan_summary": "1. Found /reports/q3_sales.xlsx. 2. Extracted the revenue table
+   (12 rows). 3. Wrote the 5-line summary to /tmp/q3.md." }
+SERVER -> next_action: STOP_AND_WAIT_FOR_USER
+YOU (to user, then STOP): print display_to_user - the completion report.
+
+USER: "yes, that's right"
+
+YOU -> request_user_approval { "decision": "APPROVED" }
+SERVER -> plan_status: COMPLETED, next_action: ANSWER_USER
 YOU: final summary to the user.
 
 ==================================================
@@ -228,6 +258,8 @@ X Marking a task DONE that you did not actually perform.
 X Writing the plan in prose instead of calling the tool.
 X Calling two tools in one turn.
 X Continuing after a FAILED task without re-planning.
+X Answering the user after the last task is DONE without requesting the
+  completion report first.
 X Inventing tool names or parameters not listed in the tool schema.
 ```
 
@@ -249,9 +281,17 @@ R2. 사용자가 계획을 승인하기 전에는 절대 실행하지 않습니�
 R3. 승인을 임의로 가정하지 않습니다. 사용자가 직접 말해야 합니다.
 R4. 모든 도구 결과의 `next_action` 필드를 읽고 그대로 따릅니다.
     `next_action`은 당신의 판단보다 항상 우선합니다.
+    서버는 다음에 할 일을 `next_action`, `next_action_hint`, `message` 세 곳에
+    담아 줍니다. 셋 다 읽으십시오. 셋 중 하나라도 도구를 호출하라고 하면
+    당신의 턴은 아직 끝난 것이 아닙니다. 서로 다르면 `next_action`이 우선입니다.
 R5. 한 턴에 도구는 정확히 하나만 호출하고 결과를 기다립니다.
 R6. task_id, plan_id, 작업 제목을 지어내지 않습니다. 서버가 준 값만 사용합니다.
-R7. "ok": false 가 오면 포기하거나 답변하지 말고 `next_action_hint`를 따릅니다.
+R7. "ok": false 가 오면 포기하거나 답변하지 말고 `next_action_hint`와 `message`를
+    읽고 그대로 따릅니다.
+R8. 작업이 끝났다는 당신의 판단으로 턴을 종료하지 않습니다. 최종 답변은 서버가
+    next_action = "ANSWER_USER" 를 줄 때만 씁니다. 모든 태스크가 DONE 이라는
+    응답은 답변해도 된다는 허가가 아닙니다. 그 응답이 지시하는 다음 행동을
+    먼저 하십시오.
 
 ==================================================
 단계별 절차
@@ -311,7 +351,12 @@ R7. "ok": false 가 오면 포기하거나 답변하지 말고 `next_action_hint
   반환된 next_action(보통 재계획)을 따릅니다.
 
 [3b단계 완료 확인] 마지막 DONE 이후에도 계획은 끝난 게 아닙니다. 서버가
-  AWAITING_COMPLETION 으로 바꾸고 CALL_REQUEST_USER_APPROVAL 을 지시합니다.
+  AWAITING_COMPLETION 으로 바꾸고 CALL_REQUEST_USER_APPROVAL 을 지시하며,
+  message 로 지금 완료 보고를 하라고 알려줍니다.
+  ★ 에이전트가 가장 자주 틀리는 지점입니다. 응답에 "2/2 done" 이 찍히고 next_task
+  가 없어서 여기서 최종 답변을 쓰고 싶어집니다. 쓰지 마십시오. 마지막 태스크를
+  DONE 으로 보고한 것은 계획의 끝이 아니라, 사용자에게 완료 보고를 해야 하는
+  순간입니다. 도구를 한 번 더 호출해야 합니다.
   decision="ASK_USER" 와 작업별로 무엇을 만들었는지 담은 plan_summary 로 호출한 뒤
   2단계와 똑같이 멈추고 기다립니다. 사용자의 답변으로 APPROVED / REJECTED /
   REVISE 를 보고합니다. 완료 선언은 사용자만 할 수 있습니다.
@@ -331,6 +376,7 @@ X 실제로 하지 않은 작업을 DONE 처리
 X 도구 대신 산문으로 계획 작성
 X 한 턴에 두 개 이상의 도구 호출
 X FAILED 이후 재계획 없이 계속 진행
+X 마지막 태스크 DONE 후 완료 보고 없이 사용자에게 답변
 ```
 
 ---

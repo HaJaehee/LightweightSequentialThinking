@@ -188,6 +188,35 @@ clothes. In a conversational system the user's intent is discovered, not declare
 holding that intent must be able to follow a correction, or the metadata starts describing a
 plan that no longer exists.
 
+<a id="d16"></a>
+## D16 — The model stopped without reporting completion (1.12.1)
+**Symptom:** observed in use. Every task gets done and marked `DONE` with real evidence, the
+server moves the plan to `AWAITING_COMPLETION` and answers
+`next_action = CALL_REQUEST_USER_APPROVAL` — and the model ignores it, writing a final answer to
+the user instead. The completion report, the one gate that puts a human in front of the
+evidence, is never requested. The plan stays `AWAITING_COMPLETION` forever; nothing is corrupted,
+but the HITL check silently does not happen.
+**Root cause:** not "weak models ignore hints" — the channel went silent at exactly the wrong
+moment. Since auto-advance (1.11.0), every mid-loop `DONE` response carried its order in
+`message` ("task N has been started for you — do that work NOW"). Across a plan the model learns
+that `message` is where its next instruction lives, while `next_action_hint` repeats similar
+wording every turn and fades into background. On the **last** `DONE` there is nothing to
+advance into, so `message` was `None` — the one response in the loop that said nothing, arriving
+at the one moment when declaring victory is the cheapest continuation available to the model. It
+was not overriding an instruction; it was filling a silence.
+**Fix:** `_finish_task` always states the next step. All tasks done + `AWAITING_COMPLETION` asks
+for the completion report explicitly (`request_user_approval`, `decision='ASK_USER'`, per-task
+`plan_summary`, plus "do not declare success yourself"); `COMPLETED` asks for the final answer.
+`advanced is None` is deliberately **not** treated as "the plan is finished" — with
+`auto_advance` off, tasks can remain — so that case names the next task instead. The agent
+prompt (Phase 3) now also names `message` as an instruction channel in R4/R7, since the fix
+otherwise depends on the model reading a field the prompt never mentioned.
+**Lesson:** in a redundant protocol, a channel that carries orders is also making a promise, and
+its **absence is read as content**. `None` was not neutral — it meant "no further orders" to a
+model that had been trained by the preceding turns to expect one. Whenever an instruction field
+can go empty, ask what the emptiness says at that exact state, especially at the last step of a
+loop where the model's own priors already point at stopping.
+
 ## Where the next bug probably is
 
 Judging by the pattern (bugs cluster in untested seams and failure paths), the thinner-covered

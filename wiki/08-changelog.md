@@ -139,15 +139,22 @@ does not extend the mandate.
 
 ---
 
-### 1.12.1 — the last DONE stopped being silent
+### 1.12.1 — the last DONE stopped being silent ([D16](09-defects-and-lessons.md#d16))
 
-Auto-advance (1.11.0) made the `message` field on a DONE response carry the instruction for the
-next step: "task N has been started for you — do that work NOW." When there is no next task,
-there was nothing to advance into, so the field went to `None` — and the response that says
-*every task is finished* was the one response in the whole execution loop that told the model
-nothing. `next_action`/`next_action_hint` still said the right thing, but the final step is
-exactly where a weak model stops reading the envelope and starts writing its own ending: it has
-just satisfied the last task, and declaring victory is the cheapest continuation available to it.
+Observed in use: the model completed every task, marked them all `DONE` with real evidence — and
+then wrote a final answer to the user instead of requesting the completion report. The server
+had moved the plan to `AWAITING_COMPLETION` and answered `next_action =
+CALL_REQUEST_USER_APPROVAL`; the model went past it. Nothing was corrupted (the plan simply sits
+in `AWAITING_COMPLETION` and the guard refuses further task writes), but the HITL gate that puts
+a human in front of the evidence quietly never ran.
+
+The cause was not that hints are weak. Auto-advance (1.11.0) made `message` the field that
+carries the next order on every DONE — "task N has been started for you — do that work NOW" —
+so over a plan the model learns that `message` is where its instruction lives, while
+`next_action_hint` repeats similar wording every turn and becomes background. On the **last**
+DONE there is nothing to advance into, so `message` was `None`: the one response in the whole
+loop that said nothing, arriving at the one moment when declaring victory is the cheapest
+continuation available. The model was not overriding an instruction — it was filling a silence.
 
 `_finish_task` now always says what happens next. With every task DONE it asks for the
 completion report explicitly — `request_user_approval` with `decision='ASK_USER'` and a per-task
@@ -161,6 +168,12 @@ the plan — the exact failure 1.9.0 was built to prevent. So the empty-`advance
 three ways: work left (name the next task), all done + `AWAITING_COMPLETION` (ask for the
 report), all done + `COMPLETED` (write the final answer). `next_action` is untouched;
 `resolve_next_action` remains its single producer.
+
+The agent prompt was the other half of the gap: R4 and R7 named `next_action`,
+`next_action_hint` and `display_to_user`, and never mentioned `message` — so the field the model
+had actually been steering by was one no rule acknowledged. Both variants now name it, and
+Phase 3b spells out that the last DONE is not an ending. This half only takes effect when the
+prompt is repasted into AnythingLLM; the server-side message alone does not deliver it.
 
 ---
 
