@@ -102,6 +102,7 @@ PASS criteria are written so they can be judged from the AnythingLLM transcript 
 | **FAIL mode** | Model redoes task 1 or 3 as well — they were accepted; the hint names them explicitly as not-to-touch |
 | **Check in state** | `plan.rework_from_completion` stays false on this path; `plan.pending_revision` is None; audit records `rework_requested` |
 | **Check the escape hatch** | Ticking `☐ 계획 자체를 다시 세우기` instead → `DRAFTING` + a real re-approval, but tasks whose title survives the redraft keep their `DONE` and `result_log` (`input_notes` says which) |
+| **Check the gap** | With 5 tasks, send back **2 and 5** (3 and 4 stay DONE between them). Finishing task 2 must hand over task **5** — `next_task.task_id = 5`, auto-started `IN_PROGRESS`, and `message` must repeat what the user said about 5. Tasks 3 and 4 are never re-run. Trying task 5 first is redirected back to 2 (`next_task.task_id = 2`, `ok:true`), and a bare `DONE` on 5 is `TASK_NOT_STARTED` |
 
 ### B3. Ambiguous reply
 

@@ -169,6 +169,12 @@ finishing it walks into `all_done()` → `AWAITING_COMPLETION` → a fresh repor
 the reworked rows with `↻ 요청하신 내용` and `이전 결과`, so the human checks their own request in
 one line.
 
+This holds when the reopened tasks are **not adjacent**, which is the interesting case. Send back
+2 and 5 out of five tasks and 3, 4 stay `DONE` between them: `current_task()` returns the first
+`PENDING`, so finishing 2 skips straight to 5, `can_start_task(5)` passes because 1–4 are all
+`DONE`, and auto-advance starts it. Ordering still binds in the other direction — reaching for 5
+while 2 is outstanding is redirected back to 2, and a bare `DONE` on 5 is `TASK_NOT_STARTED`.
+
 **Keeping the request in front of the model.** `_status_action` leads the hint with the human's
 literal sentence, forbids re-planning, and names the tasks that must not be touched;
 `_rework_suffix` repeats it in `message` wherever a task is handed over — including the

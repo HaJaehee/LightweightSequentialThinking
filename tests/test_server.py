@@ -2415,6 +2415,78 @@ class TestCompletionRework(TargetedRevisionFixture):
         self.assertIn("요약이 너무 짧아요", res["message"])
         self.assertIn("요약이 너무 짧아요", res["next_action_hint"])
 
+    # ---- reopened tasks with finished work between them -------------------
+    FIVE = [f"작업{i}" for i in range(1, 6)]
+
+    def gapped(self):
+        """Tasks 2 and 5 sent back out of a 5-task plan; 3 and 4 stay DONE between them."""
+        return self.sent_back(
+            {"2": "표가 빠졌어요", "5": "요약이 너무 짧아요"}, tasks=self.FIVE
+        )
+
+    def statuses(self, res):
+        return {t["task_id"]: t["status"] for t in res["tasks"]}
+
+    def finish(self, h, task_id, log, start=True):
+        if start:
+            h.dispatch("update_task_progress", {"task_id": task_id, "status": "IN_PROGRESS"})
+        return h.dispatch("update_task_progress", {
+            "task_id": task_id, "status": "DONE", "result_log": log})
+
+    def test_finishing_one_reopened_task_hands_over_the_next_one_across_the_gap(self):
+        """The reopened tasks are not adjacent. Task 2 is followed by two tasks that are
+        still DONE, so the auto-advance has to skip them and land on 5."""
+        h, res = self.gapped()
+        self.assertEqual(res["reopened_tasks"], [2, 5])
+        self.assertEqual(res["tasks_unchanged"], [1, 3, 4])
+        self.assertEqual(res["next_task"]["task_id"], 2)
+
+        res = self.finish(h, 2, "표 3개를 모두 넣어 out2.txt 재저장")
+        self.assertEqual(res["next_task"]["task_id"], 5)
+        self.assertEqual(
+            self.statuses(res),
+            {1: "DONE", 2: "DONE", 3: "DONE", 4: "DONE", 5: "IN_PROGRESS"},
+        )
+
+    def test_the_tasks_in_the_gap_are_never_touched(self):
+        h, _ = self.gapped()
+        res = self.finish(h, 2, "표 3개를 모두 넣어 out2.txt 재저장")
+        for task_id in (1, 3, 4):
+            task = self.plan(h).get_task(task_id)
+            self.assertEqual(task.status, "DONE")
+            self.assertIn(f"/tmp/out{task_id}.txt", task.result_log or "")
+            self.assertIsNone(task.revision_note)
+
+    def test_the_request_survives_the_gap(self):
+        """Crossing two accepted tasks must not drop what the user said about task 5."""
+        h, _ = self.gapped()
+        res = self.finish(h, 2, "표 3개를 모두 넣어 out2.txt 재저장")
+        self.assertIn("요약이 너무 짧아요", res["message"])
+        self.assertIn("요약이 너무 짧아요", res["next_action_hint"])
+        # Auto-advance already started it, so the hint must not ask for IN_PROGRESS again.
+        self.assertIn("It is already IN_PROGRESS", res["next_action_hint"])
+
+    def test_a_later_reopened_task_cannot_jump_the_earlier_one(self):
+        """Ordering still binds across a rework: 5 may not run while 2 is outstanding."""
+        h, _ = self.gapped()
+        res = h.dispatch("update_task_progress", {"task_id": 5, "status": "IN_PROGRESS"})
+        self.assertEqual(res["next_task"]["task_id"], 2)  # redirected, not rejected
+        self.assertEqual(self.plan(h).get_task(5).status, "PENDING")
+        res = h.dispatch("update_task_progress", {
+            "task_id": 5, "status": "DONE", "result_log": "요약을 12줄로 늘려 저장함"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "TASK_NOT_STARTED")
+
+    def test_the_gapped_plan_returns_to_verification_only_after_both(self):
+        h, _ = self.gapped()
+        res = self.finish(h, 2, "표 3개를 모두 넣어 out2.txt 재저장")
+        self.assertEqual(res["plan_status"], "IN_EXECUTION")
+        self.assertEqual(res["progress"], "4/5 done")
+        # Auto-advance already started task 5, so it is finished without IN_PROGRESS.
+        res = self.finish(h, 5, "요약을 12줄로 늘려 out5.txt 재저장", start=False)
+        self.assertEqual(res["plan_status"], "AWAITING_COMPLETION")
+        self.assertEqual(res["progress"], "5/5 done")
+
     # ---- the loop closes ------------------------------------------------
     def test_redoing_the_task_returns_to_the_completion_report(self):
         h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})
