@@ -2516,6 +2516,70 @@ class TestCompletionRework(TargetedRevisionFixture):
         self.assertEqual(res["plan_status"], "AWAITING_COMPLETION")
         self.assertEqual(res["progress"], "5/5 done")
 
+    # ---- what a disobedient model cannot do -------------------------------
+    def test_resubmitting_the_rejected_outcome_is_refused(self):
+        """The cheapest way to 'finish' a rework is to re-report what was already there.
+        The user rejected that outcome, so it cannot also be the answer to their request."""
+        h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})
+        old = self.plan(h).get_task(2).previous_result_log
+        h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
+        res = h.dispatch("update_task_progress", {
+            "task_id": 2, "status": "DONE", "result_log": old})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "REWORK_NOT_DONE")
+        self.assertEqual(self.plan(h).get_task(2).status, "IN_PROGRESS")
+        self.assertIn("표가 3개 빠졌어요", res["next_action_hint"])
+
+    def test_cosmetic_whitespace_does_not_launder_the_old_outcome(self):
+        h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})
+        old = self.plan(h).get_task(2).previous_result_log
+        h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
+        res = h.dispatch("update_task_progress", {
+            "task_id": 2, "status": "DONE", "result_log": f"  {old.upper()}  "})
+        self.assertEqual(res["error_code"], "REWORK_NOT_DONE")
+
+    def test_a_genuinely_new_outcome_is_accepted(self):
+        h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})
+        h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
+        res = h.dispatch("update_task_progress", {
+            "task_id": 2, "status": "DONE", "result_log": "표 3개를 모두 넣어 다시 저장함"})
+        self.assertTrue(res["ok"], res.get("error_code"))
+        self.assertEqual(res["plan_status"], "AWAITING_COMPLETION")
+
+    def test_an_ordinary_task_may_repeat_an_earlier_wording(self):
+        """The guard is scoped to reopened tasks. A plain plan has no rejected outcome,
+        so two tasks that legitimately produce the same sentence must not be refused."""
+        h, _ = self.reported()
+        plan = self.plan(h)
+        self.assertTrue(all(t.previous_result_log is None for t in plan.tasks))
+
+    def test_accepted_tasks_cannot_be_restarted_or_overwritten(self):
+        """Redoing work nobody complained about is refused by the state machine, not
+        only discouraged by the hint."""
+        h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})
+        res = h.dispatch("update_task_progress", {"task_id": 3, "status": "IN_PROGRESS"})
+        self.assertEqual(self.plan(h).get_task(3).status, "DONE")
+        self.assertEqual(res["next_task"]["task_id"], 2)  # redirected at the open one
+        before = self.plan(h).get_task(3).result_log
+        h.dispatch("update_task_progress", {
+            "task_id": 3, "status": "DONE", "result_log": "3번을 멋대로 다시 만들었습니다"})
+        self.assertEqual(self.plan(h).get_task(3).result_log, before)
+
+    def test_re_planning_during_a_rework_cannot_touch_the_plan(self):
+        """A model that reaches for plan_and_think out of habit - which is what the old
+        behaviour taught it - must not be able to wipe the task list or its evidence."""
+        h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})
+        titles = [t.title for t in self.plan(h).tasks]
+        res = h.dispatch("plan_and_think", {
+            "goal": "분기 보고서 정리", "thought": "다시 짜자", "step_number": 2,
+            "total_steps": 2, "need_more_thinking": False,
+            "task_list": ["완전히", "다른", "계획"]})
+        self.assertEqual(res["plan_status"], "IN_EXECUTION")
+        self.assertEqual(res["next_action"], "CALL_UPDATE_TASK_PROGRESS")
+        plan = self.plan(h)
+        self.assertEqual([t.title for t in plan.tasks], titles)
+        self.assertEqual([t.task_id for t in plan.tasks if t.status == "DONE"], [1, 3])
+
     # ---- the loop closes ------------------------------------------------
     def test_redoing_the_task_returns_to_the_completion_report(self):
         h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})

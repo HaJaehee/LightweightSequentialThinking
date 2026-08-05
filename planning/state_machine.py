@@ -127,6 +127,19 @@ def _error_action(plan: Plan | None, code: ErrorCode) -> tuple[str, str]:
             "stating the concrete outcome - for example what you found, where you saved "
             "it, or what you produced. 'done' or 'ok' is not acceptable evidence.",
         )
+    if code is ErrorCode.REWORK_NOT_DONE:
+        task = plan.current_task() if plan else None
+        asked = f' They said: "{task.revision_note}".' if task and task.revision_note else ""
+        which = f"task_id={task.task_id}" if task else "that task"
+        return (
+            NextAction.CALL_UPDATE_TASK_PROGRESS.value,
+            "You reported the same result_log this task already had - the one the user "
+            f"rejected.{asked} Redoing the work means the outcome CHANGES. Do the work "
+            f"again so it answers what they said, then call update_task_progress with "
+            f"{which}, status='DONE' and a result_log describing the NEW outcome. If you "
+            "believe the original was already correct, say so to the user instead of "
+            "reporting it as redone.",
+        )
     if code is ErrorCode.COMPLETION_PENDING:
         return (
             NextAction.CALL_REQUEST_USER_APPROVAL.value,

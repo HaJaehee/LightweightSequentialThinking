@@ -1602,6 +1602,26 @@ class PlanningHandlers:
             )
 
         evidence = (args.get("result_log") or "").strip()
+        # A reopened task whose new outcome is byte-for-byte the old one is a structurally
+        # impossible claim, exactly like an evidence-free DONE: the human sent it back
+        # *because* that outcome was not good enough, so it cannot also be the answer. The
+        # server still cannot see whether real work happened - but it can see this.
+        if task.revision_note and task.previous_result_log and evidence:
+            if _normalize_evidence(evidence) == _normalize_evidence(task.previous_result_log):
+                self.store.audit(
+                    "rework_resubmitted_old_evidence",
+                    plan_id=plan.plan_id, task_id=task.task_id, result_log=evidence,
+                )
+                return error(
+                    plan,
+                    ErrorCode.REWORK_NOT_DONE,
+                    f"DONE refused: this is the same result_log task {task.task_id} "
+                    "already had, and the user rejected that outcome.",
+                    notes=notes,
+                    qualify=len(state.active_plans()) > 1,
+                    tasks=plan.tasks_brief(),
+                    progress=plan.progress(),
+                )
         reason = missing_evidence_reason(evidence, task.title, self.config.min_result_log)
         if reason is not None:
             self.store.audit(

@@ -132,6 +132,8 @@ Every error maps to a `next_action` that tells the model how to recover. Full li
 | `PLAN_AMBIGUOUS` | several plans active, no `plan_id` given | `CALL_GET_CURRENT_PLAN` |
 | `GOAL_NOT_MATCHED` | continuing (step>1) but goal matches no plan (drift) | `CALL_PLAN_AND_THINK` (with the exact goal from `active_plans`) |
 | `TASK_NOT_FOUND` | bad `task_id` | `CALL_UPDATE_TASK_PROGRESS` (with valid ids listed) |
+| `MISSING_RESULT_LOG` | `DONE` with evidence that is empty, a bare claim, or the task title | `CALL_UPDATE_TASK_PROGRESS` |
+| `REWORK_NOT_DONE` | a reopened task reported `DONE` with the very outcome the user rejected | `CALL_UPDATE_TASK_PROGRESS` (quoting what they asked for) |
 | `INTERNAL_ERROR` | something unexpected | `CALL_GET_CURRENT_PLAN` (resync) |
 
 ## Input leniency (invisible to the model)

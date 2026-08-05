@@ -206,6 +206,19 @@ from both surfaces. `previous_result_log` had the same split (text report only),
 now show the request, the old output and the new one together. Defect
 [D18](09-defects-and-lessons.md#d18).
 
+### 1.13.2 — the rework state, probed adversarially
+"Will a small model really only touch the task that was sent back?" is not answered by a scripted
+run where the agent behaves. So the rework state was driven by a model that ignores every hint.
+Most routes were already closed: an accepted `DONE` task cannot be restarted or overwritten
+(idempotent, redirects to the reopened one), and `plan_and_think` short-circuits on an
+approved/running plan — *"already approved and running"* — so neither `task_list` nor
+`task_updates` can reach the task list or its evidence. One route was open: reporting the
+reopened task `DONE` with the very `result_log` the user had just rejected, which is the cheapest
+continuation available and now returns `REWORK_NOT_DONE`. The enforcement/instruction split is
+written down in [06](06-human-in-the-loop.md#rework-1130), including the row that says a model
+which does no work but writes a plausible new outcome is **not** detectable — that is what the
+completion report is for. Defect [D19](09-defects-and-lessons.md#d19).
+
 ---
 
 ## Git commit ↔ version map

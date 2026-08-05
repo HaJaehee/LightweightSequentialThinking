@@ -175,6 +175,22 @@ This holds when the reopened tasks are **not adjacent**, which is the interestin
 `DONE`, and auto-advance starts it. Ordering still binds in the other direction — reaching for 5
 while 2 is outstanding is redirected back to 2, and a bare `DONE` on 5 is `TASK_NOT_STARTED`.
 
+**What the model cannot do, whatever the hint says.** The hint is instruction; these are
+enforcement, and they are what actually answers "will a small model really touch only the task
+that was sent back?":
+
+| the model tries | what happens |
+|---|---|
+| start or re-finish an accepted `DONE` task | idempotent no-op; the reply redirects to the reopened task and its `result_log` is not overwritten |
+| `plan_and_think` with a new `task_list` | short-circuits — *"This plan is already approved and running"* — the task list and every `result_log` are untouched (`EXECUTABLE_PLAN_STATUSES` guard) |
+| `task_updates` to retitle something | same short-circuit; no `pending_revision` exists during a rework |
+| ask for approval again, or self-report `APPROVED` | the plan is `IN_EXECUTION`, not awaiting anything; `_approve` refuses and the status does not move |
+| report the reopened task `DONE` with the outcome the user just rejected | `REWORK_NOT_DONE` (1.13.2) — the human sent it back *because* that outcome was wrong, so it cannot also be the answer |
+| do no real work but write a plausible new `result_log` | **not detectable.** The server never sees the work. This is what the completion report is for, and why the page shows `이전 결과` beside the new one |
+
+The last row is the honest boundary of the whole design: the server enforces structure, the human
+checks substance. Everything above only exists to make sure the human is shown the right thing.
+
 **Keeping the request in front of the model.** `_status_action` leads the hint with the human's
 literal sentence, forbids re-planning, and names the tasks that must not be touched;
 `_rework_suffix` repeats it in `message` wherever a task is handed over — including the

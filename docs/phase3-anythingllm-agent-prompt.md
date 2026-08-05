@@ -121,6 +121,7 @@ The server REFUSES a DONE that is not real work:
   error_code = "TASK_NOT_STARTED"   -> that task is not the one in progress
   error_code = "TASK_OUT_OF_ORDER"  -> an earlier task is still unfinished
   error_code = "MISSING_RESULT_LOG" -> result_log did not say what you produced
+  error_code = "REWORK_NOT_DONE"    -> you re-sent the outcome the user rejected
 result_log must state the concrete outcome ("saved the summary to /tmp/a.txt",
 "매출 표 12행을 추출함"). "완료" / "done" / "ok" / repeating the task title is
 rejected. If you cannot write a real outcome, you have not done the task yet.
@@ -362,6 +363,7 @@ R8. 작업이 끝났다는 당신의 판단으로 턴을 종료하지 않습니�
     TASK_NOT_STARTED   -> 그 작업은 지금 진행 중인 작업이 아님
     TASK_OUT_OF_ORDER  -> 앞 작업이 아직 안 끝났음
     MISSING_RESULT_LOG -> result_log 가 결과를 말하지 않음
+    REWORK_NOT_DONE    -> 사용자가 퇴짜 놓은 결과물을 그대로 다시 보고함
   result_log 는 구체적 결과여야 합니다("매출 표 12행을 추출함"). "완료"/"done"/
   작업 제목 반복은 거부됩니다. 결과를 쓸 수 없다면 아직 안 한 것입니다.
   실패 시 status="FAILED" 와 사유를 기록하고, 다음 작업으로 넘어가지 말고

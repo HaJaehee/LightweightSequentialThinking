@@ -1,11 +1,12 @@
 # 09 · Defects and Lessons
 
-The 18 real defects found while hardening the server, each with root cause, symptom, and fix.
+The 19 real defects found while hardening the server, each with root cause, symptom, and fix.
 **This is the highest-value page for predicting where the next bug is.** Every one lived in a
 place that had no test, and several were *silent* — the server reported success while losing
-data or disarming the safety gate. The last two (D16, D17) were found in *use* rather than by
-testing, and both were the same shape: a state the protocol could reach but had no instruction
-for.
+data or disarming the safety gate. D16 and D17 were found in *use* rather than by testing, and
+both were the same shape: a state the protocol could reach but had no instruction for. D18 and
+D19 came from *looking at the running system* — one by reading the page a human decides on,
+one by scripting a model that ignores every hint.
 
 The meta-lesson, stated once: **a green test suite over untested seams means nothing.** The way
 these were found was to write a test asserting a *guarantee* (not the current output) for each
@@ -295,6 +296,28 @@ was green; none of them said "a human can read this".
 **Lesson:** a truncation is a lie about your own data, and it is told to whichever audience you
 were not picturing. When one serializer feeds both a model and a person, the person's constraints
 win — they cannot ask a follow-up question.
+
+<a id="d19"></a>
+## D19 — A rework could be "finished" by resubmitting the rejected outcome (1.13.2)
+**Symptom:** none in the field — found by scripting a model that ignores every hint and seeing
+what the server physically stops. Most routes were already closed (see the table in
+[06](06-human-in-the-loop.md#rework-1130)): an accepted `DONE` task cannot be restarted or
+overwritten, and `plan_and_think` short-circuits on an approved/running plan, so neither a fresh
+`task_list` nor `task_updates` can reach the task list or its evidence.
+**The one open route:** report the reopened task `DONE` with the *same* `result_log` it already
+had. Accepted, plan moves to `AWAITING_COMPLETION`, and the human is shown a "reworked" task
+whose outcome is identical to the one they rejected a minute earlier. For a weak model this is
+the cheapest possible continuation — the text is right there in `previous_result_log`.
+**Fix:** `REWORK_NOT_DONE`. A reopened task (`revision_note` set) reporting evidence that
+normalizes equal to its `previous_result_log` is refused, with a hint that quotes what the user
+actually asked for and adds the honest alternative — *"if you believe the original was already
+correct, say so to the user instead of reporting it as redone."* Matching is on normalized text,
+so whitespace or case cannot launder it. Scoped to reopened tasks: an ordinary plan has no
+rejected outcome, and two tasks that legitimately produce the same sentence must still pass.
+**Lesson:** adding a field for the model to read (`previous_result_log`, 1.13.0) also hands it
+the perfect forgery. Every piece of context you give a weak model to help it do the work is
+equally a way to *look* like it did the work — so when you add one, ask what the laziest
+possible use of it would be, and close that first.
 
 ## Where the next bug probably is
 
