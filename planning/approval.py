@@ -371,6 +371,9 @@ button:disabled{opacity:.5;cursor:default}
 .ev{font-size:.86rem;opacity:.75;margin:.25rem 0 0 1.95em;line-height:1.55;
     white-space:pre-wrap;word-break:break-word}
 .ev.none{opacity:.45;font-style:italic}
+/* Superseded output on a row the human sent back. Muted rather than struck through -
+   a struck-out sentence is unreadable, and this one has to be compared, not dismissed. */
+.ev.old{opacity:.45}
 /* Per-task comment boxes are collapsed by default. Nine open textareas turn a task list
    into a form; the plan itself is what the human came here to read. */
 textarea.tc{display:none;min-height:2.4rem;margin:.4rem 0 0 1.95em;width:calc(100% - 1.95em);
@@ -510,6 +513,10 @@ function taskRows(d){
     if(t.previous_title)row+='<div class="was">'+esc(t.previous_title)+'</div>';
     if(t.revision_note)row+='<div class="note">\\u21BB 요청하신 내용: '+
       esc(t.revision_note)+'</div>';
+    // What the task used to produce, for a row the human already sent back once. The
+    // request alone shows what was asked; only this shows whether it was answered.
+    if(done&&t.previous_result_log)
+      row+='<div class="ev old">이전 결과: '+esc(t.previous_result_log)+'</div>';
     // The claim the human is judging. Without it a completion report is a task list
     // that says nothing about whether the work happened.
     if(done){

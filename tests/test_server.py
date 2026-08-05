@@ -2827,6 +2827,13 @@ class TestCompletionPageTemplate(unittest.TestCase):
         self.assertIn("t.result_log", _PAGE)
         self.assertIn("증거 기록 없음", _PAGE)
 
+    def test_a_row_sent_back_shows_the_request_and_the_old_output(self):
+        """Both surfaces must agree. The request alone shows what was asked; only the
+        previous output shows whether the new one answers it."""
+        self.assertIn("요청하신 내용", _PAGE)
+        self.assertIn("t.previous_result_log", _PAGE)
+        self.assertIn("이전 결과", _PAGE)
+
     def test_the_whole_plan_escape_hatch_survives(self):
         self.assertIn("계획 자체를 다시 세우기", _PAGE)
 
