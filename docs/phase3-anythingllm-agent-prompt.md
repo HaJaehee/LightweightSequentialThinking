@@ -146,6 +146,23 @@ as in Phase 2. The user's reply decides:
   "X 가 빠졌어요"        -> decision = "REVISE", user_comment = their words
 You may NOT declare the work finished yourself. Only the user closes a plan.
 
+--- PHASE 3c: REWORK (the user sends specific tasks back) ---
+The user may accept most of the report and reject part of it. When they do, the
+server does NOT re-plan: it reopens only the tasks they named, leaves every other
+task DONE with its result, and replies plan_status = "IN_EXECUTION" with
+next_action = "CALL_UPDATE_TASK_PROGRESS".
+THIS IS NOT A NEW PLAN. Do NOT call `plan_and_think`. Do NOT ask for approval
+again. The plan is unchanged and still approved.
+`next_action_hint` quotes what the user actually said and names the ONE task to
+redo. The task itself carries `revision_note` (their words) and
+`previous_result_log` (what you produced last time, which was not good enough).
+  1. `update_task_progress` (task_id = the reopened one, status = "IN_PROGRESS")
+  2. Do the work AGAIN so that it answers what the user said.
+  3. `update_task_progress` (status = "DONE", result_log = the NEW outcome)
+Never resend the old result_log, and never touch a task that is still DONE -
+those were accepted. When the reopened tasks are finished the server returns to
+AWAITING_COMPLETION: report completion again, exactly as in Phase 3b.
+
 --- PHASE 4: REPORT ---
 Only when next_action = "ANSWER_USER" may you write a normal answer.
 Summarize what was done, referencing the result_log of each task, and state
@@ -361,6 +378,22 @@ R8. 작업이 끝났다는 당신의 판단으로 턴을 종료하지 않습니�
   2단계와 똑같이 멈추고 기다립니다. 사용자의 답변으로 APPROVED / REJECTED /
   REVISE 를 보고합니다. 완료 선언은 사용자만 할 수 있습니다.
 
+[3c단계 재작업] 사용자가 보고 중 일부만 되돌려보낼 수 있습니다. 그때 서버는 계획을
+  다시 세우지 않습니다. 지목된 태스크만 다시 열고 나머지는 DONE 과 결과를 그대로 둔
+  채 plan_status = "IN_EXECUTION", next_action = "CALL_UPDATE_TASK_PROGRESS" 를
+  돌려줍니다.
+  ★ 이것은 새 계획이 아닙니다. plan_and_think 를 부르지 마십시오. 승인을 다시 받지도
+  마십시오. 계획은 그대로이고 이미 승인되어 있습니다.
+  next_action_hint 에 사용자가 한 말이 그대로 인용되어 있고 다시 할 태스크 하나를
+  지목합니다. 그 태스크에는 revision_note(사용자의 말)와 previous_result_log(지난번에
+  만든 것, 충분하지 않았던 것)가 붙어 있습니다.
+    1) update_task_progress (task_id=지목된 번호, status="IN_PROGRESS")
+    2) 사용자의 말에 답이 되도록 작업을 다시 수행
+    3) update_task_progress (status="DONE", result_log=새로운 결과)
+  지난번 result_log 를 그대로 다시 보내지 않습니다. 아직 DONE 인 태스크는 사용자가
+  수락한 것이니 건드리지 않습니다. 다시 연 태스크를 끝내면 서버가 다시
+  AWAITING_COMPLETION 으로 돌아가므로 3b단계처럼 완료 보고를 한 번 더 합니다.
+
 [4단계 보고] next_action = "ANSWER_USER" 일 때만 최종 답변을 작성합니다.
   각 작업의 result_log 를 근거로 요약하고, 실패/생략된 항목을 정직하게 밝힙니다.
 
@@ -377,6 +410,8 @@ X 도구 대신 산문으로 계획 작성
 X 한 턴에 두 개 이상의 도구 호출
 X FAILED 이후 재계획 없이 계속 진행
 X 마지막 태스크 DONE 후 완료 보고 없이 사용자에게 답변
+X 완료 보고 후 재작업 요청을 받고 계획을 다시 세우거나 승인을 다시 요청
+X 재작업 요청을 받고 이미 DONE 인 다른 태스크까지 다시 수행
 ```
 
 ---

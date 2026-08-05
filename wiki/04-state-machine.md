@@ -49,6 +49,12 @@ finished work — see below.
 | `APPROVED` | `update_task_progress` IN_PROGRESS | `IN_EXECUTION` | — |
 | `IN_EXECUTION` | `update_task_progress` DONE (not last) | `IN_EXECUTION`, next task auto-started `IN_PROGRESS` | — |
 | `IN_EXECUTION` | `update_task_progress` DONE (last) | `AWAITING_COMPLETION` | — |
+| `AWAITING_COMPLETION` | `approval` APPROVED | `COMPLETED` | — |
+| `AWAITING_COMPLETION` | `approval` REVISE (scope `TASKS`) | **`IN_EXECUTION`**, only the named tasks reopened — *no re-approval* (1.13.0) | — |
+| `AWAITING_COMPLETION` | `approval` REVISE (scope `PLAN`) | `DRAFTING` + `rework_from_completion` | — |
+| `DRAFTING` + `rework_from_completion` | `plan_and_think` (final+`task_list`) | `AWAITING_APPROVAL`, surviving tasks keep `DONE` + `result_log` | — |
+| `AWAITING_APPROVAL` | `approval` APPROVED **when every task is already DONE** | `AWAITING_COMPLETION`, not `APPROVED` (1.13.0) | — |
+| `AWAITING_COMPLETION` | `update_task_progress` | *(no change)* | `COMPLETION_PENDING` |
 | `IN_EXECUTION` | `update_task_progress` FAILED | `BLOCKED` | — |
 | `BLOCKED` | `plan_and_think` | `DRAFTING` (same plan_id) | — |
 | `BLOCKED` | `update_task_progress` on another task | *(no change)* | `PLAN_BLOCKED` |
@@ -101,7 +107,7 @@ likely to do it.
 **And `COMPLETED` is no longer self-awarded.** When the last task is `DONE` the plan enters
 `AWAITING_COMPLETION`; the model must call `request_user_approval(ASK_USER)`, which shows the
 human a **completion report** of every task with its `result_log`. Only the human's `APPROVED`
-closes the plan (`REJECTED` → `CANCELLED`, `REVISE` → `DRAFTING` with their comment). This is
+closes the plan (`REJECTED` → `CANCELLED`). This is
 the only check that catches invented `result_log` text, since the server cannot observe work.
 The approval fingerprint covers each task's status and evidence, so a report cannot be
 rewritten after the human saw it. Set `PLANNING_MCP_COMPLETION_APPROVAL=false` to go straight
@@ -109,6 +115,22 @@ to `COMPLETED` as before.
 
 Anti-abandonment: while any task remains, every `next_action_hint` names how many are left and
 says not to tell the user the work is finished.
+
+**`REVISE` on a completion report is rework, not re-planning (1.13.0).** The human is not
+disputing the task list there — they approved it and it has not changed — they are saying that
+what came out of specific tasks is not good enough. So the named tasks go back to `PENDING` with
+the human's sentence on them (`revision_note`) and their old output kept (`previous_result_log`),
+every other task keeps its `DONE` and its evidence, and the plan returns to `IN_EXECUTION`
+**without a second approval**. Nothing about ordering changes, so `can_start_task`,
+`unfinished_before`, `current_task`, `_auto_advance` and `all_done` all work unmodified: a
+reopened task is simply the next `PENDING` one, and finishing it walks back into
+`AWAITING_COMPLETION` for a fresh report.
+
+Treating that as a redraft is what defect [D17](09-defects-and-lessons.md#d17) was: `DRAFTING`
+with every task `DONE`, the generic re-plan hint, and — because finalizing replaces `plan.tasks`
+— every `result_log` deleted. The whole-plan checkbox still exists for add/delete/reorder, which
+genuinely needs a new plan and a new approval, but it now carries evidence across the redraft for
+tasks whose title survives (`_carry_evidence`, matched with `title_key`).
 
 ## Two time-based / version-based guards (added after real bugs)
 

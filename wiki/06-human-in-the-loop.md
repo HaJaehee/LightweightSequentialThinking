@@ -76,7 +76,11 @@ Blocking approval adds a third, physical layer on top of these.
 - A **PLAN** request renders a header — `계획 승인 요청 · <plan_id>`, the labelled 목표, and the
   model's 개요 (`plan_summary`) — then the task list as rows, each with a collapsed comment box
   behind an [의견] button (see [Per-task review](#per-task-review-19x)). A **COMPLETION** request
-  keeps the original single `<pre>` + one comment box.
+  (1.13.0) uses the same rows under a `완료 확인` header, each showing that task's `result_log`
+  (or `(증거 기록 없음)`) — the claim the human is actually judging — behind a [다시 작업] button.
+  The `DONE` badge is suppressed there, since every task carries it and the evidence line already
+  says so. Only an entry with **no phase at all** — written by an older process during a rolling
+  restart — still falls back to the original single `<pre>` + one comment box.
 - `plan_summary` travels as **its own field** on the request, not only inside the pre-rendered
   `display`. It briefly did not: when the page stopped rendering `display` for PLAN requests, the
   overview went with it and the human was left judging a bare task list. A field the page can
@@ -124,9 +128,9 @@ not touch. `plan_and_think` then rewrites only the flagged tasks: **task ids, po
 `result_log` of untouched tasks all survive.** Unflagged edits are dropped with a note.
 
 **Boundaries, and why.**
-- **The completion phase is excluded.** A COMPLETION request asks whether work already done is
-  real; rewriting one line of the plan does not answer that. `record_decision` forces `scope =
-  PLAN` for any non-PLAN entry, so an older or hand-crafted client cannot get around it.
+- **The completion phase means something different** — see [Rework](#rework-1130) below. Until
+  1.13.0 it was excluded outright, and that exclusion was defect
+  [D17](09-defects-and-lessons.md#d17).
 - **Add / delete / reorder are excluded.** They renumber `task_id`, which breaks the ordering
   invariants in `can_start_task` / `unfinished_before` and any id the model is holding. Those go
   through 계획 전체 재작성; the checkbox label says so.
@@ -140,6 +144,37 @@ not touch. `plan_and_think` then rewrites only the flagged tasks: **task ids, po
 **Mixed versions.** An entry published by an older process has no `phase`; `/api/pending` returns
 it as `null` rather than guessing `PLAN`, and the page falls back to the original single-comment
 form. A decided entry with no `scope` reads as `PLAN`. Both directions degrade to 1.8 behaviour.
+
+## Rework (1.13.0)
+
+The same per-task machinery, pointed at finished work. On a **COMPLETION** request "these tasks
+only" does not mean *rewrite their wording*, it means **do them again** — so the scope value is
+identical and the *handler* reads it against `plan.status`. `_mutate_no` is the one place that
+decision is made.
+
+| what the human does | result |
+|---|---|
+| comments on task 2, clicks `다시 작업 요청 · 2번만` | task 2 → `PENDING` + `revision_note`, its old output kept as `previous_result_log`; tasks 1, 3 keep `DONE` + `result_log`; plan → `IN_EXECUTION`, **no re-approval** |
+| ticks `☐ 계획 자체를 다시 세우기` | plan → `DRAFTING` + `rework_from_completion`; the redraft carries evidence for tasks whose title survives, and *does* need a new approval |
+| clicks 거절 | `CANCELLED`, unchanged |
+
+**Why no second approval.** The task list did not change — re-approving it is ceremony that
+costs a weak model two turns and a chance to derail, and the rework is verified anyway by the
+next completion report. What the human said is not a withdrawal of their approval; it is an
+order about output.
+
+**Why the execution machinery needed no changes.** Reopening task 3 leaves 1–2 `DONE`, so
+`can_start_task(3)` passes, `unfinished_before(3)` is empty, `current_task()` returns 3, and
+finishing it walks into `all_done()` → `AWAITING_COMPLETION` → a fresh report. The report marks
+the reworked rows with `↻ 요청하신 내용` and `이전 결과`, so the human checks their own request in
+one line.
+
+**Keeping the request in front of the model.** `_status_action` leads the hint with the human's
+literal sentence, forbids re-planning, and names the tasks that must not be touched;
+`_rework_suffix` repeats it in `message` wherever a task is handed over — including the
+auto-advance into a *second* reworked task, which is the only thing the model reads at that
+moment. A request that appears once, three turns back, is a request a small model has already
+lost.
 
 ## Config knobs
 

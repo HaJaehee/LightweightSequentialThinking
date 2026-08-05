@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # otherwise drown the test output. The tests assert on responses and the audit log instead.
 logging.disable(logging.CRITICAL)
 
-from planning.approval import ApprovalServer, ApprovalStore, Verdict  # noqa: E402
+from planning.approval import _PAGE, ApprovalServer, ApprovalStore, Verdict  # noqa: E402
 from planning.config import SDK_REQUEST_TIMEOUT_SEC, Config  # noqa: E402
 from planning.filelock import exclusive  # noqa: E402
 from planning.handlers import PlanningHandlers  # noqa: E402
@@ -36,7 +36,7 @@ from planning.leniency import UNMATCHED_TITLES_KEY, normalize  # noqa: E402
 from planning.protocol import McpProtocol  # noqa: E402
 from planning.responses import render_plan_for_user  # noqa: E402
 from planning.schemas import TOOL_DEFINITIONS, build_tool_definitions  # noqa: E402
-from planning.store import Store  # noqa: E402
+from planning.store import Store, title_key  # noqa: E402
 
 REQUIRED_FIELDS = ("ok", "plan_status", "next_action", "next_action_hint")
 
@@ -1208,9 +1208,14 @@ class FakeApprovalUI:
         self.live["comment"] = comment
 
     def _verdict(self, record):
-        # A completion request can never carry a per-task scope; the real store enforces
-        # that in record_decision, and the double must not be more permissive.
-        scope = self.scope if record.get("phase") == "PLAN" else "PLAN"
+        # Both real phases may carry a per-task scope; an entry with no phase at all
+        # cannot. The real store enforces exactly that in record_decision, and the
+        # double must be neither more nor less permissive.
+        scope = (
+            self.scope
+            if record.get("phase") in ("PLAN", "COMPLETION")
+            else "PLAN"
+        )
         return Verdict(
             decision=record["decision"],
             comment=record.get("comment", "") or "",
@@ -2063,6 +2068,25 @@ class TargetedRevisionFixture(HandlerTestCase):
             "goal": "분기 보고서 정리", "thought": "고쳤습니다", "step_number": 2,
             "total_steps": 2, "need_more_thinking": False, "task_updates": updates})
 
+    def run_all(self, h, count=3):
+        """Execute every task the way the server demands: start, then finish with evidence."""
+        for task_id in range(1, count + 1):
+            h.dispatch("update_task_progress", {"task_id": task_id, "status": "IN_PROGRESS"})
+            h.dispatch("update_task_progress", {
+                "task_id": task_id, "status": "DONE",
+                "result_log": f"태스크 {task_id} 결과를 /tmp/out{task_id}.txt 에 저장"})
+
+    def reported(self, ui=None, tasks=None):
+        """Drive a plan to APPROVED, run every task, and stop at the completion report."""
+        ui = ui if ui is not None else FakeApprovalUI("APPROVED")
+        h = self.blocking(ui)
+        self.draft(h, tasks)
+        res = h.dispatch(
+            "request_user_approval", {"decision": "ASK_USER", "plan_summary": "요약"}
+        )
+        self.run_all(h, len(tasks or self.TASKS))
+        return h, res
+
     def plan(self, h):
         return h.store.load().active_plan
 
@@ -2283,30 +2307,250 @@ class TestTargetedRevision(TargetedRevisionFixture):
         self.assertIsNone(task.revision_note)
         self.assertIsNone(task.previous_title)
 
-    # ---- the completion phase is deliberately excluded -------------------
     def test_completion_phase_is_published_as_such(self):
-        ui = FakeApprovalUI("APPROVED")
-        h = self.blocking(ui)
-        self.draft(h)
-        h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "요약"})
-        for task_id in (1, 2, 3):
-            h.dispatch("update_task_progress", {"task_id": task_id, "status": "IN_PROGRESS"})
-            h.dispatch("update_task_progress", {
-                "task_id": task_id, "status": "DONE",
-                "result_log": f"태스크 {task_id} 결과를 /tmp/out{task_id}.txt 에 저장"})
-        self.assertEqual(self.plan(h).plan_status, "AWAITING_COMPLETION")
+        h, _ = self.reported()
+        h.approval_ui.decision = None  # capture the report instead of answering it
+        h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "완료 보고"})
+        self.assertEqual(h.approval_ui.opened[-1]["phase"], "COMPLETION")
 
-        # The human comments per task anyway; the phase must overrule it.
-        ui.decision = "REVISE"
-        ui.scope = "TASKS"
-        ui.task_comments = {"2": "이건 실제로 안 된 것 같은데요"}
+
+class TestCompletionRework(TargetedRevisionFixture):
+    """Sending finished work back, task by task.
+
+    The failure this replaces: a completion-report REVISE was always a whole-plan
+    redraft, so the model was handed a DRAFTING plan whose tasks were all DONE, told
+    only "re-plan", and then - because finalizing replaces the task list - lost every
+    result_log it had written. It answered by redoing the entire plan, or by inventing
+    evidence to get past the DONE guards. Neither is the fix the human asked for.
+    """
+
+    def sent_back(self, comments, comment="", scope="TASKS", tasks=None):
+        """...then have the human send specific tasks back from that report."""
+        ui = FakeApprovalUI("APPROVED")
+        h, _ = self.reported(ui, tasks)
+        self.assertEqual(self.plan(h).plan_status, "AWAITING_COMPLETION")
+        ui.decision, ui.comment = "REVISE", comment
+        ui.scope, ui.task_comments = scope, comments
         res = h.dispatch(
             "request_user_approval", {"decision": "ASK_USER", "plan_summary": "완료 보고"}
         )
-        self.assertEqual(ui.opened[-1]["phase"], "COMPLETION")
-        self.assertEqual(res["revision_scope"], "PLAN")
-        self.assertIsNone(self.plan(h).pending_revision)
+        return h, res
+
+    # ---- the mutation ---------------------------------------------------
+    def test_only_the_named_task_reopens(self):
+        h, res = self.sent_back({"2": "표가 3개 빠졌어요"})
+        self.assertEqual(res["plan_status"], "IN_EXECUTION")
+        self.assertEqual(res["reopened_tasks"], [2])
+        plan = self.plan(h)
+        reopened = plan.get_task(2)
+        self.assertEqual(reopened.status, "PENDING")
+        self.assertEqual(reopened.revision_note, "표가 3개 빠졌어요")
+        self.assertIsNone(reopened.result_log)
+        self.assertIsNone(reopened.started_at)
+        for task_id in (1, 3):
+            kept = plan.get_task(task_id)
+            self.assertEqual(kept.status, "DONE", f"task {task_id} lost its status")
+            self.assertIn(f"/tmp/out{task_id}.txt", kept.result_log or "")
+
+    def test_the_previous_output_is_kept_so_the_redo_is_not_blind(self):
+        h, res = self.sent_back({"2": "표가 3개 빠졌어요"})
+        self.assertEqual(self.plan(h).get_task(2).previous_result_log,
+                         "태스크 2 결과를 /tmp/out2.txt 에 저장")
+        brief = next(t for t in res["tasks"] if t["task_id"] == 2)
+        self.assertIn("previous_result_log", brief)
+
+    def test_the_plan_is_not_sent_back_for_approval(self):
+        """The task list did not change, so re-approving it is pure ceremony - and a
+        weak model spends two turns and a chance to derail on every round of it."""
+        h, res = self.sent_back({"2": "표가 3개 빠졌어요"})
+        self.assertEqual(res["next_action"], "CALL_UPDATE_TASK_PROGRESS")
+        self.assertNotEqual(res["plan_status"], "AWAITING_APPROVAL")
+        self.assertNotEqual(res["plan_status"], "DRAFTING")
+        # And execution really is open, not merely described as open.
+        started = h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
+        self.assertTrue(started["ok"], started.get("error_code"))
+
+    def test_the_task_list_itself_is_untouched(self):
+        h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})
+        plan = self.plan(h)
+        self.assertEqual([t.title for t in plan.tasks], self.TASKS)
+        self.assertIsNone(plan.pending_revision)
+
+    def test_it_is_audited_as_rework_not_as_a_revision(self):
+        self.sent_back({"2": "표가 3개 빠졌어요"}, comment="표를 다시 봐주세요")
+        audit = self.audit()
+        self.assertIn("rework_requested", audit)
+        self.assertIn("표가 3개 빠졌어요", audit)
+
+    # ---- what the model is told -----------------------------------------
+    def test_the_hint_carries_the_users_own_words(self):
+        """A weak model loses a string that appeared once, three turns ago. The request
+        has to live in the hint until it is answered."""
+        _, res = self.sent_back({"2": "표가 3개 빠졌어요"})
+        hint = res["next_action_hint"]
+        self.assertIn("표가 3개 빠졌어요", hint)
+        self.assertIn("task_id=2", hint)
+        self.assertIn("Redo ONLY this task", hint)
+
+    def test_the_hint_forbids_re_planning_and_protects_accepted_work(self):
+        _, res = self.sent_back({"2": "표가 3개 빠졌어요"})
+        hint = res["next_action_hint"]
+        self.assertIn("Do not re-plan", hint)
+        self.assertIn("do NOT redo", hint)
+        for kept in ("1", "3"):
+            self.assertIn(kept, hint.split("were accepted")[0])
+
+    def test_the_request_survives_into_the_in_progress_hint(self):
+        h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})
+        res = h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
+        self.assertIn("표가 3개 빠졌어요", res["next_action_hint"])
+
+    def test_a_second_reopened_task_keeps_its_request_when_reached(self):
+        """Task 3 is reached by finishing task 2; the message announcing that is the
+        only thing the model reads at that moment."""
+        h, _ = self.sent_back({"2": "표를 다시", "3": "요약이 너무 짧아요"})
+        h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
+        res = h.dispatch("update_task_progress", {
+            "task_id": 2, "status": "DONE", "result_log": "표 3개를 모두 넣어 다시 저장함"})
+        self.assertIn("요약이 너무 짧아요", res["message"])
+        self.assertIn("요약이 너무 짧아요", res["next_action_hint"])
+
+    # ---- the loop closes ------------------------------------------------
+    def test_redoing_the_task_returns_to_the_completion_report(self):
+        h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})
+        h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
+        res = h.dispatch("update_task_progress", {
+            "task_id": 2, "status": "DONE", "result_log": "표 3개를 모두 넣어 다시 저장함"})
+        self.assertEqual(res["plan_status"], "AWAITING_COMPLETION")
+        self.assertEqual(res["progress"], "3/3 done")
+
+    def test_the_new_report_shows_what_was_asked_and_what_changed(self):
+        h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})
+        h.approval_ui.decision = None  # capture the report instead of answering it
+        h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
+        h.dispatch("update_task_progress", {
+            "task_id": 2, "status": "DONE", "result_log": "표 3개를 모두 넣어 다시 저장함"})
+        res = h.dispatch(
+            "request_user_approval", {"decision": "ASK_USER", "plan_summary": "다시 했습니다"}
+        )
+        report = res["display_to_user"]
+        self.assertIn("요청하신 내용: 표가 3개 빠졌어요", report)
+        self.assertIn("이전 결과: 태스크 2 결과를 /tmp/out2.txt 에 저장", report)
+        self.assertIn("표 3개를 모두 넣어 다시 저장함", report)
+
+    def test_approving_the_second_report_completes_the_plan(self):
+        h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})
+        h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
+        h.dispatch("update_task_progress", {
+            "task_id": 2, "status": "DONE", "result_log": "표 3개를 모두 넣어 다시 저장함"})
+        h.approval_ui.decision = "APPROVED"
+        res = h.dispatch(
+            "request_user_approval", {"decision": "ASK_USER", "plan_summary": "다시 했습니다"}
+        )
+        self.assertEqual(res["plan_status"], "COMPLETED")
+        # A completed plan is no longer active, so it is read back by id.
+        finished = h.store.load().plans[res["plan_id"]]
+        self.assertIsNone(finished.get_task(2).revision_note)
+        self.assertIsNone(finished.get_task(2).previous_result_log)
+
+    # ---- the whole-plan escape hatch still exists ------------------------
+    def test_the_whole_plan_checkbox_still_reopens_planning(self):
+        """'계획 자체를 다시 세우기' is for adding or deleting a task, and that really
+        does need a new plan and a new approval."""
+        _, res = self.sent_back({}, comment="4번 단계가 통째로 빠졌어요", scope="PLAN")
         self.assertEqual(res["plan_status"], "DRAFTING")
+        self.assertEqual(res["next_action"], "CALL_PLAN_AND_THINK")
+
+
+class TestEvidenceSurvivesARedraft(TargetedRevisionFixture):
+    """Part 2: a whole-plan revision asked for from the completion report must not
+    delete work that has already been done. Only that path - an ordinary re-plan after
+    a failure should still drop stale evidence."""
+
+    def redrafted(self, new_tasks, comment="4번이 빠졌어요"):
+        ui = FakeApprovalUI("APPROVED")
+        h, _ = self.reported(ui)
+        ui.decision, ui.comment, ui.scope = "REVISE", comment, "PLAN"
+        h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "완료 보고"})
+        res = h.dispatch("plan_and_think", {
+            "goal": "분기 보고서 정리", "thought": "단계를 추가합니다", "step_number": 2,
+            "total_steps": 2, "need_more_thinking": False, "task_list": new_tasks})
+        return h, res
+
+    def statuses(self, h):
+        return {t.title: t.status for t in self.plan(h).tasks}
+
+    def test_surviving_tasks_keep_their_work(self):
+        h, res = self.redrafted(self.TASKS + ["검수 받기"])
+        self.assertEqual(
+            self.statuses(h),
+            {"보고서 찾기": "DONE", "표 추출": "DONE", "요약 작성": "DONE", "검수 받기": "PENDING"},
+        )
+        self.assertIn("/tmp/out2.txt", self.plan(h).get_task(2).result_log or "")
+        self.assertIn("survived this rewrite", " ".join(res["input_notes"]))
+
+    def test_a_changed_title_is_a_different_task_and_starts_over(self):
+        h, _ = self.redrafted(["보고서 찾기", "표 추출 후 검증", "요약 작성"])
+        self.assertEqual(
+            self.statuses(h),
+            {"보고서 찾기": "DONE", "표 추출 후 검증": "PENDING", "요약 작성": "DONE"},
+        )
+
+    def test_matching_is_lenient_at_the_edges_like_goal_matching(self):
+        """A retyped title differing only in punctuation or spacing is the same task -
+        the same relaxation `goal_key` applies to routing."""
+        h, _ = self.redrafted(["보고서 찾기.", "표  추출 ", " 요약 작성"])
+        self.assertEqual(
+            [t.status for t in self.plan(h).tasks], ["DONE", "DONE", "DONE"]
+        )
+
+    def test_reordering_keeps_the_work_because_matching_is_by_key(self):
+        h, _ = self.redrafted(["요약 작성", "보고서 찾기", "표 추출"])
+        self.assertEqual(self.statuses(h),
+                         {"요약 작성": "DONE", "보고서 찾기": "DONE", "표 추출": "DONE"})
+
+    def test_an_all_done_redraft_goes_back_to_verification_not_to_execution(self):
+        """Everything carried, so approving it must not unlock a plan with nothing left
+        to run and let the model answer without the completion check."""
+        h, _ = self.redrafted(list(self.TASKS))
+        h.approval_ui.decision = "APPROVED"
+        res = h.dispatch(
+            "request_user_approval", {"decision": "ASK_USER", "plan_summary": "그대로입니다"}
+        )
+        self.assertEqual(res["plan_status"], "AWAITING_COMPLETION")
+        self.assertEqual(res["next_action"], "CALL_REQUEST_USER_APPROVAL")
+
+    def test_an_ordinary_replan_still_drops_stale_evidence(self):
+        """Regression guard: the carry-over is scoped to the completion path only."""
+        h = self.blocking(FakeApprovalUI("REVISE", "다시 세워주세요", scope="PLAN"))
+        self.draft(h)
+        h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "요약"})
+        self.assertFalse(self.plan(h).rework_from_completion)
+        h.dispatch("plan_and_think", {
+            "goal": "분기 보고서 정리", "thought": "다시", "step_number": 2, "total_steps": 2,
+            "need_more_thinking": False, "task_list": list(self.TASKS)})
+        self.assertEqual([t.status for t in self.plan(h).tasks],
+                         ["PENDING", "PENDING", "PENDING"])
+
+
+class TestTitleKey(unittest.TestCase):
+    """`title_key` decides whether finished work survives a redraft, so where its
+    leniency stops is a guarantee, not an implementation detail."""
+
+    def test_edges_and_inner_whitespace_are_normalized(self):
+        for variant in ("표 추출", " 표 추출 ", "표 추출.", "표 추출!", "표  추출", "표\t추출"):
+            self.assertEqual(title_key(variant), title_key("표 추출"), variant)
+
+    def test_different_wording_is_a_different_task(self):
+        for other in ("표 추출 후 검증", "표추출", "표 정리", "TABLE 추출"):
+            self.assertNotEqual(title_key(other), title_key("표 추출"), other)
+
+    def test_case_is_significant_just_as_it_is_for_goals(self):
+        self.assertNotEqual(title_key("Extract the table"), title_key("extract the table"))
+
+    def test_empty_input_is_survivable(self):
+        self.assertEqual(title_key(""), "")
+        self.assertEqual(title_key(None), "")
 
 
 class TestRevisionScopeAtTheStore(HandlerTestCase):
@@ -2333,11 +2577,15 @@ class TestRevisionScopeAtTheStore(HandlerTestCase):
         )
         self.assertEqual(s.claim(rid).task_comments, {"3": "실제 의견"})
 
-    def test_completion_request_cannot_carry_a_task_scope(self):
+    def test_completion_request_can_carry_a_task_scope(self):
+        """On a completion report "these tasks only" means redo them, not retitle them -
+        but that reading belongs to the handler. The store just carries it faithfully."""
         s = self.store_for("r3")
         rid = s.publish("plan_a", "g", "d", [], "fp", phase="COMPLETION")
         s.record_decision(rid, "REVISE", "", {"2": "안 된 것 같아요"}, "TASKS")
-        self.assertEqual(s.claim(rid).scope, "PLAN")
+        verdict = s.claim(rid)
+        self.assertEqual(verdict.scope, "TASKS")
+        self.assertEqual(verdict.task_comments, {"2": "안 된 것 같아요"})
 
     def test_entry_without_a_phase_cannot_carry_a_task_scope(self):
         """Written by an older process during a rolling restart; degrade, do not guess."""
@@ -2477,6 +2725,38 @@ class TestPerTaskPageSurface(HandlerTestCase):
             self.assertIn("&quot;", html)
         finally:
             srv.shutdown()
+
+
+class TestCompletionPageTemplate(unittest.TestCase):
+    """The completion report's per-task review, asserted against the template itself.
+
+    No socket: the page is a constant, so these run wherever the suite runs, and they
+    cover the branch that decides whether finished work can be sent back one task at a
+    time at all. The click-through was verified in a real browser.
+    """
+
+    def test_a_completion_report_is_reviewed_task_by_task(self):
+        self.assertIn("d.phase==='PLAN'||d.phase==='COMPLETION'", _PAGE)
+
+    def test_the_phase_is_kept_so_the_two_can_be_labelled_differently(self):
+        self.assertIn("const PHASE={}", _PAGE)
+        self.assertIn("PHASE[d.id]=d.phase", _PAGE)
+
+    def test_one_builder_labels_the_button_everywhere(self):
+        """First render and every relabel must agree, or the button lies about scope."""
+        self.assertIn("function revLabel(", _PAGE)
+        self.assertIn("revLabel(PHASE[id],Object.keys(comments(id)),wholePlan(id))", _PAGE)
+        self.assertIn("revLabel(d.phase,[],false)", _PAGE)
+
+    def test_the_button_asks_for_rework_not_for_a_rewrite(self):
+        self.assertIn("다시 작업 요청", _PAGE)
+
+    def test_the_evidence_is_what_the_human_judges(self):
+        self.assertIn("t.result_log", _PAGE)
+        self.assertIn("증거 기록 없음", _PAGE)
+
+    def test_the_whole_plan_escape_hatch_survives(self):
+        self.assertIn("계획 자체를 다시 세우기", _PAGE)
 
 
 class TestPlanStateEdges(HandlerTestCase):

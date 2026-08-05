@@ -13,6 +13,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,23 @@ _GOAL_TRIM = " \t\r\n.!?,;:。！？．…"
 def goal_key(goal: str) -> str:
     """Normalized key for goal-based routing. Conservative: only trims edges."""
     return (goal or "").strip().strip(_GOAL_TRIM).strip()
+
+
+_TITLE_COLLAPSE = re.compile(r"\s+")
+
+
+def title_key(title: str) -> str:
+    """Normalized key for carrying evidence across a re-plan.
+
+    Same philosophy as `goal_key`: trim the edges (plus collapse internal whitespace,
+    because a task title gets retyped where a goal gets echoed) and leave wording and
+    case alone. Deliberately NOT fuzzy, because the two failure modes are not
+    symmetric: failing to match only costs a redo, while matching two different tasks
+    would let a task that must be redone keep a stale result_log and be skipped - the
+    exact failure the evidence guards exist to prevent. List numbering ("1. ", "- ")
+    is already stripped upstream by `leniency._clean_title`, so it never reaches here.
+    """
+    return _TITLE_COLLAPSE.sub(" ", (title or "").strip().strip(_GOAL_TRIM)).strip()
 
 
 STATE_FILENAME = "plan_state.json"

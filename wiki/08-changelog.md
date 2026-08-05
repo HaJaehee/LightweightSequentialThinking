@@ -175,6 +175,23 @@ had actually been steering by was one no rule acknowledged. Both variants now na
 Phase 3b spells out that the last DONE is not an ending. This half only takes effect when the
 prompt is repasted into AnythingLLM; the server-side message alone does not deliver it.
 
+### 1.13.0 — rework: a completion report can be sent back task by task
+The loop worked until the human pressed **수정 요청** on the *completion report*; then a small
+model came apart. It was not the model. A completion revision was always a whole-plan redraft,
+which sent the plan back to `DRAFTING` with every task still `DONE`, gave the generic "re-plan"
+hint with the human's actual sentence in no instruction field at all, and then — because
+finalizing replaces `plan.tasks` — **deleted every `result_log` the model had written**. The only
+remaining move was to redo the entire plan under the ordering and evidence guards.
+
+Now the completion page offers per-task comments, and `AWAITING_COMPLETION` + task comments means
+**redo those tasks**, not rewrite their titles: only the named tasks reopen (keeping
+`previous_result_log` so the redo is not blind), every other task keeps its `DONE` and its
+evidence, and the plan returns to `IN_EXECUTION` **without re-approval** — the task list never
+changed. The hint leads with the human's own words and repeats them wherever the task is handed
+over. The whole-plan escape hatch stays for add/delete/reorder and now carries evidence across
+the redraft, matched with `title_key` (the `goal_key` relaxation, applied to titles). Defect
+[D17](09-defects-and-lessons.md#d17).
+
 ---
 
 ## Git commit ↔ version map

@@ -116,6 +116,11 @@ class Task:
     # human re-reads one line instead of the whole plan. Cleared once approved.
     revision_note: str | None = None
     previous_title: str | None = None
+    # What this task produced before the human sent it back for rework. Reopening a task
+    # clears result_log (the old outcome is no longer the outcome), but a model told to
+    # redo work with no record of what it did the first time is working blind, and a
+    # small one will simply produce something unrelated. Kept until the plan completes.
+    previous_result_log: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -127,6 +132,7 @@ class Task:
             "finished_at": self.finished_at,
             "revision_note": self.revision_note,
             "previous_title": self.previous_title,
+            "previous_result_log": self.previous_result_log,
         }
 
     @classmethod
@@ -140,24 +146,33 @@ class Task:
             finished_at=raw.get("finished_at"),
             revision_note=raw.get("revision_note"),
             previous_title=raw.get("previous_title"),
+            previous_result_log=raw.get("previous_result_log"),
         )
 
     def clear_revision_marks(self) -> None:
         self.revision_note = None
         self.previous_title = None
+        self.previous_result_log = None
 
     def brief(self, log_limit: int = 200) -> dict[str, Any]:
         """Compact form sent to the LLM. result_log is capped to protect context."""
-        log = self.result_log
-        if log and len(log) > log_limit:
-            log = log[:log_limit] + "..."
+
+        def cap(text: str | None) -> str | None:
+            if text and len(text) > log_limit:
+                return text[:log_limit] + "..."
+            return text
+
         out: dict[str, Any] = {"task_id": self.task_id, "title": self.title, "status": self.status}
+        log = cap(self.result_log)
         if log:
             out["result_log"] = log
         if self.revision_note:
             out["revision_note"] = self.revision_note
         if self.previous_title:
             out["previous_title"] = self.previous_title
+        previous_log = cap(self.previous_result_log)
+        if previous_log:
+            out["previous_result_log"] = previous_log
         return out
 
 
@@ -250,6 +265,13 @@ class Plan:
     # task_list, and what tells it which tasks the model is allowed to touch. Cleared as
     # soon as the revision is applied, so it can never authorize a later edit.
     pending_revision: dict[str, Any] | None = None
+    # Set when a WHOLE-PLAN revision was asked for from the completion report rather than
+    # from the plan-approval screen. The work has already been done at that point, so the
+    # redraft must not throw its evidence away: tasks that survive the rewrite keep what
+    # they produced. Consumed (and cleared) by the next finalization in plan_and_think.
+    # A revision asked for before execution has no evidence to keep, and an ordinary
+    # re-plan after a failure SHOULD drop it - hence a flag rather than always-on.
+    rework_from_completion: bool = False
 
     # ---- serialization -------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -265,6 +287,7 @@ class Plan:
             "approval": self.approval.to_dict(),
             "superseded_tasks": self.superseded_tasks,
             "pending_revision": self.pending_revision,
+            "rework_from_completion": self.rework_from_completion,
             "original_goal": self.original_goal or self.goal,
             "goal_history": self.goal_history,
         }
@@ -283,6 +306,7 @@ class Plan:
             approval=Approval.from_dict(raw.get("approval")),
             superseded_tasks=raw.get("superseded_tasks", []),
             pending_revision=raw.get("pending_revision") or None,
+            rework_from_completion=bool(raw.get("rework_from_completion")),
             # A state file written before goal revision existed has neither field; its
             # goal has never changed, so it *is* the original.
             original_goal=str(raw.get("original_goal") or raw.get("goal", "")),

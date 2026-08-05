@@ -1,16 +1,22 @@
 # 11 · Status and Next Steps
 
-## Current state (as of version 1.12.1)
+## Current state (as of version 1.13.0)
 
 - **Code:** feature-complete for the design. All four tools, blocking approval, multi-plan,
   shared approval surface, cross-process locking, failure-path hardening, leniency fuzzing,
   per-task plan review (1.10.0), auto-advance (1.11.0), goal revision (1.12.0), an explicit
-  next-step message on every DONE including the last (1.12.1).
-- **Tests:** 240 unit + 5 smoke, all passing. `verify_install.py` runs everything.
+  next-step message on every DONE including the last (1.12.1), and rework — a completion
+  report can be sent back task by task without re-planning or losing evidence (1.13.0).
+- **Tests:** 269 unit + 5 smoke, all passing. `verify_install.py` runs everything.
+  Note: `TestApprovalPageSurface` / `TestPerTaskPageSurface` / `TestBlockingApproval` bind
+  hardcoded ports 8788-8799. On a machine where something else already holds them, those
+  tests fail on `srv.start()` returning False — a test-isolation weakness, not a server
+  bug. Worth switching to ephemeral ports; the 1.13.0 page changes are covered
+  socket-free by `TestCompletionPageTemplate` for exactly this reason.
 - **Git:** on `develop`. Remote is `github.com/HaJaehee/LightweightSequentialThinking`.
   **NOT pushed.** Pushing is a user decision — the repo may be public and `docs/` contains
   deployment/security material; confirm before pushing.
-- **Build artifacts (1.12.0, built 2026-07-28) — 1.12.1 has not been packaged yet:**
+- **Build artifacts (1.12.0, built 2026-07-28) — 1.12.1 and 1.13.0 have not been packaged yet:**
 
   | archive | size | sha256 |
   |---|---|---|
@@ -35,6 +41,11 @@
   syncing to 1.12.0, restart AnythingLLM and **repaste the agent prompt**: an agent still running
   the 1.11.0 prompt never sends `revised_goal`, so a user correcting the goal still leaves the
   old goal in the metadata — the server-side fix alone does not produce the behaviour.
+
+  The same applies to 1.13.0, and more sharply: the server will reopen a single task and say
+  so, but an agent running a pre-1.13.0 prompt has no rule saying "a rework is not a
+  re-plan", and Phase 3c is what supplies it. **Repaste the prompt or the fix is half
+  delivered.**
 
 ## Known open items
 

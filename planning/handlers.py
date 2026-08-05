@@ -39,7 +39,7 @@ from .models import (
 )
 from .responses import build, error, render_completion_report, render_plan_for_user
 from .state_machine import can_start_task, execution_guard
-from .store import State, Store, goal_key
+from .store import State, Store, goal_key, title_key
 
 log = logging.getLogger("planning-mcp.handlers")
 
@@ -179,12 +179,17 @@ class PlanningHandlers:
         # completion report with stale complaints.
         plan.clear_revision_marks()
         plan.pending_revision = None
-        # Approving a completion report closes the plan; approving a draft unlocks it.
-        plan.set_status(
-            PlanStatus.COMPLETED
-            if plan.status is PlanStatus.AWAITING_COMPLETION
-            else PlanStatus.APPROVED
-        )
+        plan.rework_from_completion = False
+        # Approving a completion report closes the plan; approving a draft unlocks it -
+        # unless the draft is already finished work carried through a redraft, in which
+        # case unlocking it would let the model answer without the completion check ever
+        # being asked. Route that back to the verification gate instead.
+        if plan.status is PlanStatus.AWAITING_COMPLETION:
+            plan.set_status(PlanStatus.COMPLETED)
+        elif plan.all_done() and self.config.completion_approval:
+            plan.set_status(PlanStatus.AWAITING_COMPLETION)
+        else:
+            plan.set_status(PlanStatus.APPROVED)
         self._withdraw_approval_request(plan)
 
     def _mutate_rejected(self, plan: Plan, comment: str | None) -> None:
@@ -212,6 +217,70 @@ class PlanningHandlers:
                 targets[str(task_id)] = body
         return targets
 
+    def _mutate_no(
+        self,
+        plan: Plan,
+        comment: str | None,
+        task_comments: dict[str, str] | None = None,
+        scope: str = SCOPE_PLAN,
+    ) -> tuple[str, Any]:
+        """Route the human's "no" to the mutation that actually answers it.
+
+        The same button carries two different objections depending on when it is pressed.
+        Before execution it means "this plan is wrong". After the completion report it
+        means "the plan was fine, what came out of these tasks is not" - and treating
+        that as a re-plan is what used to throw away every task's evidence and order the
+        model to redo work nobody complained about.
+
+        Returns ("REWORK", [task_id, ...]) or ("REVISE", {task_id: comment}).
+        """
+        targets = (
+            self._revision_targets(plan, task_comments) if scope == SCOPE_TASKS else {}
+        )
+        if plan.status is PlanStatus.AWAITING_COMPLETION and targets:
+            reopened = self._mutate_rework(
+                plan, comment, {int(k): v for k, v in targets.items()}
+            )
+            return "REWORK", reopened
+        return "REVISE", self._mutate_revise(plan, comment, task_comments, scope)
+
+    def _mutate_rework(
+        self, plan: Plan, comment: str | None, targets: dict[int, str]
+    ) -> list[int]:
+        """Reopen specific finished tasks without disturbing the plan around them.
+
+        The human is not disputing the task list here - they approved it and it has not
+        changed - so it is not re-approved. Only the named tasks go back to PENDING;
+        every other task keeps its DONE status and its evidence, which is the whole
+        point. Ordering is untouched, so `can_start_task` and `unfinished_before` keep
+        working unchanged: a reopened task is simply the next PENDING one.
+        """
+        plan.approval.revision_count += 1
+        plan.approval.user_comment = comment or ""
+        # The completion report is withdrawn rather than answered: once the rework lands,
+        # a fresh one has to be asked for and verified.
+        plan.approval.reset_request()
+        reopened: list[int] = []
+        for task_id in sorted(targets):
+            task = plan.get_task(task_id)
+            if task is None:  # _revision_targets already filtered; belt and braces
+                continue
+            task.revision_note = targets[task_id]
+            # What it produced last time, kept so the redo is not done blind. Marks on
+            # other tasks are deliberately left alone: a note from an earlier round is
+            # still the reason that task reads the way it does on the next report.
+            task.previous_result_log = task.result_log or task.previous_result_log
+            task.result_log = None
+            task.status = TaskStatus.PENDING.value
+            task.started_at = None
+            task.finished_at = None
+            reopened.append(task_id)
+        plan.pending_revision = None
+        plan.rework_from_completion = False
+        plan.set_status(PlanStatus.IN_EXECUTION)
+        self._withdraw_approval_request(plan)
+        return reopened
+
     def _mutate_revise(
         self,
         plan: Plan,
@@ -226,6 +295,9 @@ class PlanningHandlers:
         the human objected to, which is the only thing that later stops the model from
         quietly rewriting the tasks they already accepted.
         """
+        # Read before the status changes. A redraft asked for from the completion report
+        # must not delete the work that has already been done - see `_carry_evidence`.
+        plan.rework_from_completion = plan.status is PlanStatus.AWAITING_COMPLETION
         plan.approval.revision_count += 1
         plan.approval.user_comment = comment or ""
         plan.approval.reset_request()
@@ -267,7 +339,7 @@ class PlanningHandlers:
         elif verdict.decision == Decision.REJECTED.value:
             self._mutate_rejected(plan, verdict.comment)
         else:
-            self._mutate_revise(
+            self._mutate_no(
                 plan, verdict.comment, verdict.task_comments, verdict.scope
             )
         self.store.save(state)
@@ -695,7 +767,22 @@ class PlanningHandlers:
         if plan.tasks:  # re-plan: keep the old breakdown as evidence
             plan.superseded_tasks.append([t.to_dict() for t in plan.tasks])
 
+        previous = plan.tasks
         plan.tasks = [Task(task_id=i, title=title) for i, title in enumerate(task_list, start=1)]
+        if plan.rework_from_completion:
+            plan.rework_from_completion = False
+            carried = self._carry_evidence(previous, plan.tasks)
+            if carried:
+                notes.append(
+                    "Task(s) "
+                    + ", ".join(str(t) for t in carried)
+                    + " survived this rewrite unchanged, so they keep the work you "
+                    "already did and their result_log. Do NOT do them again - only the "
+                    "tasks that are still PENDING need work."
+                )
+                self.store.audit(
+                    "evidence_carried", plan_id=plan.plan_id, tasks=carried
+                )
         plan.set_status(PlanStatus.AWAITING_APPROVAL)
         plan.approval.reset_request()
         self.store.save(state)
@@ -716,6 +803,40 @@ class PlanningHandlers:
                 "Execution is locked until the user approves."
             ),
         )
+
+    @staticmethod
+    def _carry_evidence(previous: list[Task], current: list[Task]) -> list[int]:
+        """Move finished work onto the tasks that survived a redraft. Returns their ids.
+
+        Only ever used when the redraft answers a revision asked for from the COMPLETION
+        report: the work has already happened, and wiping it is what turned "you missed a
+        step" into an order to rerun the entire plan. An ordinary re-plan - after a
+        failure, say - still drops the old evidence, which is correct there.
+
+        Matched with `title_key`, so a trailing period or a doubled space does not lose a
+        task's work, and by key rather than by position, so reordering or inserting a step
+        keeps it too. Deliberately no fuzzy matching: a miss only costs a redo, while a
+        wrong match would let a task that must be redone keep a stale result_log and be
+        skipped. Duplicate titles are paired in order; whatever is left over carries
+        nothing. Only DONE work is carried - a FAILED task has nothing worth keeping.
+        """
+        pool: dict[str, list[Task]] = {}
+        for task in previous:
+            if task.status == TaskStatus.DONE.value:
+                pool.setdefault(title_key(task.title), []).append(task)
+        carried: list[int] = []
+        for task in current:
+            bucket = pool.get(title_key(task.title))
+            if not bucket:
+                continue
+            source = bucket.pop(0)
+            task.status = source.status
+            task.result_log = source.result_log
+            task.started_at = source.started_at
+            task.finished_at = source.finished_at
+            task.previous_result_log = source.previous_result_log
+            carried.append(task.task_id)
+        return carried
 
     def _apply_task_updates(
         self,
@@ -1154,7 +1275,14 @@ class PlanningHandlers:
         task = plan.current_task()
         return build(
             plan,
-            message="Execution is now unlocked.",
+            message=(
+                # Everything carried through the redraft, so there is nothing left to
+                # run - saying "unlocked" here would read as "go and do it all again".
+                "The user approved this plan. Every task in it is already finished, so "
+                "report completion now instead of executing anything."
+                if plan.status is PlanStatus.AWAITING_COMPLETION
+                else "Execution is now unlocked."
+            ),
             notes=notes,
             qualify=len(state.active_plans()) > 1,
             tasks=plan.tasks_brief(),
@@ -1178,12 +1306,15 @@ class PlanningHandlers:
         redrafted whole - exactly as it always was.
         """
         comment = args.get("user_comment") or ""
-        targets = self._mutate_revise(
+        kind, detail = self._mutate_no(
             plan,
             comment,
             verdict.task_comments if verdict else None,
             verdict.scope if verdict else SCOPE_PLAN,
         )
+        if kind == "REWORK":
+            return self._reworked(state, plan, detail, comment, verdict, notes)
+        targets = detail
         self.store.save(state)
         self.store.audit(
             "revision_requested",
@@ -1232,6 +1363,47 @@ class PlanningHandlers:
             # Even a whole-plan rewrite benefits from knowing what the human said about
             # each task; it just does not constrain which tasks may change.
             task_comments=(verdict.task_comments or None) if verdict else None,
+        )
+
+    def _reworked(
+        self,
+        state: State,
+        plan: Plan,
+        reopened: list[int],
+        comment: str,
+        verdict: Verdict | None,
+        notes: list[str],
+    ) -> dict[str, Any]:
+        """Answer a completion report that sent specific tasks back to be done again."""
+        self.store.save(state)
+        self.store.audit(
+            "rework_requested",
+            plan_id=plan.plan_id,
+            revision_count=plan.approval.revision_count,
+            user_comment=comment,
+            reopened=reopened,
+            task_comments=(verdict.task_comments or None) if verdict else None,
+        )
+        which = ", ".join(str(t) for t in reopened)
+        kept = [t.task_id for t in plan.tasks if t.status == TaskStatus.DONE.value]
+        task = plan.current_task()
+        return build(
+            plan,
+            message=(
+                f"The user checked the finished work and sent task(s) {which} back to be "
+                "done AGAIN. The plan itself is unchanged and still approved - do not "
+                "re-plan and do not ask for approval. Redo only those tasks, then report "
+                "completion again."
+            ),
+            notes=notes,
+            qualify=len(state.active_plans()) > 1,
+            user_comment=comment or None,
+            revision_count=plan.approval.revision_count,
+            reopened_tasks=reopened,
+            tasks_unchanged=kept or None,
+            tasks=plan.tasks_brief(),
+            progress=plan.progress(),
+            next_task={"task_id": task.task_id, "title": task.title} if task else None,
         )
 
     def _reject(
@@ -1480,6 +1652,7 @@ class PlanningHandlers:
                 f"Task {task.task_id} is DONE. Task {advanced.task_id} "
                 f"('{advanced.title}') has been started for you - do that work NOW, then "
                 "report it DONE with its own result_log. Do not send IN_PROGRESS again."
+                + self._rework_suffix(advanced)
             )
         elif nxt is not None:
             # Nothing was auto-started (auto_advance off, or the next task is not
@@ -1488,6 +1661,7 @@ class PlanningHandlers:
                 f"Task {task.task_id} is DONE. The plan is NOT finished: next is "
                 f"task_id={nxt.task_id} ('{nxt.title}'). Call update_task_progress with "
                 f"task_id={nxt.task_id} and status='IN_PROGRESS'."
+                + self._rework_suffix(nxt)
             )
         elif plan.status is PlanStatus.AWAITING_COMPLETION:
             # Every task is finished, so the only thing left is the completion report.
@@ -1515,6 +1689,22 @@ class PlanningHandlers:
             qualify=len(state.active_plans()) > 1,
             next_task={"task_id": nxt.task_id, "title": nxt.title} if nxt else None,
             message=message,
+        )
+
+    @staticmethod
+    def _rework_suffix(task: Task | None) -> str:
+        """Why this task is open again, restated wherever it is handed to the model.
+
+        Two reworked tasks in one round means the second is reached by finishing the
+        first, and the message announcing that is the only thing the model reads at
+        that moment. Dropping the request there is how it gets redone as if nothing
+        had been asked for.
+        """
+        if task is None or not task.revision_note:
+            return ""
+        return (
+            f' The user sent task {task.task_id} back to be done again: '
+            f'"{task.revision_note}". Answer that, do not repeat what you did before.'
         )
 
     def _auto_advance(self, plan: Plan) -> Task | None:

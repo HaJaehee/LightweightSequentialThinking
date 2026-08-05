@@ -88,7 +88,20 @@ PASS criteria are written so they can be judged from the AnythingLLM transcript 
 | **FAIL mode** | Model sends a full `task_list` and rewrites all four tasks — accepted, but `input_notes` says so and the audit log records `targeted_revision_ignored`. This is the metric for whether the model is using the feature. |
 | **FAIL mode (blocked)** | Model sends `task_updates` for a task the user did **not** flag → the edit is dropped with a note, that task is unchanged |
 | **Check in state** | `plan.pending_revision` set on REVISE, cleared after the update; task 3 has `revision_note` + `previous_title`; untouched tasks keep `result_log` |
-| **Check the boundary** | Same comment typed on a **completion** report must fall back to whole-plan REVISE (`revision_scope: "PLAN"`, no `pending_revision`) — the page shows no per-task boxes there |
+| **Check the boundary** | The same comment typed on a **completion** report is a different thing — see B2c |
+
+### B2c. Per-task comment on the completion report (rework, 1.13.0) — no re-approval
+
+| | |
+|---|---|
+| **Setup** | Run a 3-task plan to the end so the completion report is on screen with each task's `result_log` under it |
+| **U (at gate)** | Types `표가 3개 빠졌어요` into **task 2's** box only, then clicks the button now labelled `다시 작업 요청 · 2번만` |
+| **Expect** | `plan_status: "IN_EXECUTION"`, `reopened_tasks: [2]`, `next_action: CALL_UPDATE_TASK_PROGRESS` — **no** `plan_and_think`, **no** second approval |
+| **PASS** | (a) task 2 is `PENDING` with `revision_note` and `previous_result_log`; (b) tasks 1 and 3 are still `DONE` **with their original `result_log`**; (c) `next_action_hint` quotes `표가 3개 빠졌어요` and names only task 2; (d) redoing task 2 returns the plan to `AWAITING_COMPLETION`; (e) the new report shows `↻ 요청하신 내용` and `이전 결과` on task 2 |
+| **FAIL mode (the D17 bug)** | Model calls `plan_and_think` and rewrites the task list → every `result_log` is lost and all 3 tasks must be redone. If this happens, the prompt was not repasted: Phase 3c is what tells the model this is not a re-plan. |
+| **FAIL mode** | Model redoes task 1 or 3 as well — they were accepted; the hint names them explicitly as not-to-touch |
+| **Check in state** | `plan.rework_from_completion` stays false on this path; `plan.pending_revision` is None; audit records `rework_requested` |
+| **Check the escape hatch** | Ticking `☐ 계획 자체를 다시 세우기` instead → `DRAFTING` + a real re-approval, but tasks whose title survives the redraft keep their `DONE` and `result_log` (`input_notes` says which) |
 
 ### B3. Ambiguous reply
 

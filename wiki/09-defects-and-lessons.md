@@ -1,9 +1,11 @@
 # 09 · Defects and Lessons
 
-The 13 real defects found while hardening the server, each with root cause, symptom, and fix.
+The 17 real defects found while hardening the server, each with root cause, symptom, and fix.
 **This is the highest-value page for predicting where the next bug is.** Every one lived in a
 place that had no test, and several were *silent* — the server reported success while losing
-data or disarming the safety gate.
+data or disarming the safety gate. The last two (D16, D17) were found in *use* rather than by
+testing, and both were the same shape: a state the protocol could reach but had no instruction
+for.
 
 The meta-lesson, stated once: **a green test suite over untested seams means nothing.** The way
 these were found was to write a test asserting a *guarantee* (not the current output) for each
@@ -211,11 +213,60 @@ for the completion report explicitly (`request_user_approval`, `decision='ASK_US
 `auto_advance` off, tasks can remain — so that case names the next task instead. The agent
 prompt (Phase 3) now also names `message` as an instruction channel in R4/R7, since the fix
 otherwise depends on the model reading a field the prompt never mentioned.
+**Lesson (D17 below):** the same reading applies to a *state*, not just a channel — DRAFTING
+with every task DONE was a sentence the protocol had no grammar for.
+
 **Lesson:** in a redundant protocol, a channel that carries orders is also making a promise, and
 its **absence is read as content**. `None` was not neutral — it meant "no further orders" to a
 model that had been trained by the preceding turns to expect one. Whenever an instruction field
 can go empty, ask what the emptiness says at that exact state, especially at the last step of a
 loop where the model's own priors already point at stopping.
+
+<a id="d17"></a>
+## D17 — Revising a completion report made the model useless (1.13.0)
+**Symptom:** reported from the field. `계획 → 승인 → 실행 → 완료 보고 → 완료 승인` runs cleanly on
+a small model. The moment the human presses **수정 요청** on the *completion report*, the same
+model falls apart: it re-runs tasks it already finished, or fires evidence-free `DONE` at each
+one and loops on `MISSING_RESULT_LOG`, or tries to answer and is blocked by `execution_guard`.
+The one thing it never does is the fix the human asked for.
+**Root cause — not the model. Six steps, each individually defensible:**
+1. The page offered no per-task comment on a completion report (`perTask` required
+   `phase==='PLAN'`), and `record_decision` clamped any non-PLAN phase to `SCOPE_PLAN`. There
+   was no way for the human to say *"only task 3"* about finished work.
+2. `_mutate_revise` therefore always ran, sending the plan back to `DRAFTING` with every task
+   still `DONE` — `plan_status=DRAFTING, progress=7/7 done`, a state the protocol has no grammar
+   for.
+3. With no targets, `_status_action`'s DRAFTING branch gave the *generic* hint. **The human's
+   sentence appeared in no instruction field at all** — only once, in `user_comment`, which is
+   three turns back in a small model's context by the time it acts.
+4. `task_updates` was refused (`REVISION_NOT_REQUESTED`), so the only legal move was a full
+   `task_list`.
+5. Finalizing replaces `plan.tasks` wholesale — **every `result_log` was deleted**. It survives
+   in `superseded_tasks`, which no response ever carries, so the model can never see it again.
+6. Re-approval of a byte-identical plan, then all N tasks to be redone under the ordering and
+   evidence guards.
+**Fix:** completion revision became **rework**, not re-planning. Per-task comments are enabled
+for `PHASE_COMPLETION` (the clamp now only catches an entry with *no* phase — the rolling-restart
+case). `_mutate_no` routes on `plan.status`: `AWAITING_COMPLETION` + targets → `_mutate_rework`,
+which reopens only the named tasks (`PENDING`, `revision_note` set, `previous_result_log` kept so
+the redo is not blind), leaves every other task `DONE` with its evidence, and returns the plan to
+`IN_EXECUTION` **without re-approval** — the task list never changed, so re-approving it is
+ceremony that costs a weak model two turns and a chance to derail. `_status_action` leads with
+the human's own sentence and forbids re-planning; `_rework_suffix` repeats it wherever a task is
+handed over, including auto-advance. The whole-plan escape hatch survives for add/delete/reorder,
+but now carries evidence across the redraft (`_carry_evidence`, matched with `title_key`).
+**Why nothing else had to change:** reopening task 3 leaves 1–2 `DONE`, so `can_start_task`,
+`unfinished_before`, `current_task`, `_auto_advance` and `all_done` all keep working untouched —
+a reopened task is simply the next `PENDING` one. The machinery was already right; only the
+transition into it was wrong.
+**Second-order hole closed by the fix:** if a redraft carries *every* task, approving it would
+leave an `APPROVED` plan with nothing to run and `next_action = ANSWER_USER`, skipping the
+completion gate entirely. `_mutate_approved` now routes an all-done approval to
+`AWAITING_COMPLETION` instead.
+**Lesson:** one button meant three different things (*this plan is wrong* / *you missed a step* /
+*this output is wrong*), and the state machine only implemented the first. When a control is
+reachable from two states, ask what it means in **each** — a shortcut that is merely wasteful
+before execution becomes destructive after it, because by then there is work to destroy.
 
 ## Where the next bug probably is
 

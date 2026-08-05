@@ -68,6 +68,13 @@ Optional: `plan_summary` (required for `ASK_USER`), `user_comment`, `plan_id`.
 - **`APPROVED`/`REJECTED`/`REVISE`**: report what the human actually said. A `REVISE` the model
   reports itself is always a whole-plan revision; only the approval page can express a per-task
   one, because only there can the human point at a specific task.
+- **What a per-task `REVISE` means depends on when it arrives (1.13.0).** Before execution it
+  rewrites those tasks' wording (`pending_revision` + `task_updates`). On the **completion
+  report** it means *do them again*: the named tasks reopen as `PENDING` carrying the human's
+  sentence, every other task keeps its `DONE` and evidence, and the plan goes back to
+  `IN_EXECUTION` **without re-approval** — the task list never changed. `_mutate_no` is the
+  single place that reading is chosen. See [06](06-human-in-the-loop.md#rework-1130) and
+  [D17](09-defects-and-lessons.md#d17).
 - **Approval binds to the exact version shown** (goal + task-title fingerprint). Approving a
   plan version the human never saw → `APPROVAL_NOT_REQUESTED`. An approval left idle past
   `approval_ttl` → `APPROVAL_EXPIRED`.

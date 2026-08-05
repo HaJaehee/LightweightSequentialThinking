@@ -254,6 +254,35 @@ def _status_action(plan: Plan | None) -> tuple[str, str]:
             f"({', '.join(str(t.task_id) for t in left)}). Do NOT tell the user the work "
             "is finished until every task is DONE."
         )
+        # A task the human reopened from the completion report. The plan is not what is
+        # wrong, so the generic "next task" hint would send a weak model off to re-plan
+        # or to redo everything; what it needs is the sentence the human actually wrote,
+        # and an explicit instruction to leave the accepted work alone.
+        if task.revision_note:
+            kept = [t.task_id for t in plan.tasks if t.status == TaskStatus.DONE.value]
+            keep = (
+                " Task(s) " + ", ".join(str(k) for k in kept) + " were accepted by the "
+                "user and keep the results you already produced - do NOT redo, rewrite "
+                "or re-report them."
+                if kept
+                else ""
+            )
+            step = (
+                f"It is already IN_PROGRESS: do the work now and call "
+                f"update_task_progress with task_id={task.task_id}, status='DONE' and a "
+                "result_log describing the NEW outcome."
+                if task.status == TaskStatus.IN_PROGRESS.value
+                else f"Call update_task_progress with task_id={task.task_id} and "
+                "status='IN_PROGRESS'."
+            )
+            return (
+                NextAction.CALL_UPDATE_TASK_PROGRESS.value,
+                f"The user reviewed the finished work and sent task {task.task_id} "
+                f"('{task.title}') back to be done AGAIN: \"{task.revision_note}\". "
+                f"Do not re-plan and do not ask for approval - the plan is unchanged and "
+                f"still approved. Redo ONLY this task so that it answers what they said. "
+                f"{step}{keep}{outstanding}",
+            )
         if task.status == TaskStatus.IN_PROGRESS.value:
             return (
                 NextAction.CALL_UPDATE_TASK_PROGRESS.value,

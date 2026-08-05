@@ -34,7 +34,9 @@
     <transition from="AWAITING_COMPLETION" call="request_user_approval(ASK_USER)"      to="AWAITING_COMPLETION" note="shows the per-task completion report and blocks"/>
     <transition from="AWAITING_COMPLETION" call="request_user_approval(APPROVED)"      to="COMPLETED"/>
     <transition from="AWAITING_COMPLETION" call="request_user_approval(REJECTED)"      to="CANCELLED"/>
-    <transition from="AWAITING_COMPLETION" call="request_user_approval(REVISE)"        to="DRAFTING"/>
+    <transition from="AWAITING_COMPLETION" call="request_user_approval(REVISE, scope=TASKS)" to="IN_EXECUTION" note="rework (1.13.0): only the named tasks reopen; every other task keeps DONE and its result_log; no re-approval, the task list did not change"/>
+    <transition from="AWAITING_COMPLETION" call="request_user_approval(REVISE, scope=PLAN)"  to="DRAFTING" note="whole-plan redraft for add/delete/reorder; sets rework_from_completion so the redraft carries evidence for surviving titles"/>
+    <transition from="AWAITING_APPROVAL"   call="request_user_approval(APPROVED, all tasks already DONE)" to="AWAITING_COMPLETION" note="1.13.0: never unlock a plan with nothing left to run - that would skip the completion gate"/>
     <transition from="IN_EXECUTION"      call="update_task_progress(FAILED)"           to="BLOCKED"/>
     <transition from="BLOCKED"           call="plan_and_think"                          to="DRAFTING" note="same plan id, revision"/>
     <transition from="any"               call="get_current_plan"                        to="(unchanged)" note="never fails"/>

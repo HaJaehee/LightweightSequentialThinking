@@ -72,6 +72,14 @@ def render_completion_report(plan: Plan, plan_summary: str | None = None) -> str
     lines.append("")
     for task in plan.tasks:
         lines.append(f"{task.task_id}. {task.title}")
+        # A task the human sent back last round. Showing what they asked for, and what
+        # it used to say, is what lets them check the request in one line instead of
+        # re-reading the whole report.
+        if task.revision_note:
+            lines.append(f"   ↻ 요청하신 내용: {task.revision_note}")
+        previous = (task.previous_result_log or "").strip()
+        if previous:
+            lines.append(f"   이전 결과: {previous}")
         evidence = (task.result_log or "").strip()
         lines.append(f"   -> {evidence}" if evidence else "   -> (증거 기록 없음)")
     lines.append("")

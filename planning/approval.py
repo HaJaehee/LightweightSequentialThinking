@@ -208,9 +208,13 @@ class ApprovalStore:
         `scope` comes from the page, which labels its own button with the consequence
         before the human clicks it. The server never re-derives it from whether comments
         happen to be present - that would silently overrule what the human was shown.
-        The one thing it does enforce is that a COMPLETION request can only ever be
-        PLAN-scoped, so an older or hand-crafted client cannot request a per-task
-        rewrite of work that has already run.
+
+        Both phases may carry a task scope, but it means different things and only the
+        handler knows which: on a PLAN request "these tasks only" is a rewrite of their
+        wording, on a COMPLETION request it is an order to redo the work. What is still
+        enforced here is that an entry with NO phase at all - written by an older process
+        during a rolling restart, which had no per-task review of finished work - falls
+        back to a whole-plan revision rather than being guessed at.
         """
         if decision not in DECISIONS:
             return False
@@ -221,9 +225,9 @@ class ApprovalStore:
             for entry in queue:
                 if entry.get("id") == request_id and entry.get("decision") is None:
                     wanted = scope if scope in SCOPES else SCOPE_PLAN
-                    # Strict equality, so an entry with no phase at all (written by an
-                    # older process) also falls back to a whole-plan rewrite.
-                    if entry.get("phase") != PHASE_PLAN:
+                    # Membership, not truthiness: an entry with no phase at all (written
+                    # by an older process) still falls back to a whole-plan rewrite.
+                    if entry.get("phase") not in (PHASE_PLAN, PHASE_COMPLETION):
                         wanted = SCOPE_PLAN
                     entry["decision"] = decision
                     entry["comment"] = comment or ""
@@ -362,6 +366,11 @@ button:disabled{opacity:.5;cursor:default}
 .was{font-size:.82rem;opacity:.55;margin:.25rem 0 0 1.95em;text-decoration:line-through}
 .note{font-size:.82rem;margin:.25rem 0 0 1.95em;color:#8a5a00}
 @media(prefers-color-scheme:dark){.note{color:#d9a441}}
+/* The agent's evidence for a finished task. Shown only on a completion report - it is
+   the thing the human is actually being asked to judge. */
+.ev{font-size:.86rem;opacity:.75;margin:.25rem 0 0 1.95em;line-height:1.55;
+    white-space:pre-wrap;word-break:break-word}
+.ev.none{opacity:.45;font-style:italic}
 /* Per-task comment boxes are collapsed by default. Nine open textareas turn a task list
    into a form; the plan itself is what the human came here to read. */
 textarea.tc{display:none;min-height:2.4rem;margin:.4rem 0 0 1.95em;width:calc(100% - 1.95em);
@@ -424,9 +433,11 @@ function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>
   '"':'&quot;',"'":'&#39;'}[c]));}
 
 // ---- per-task review -----------------------------------------------------
-// Only a PLAN request can be reviewed task by task. A COMPLETION request asks whether
-// work already done is real; rewriting one line of the plan does not answer that, so
-// that phase keeps the original single-comment form.
+// Both phases can be reviewed task by task, but the request means different things:
+// on a plan it rewrites the task's wording, on a completion report it orders that one
+// task to be done again. The phase of each queued request is kept here so the buttons
+// can say which of the two the human is about to ask for.
+const PHASE={};
 function comments(id){
   const out={};
   document.querySelectorAll('textarea[data-req="'+id+'"]').forEach(b=>{
@@ -454,7 +465,15 @@ function scopeOf(id){
   return Object.keys(comments(id)).length?'TASKS':'PLAN';
 }
 // The button says what it will do BEFORE it is clicked, so choosing the scope is an
-// explicit act by the human rather than something the server infers afterwards.
+// explicit act by the human rather than something the server infers afterwards. One
+// builder for both the first render and every relabel, so the two can never drift.
+function revLabel(phase,ids,whole){
+  const done=phase==='COMPLETION';
+  if(whole||!ids.length)
+    return done?'수정 요청 · 계획 전체 다시 세우기':'수정 요청 · 계획 전체 재작성';
+  const verb=done?'다시 작업 요청':'수정 요청';
+  return ids.length===1?verb+' · '+ids[0]+'번만':verb+' · '+ids.length+'개 태스크만';
+}
 function relabel(id){
   // Mark the rows that carry a comment, so a collapsed one is still visible as such.
   document.querySelectorAll('textarea[data-req="'+id+'"]').forEach(b=>{
@@ -463,10 +482,7 @@ function relabel(id){
   });
   const btn=document.getElementById('rev-'+id);
   if(!btn)return;
-  const ids=Object.keys(comments(id));
-  if(wholePlan(id)||!ids.length){btn.textContent='수정 요청 · 계획 전체 재작성';return;}
-  btn.textContent=ids.length===1?'수정 요청 · '+ids[0]+'번만'
-                                :'수정 요청 · '+ids.length+'개 태스크만';
+  btn.textContent=revLabel(PHASE[id],Object.keys(comments(id)),wholePlan(id));
 }
 // The header a human needs before they can judge a task list at all: what is being
 // asked, what the goal is, and the model's own overview of how it intends to get there.
@@ -480,19 +496,31 @@ function header(d){
   return h;
 }
 function taskRows(d){
+  // On a completion report every task is DONE, so a DONE badge on every row is noise -
+  // the evidence line below it already says so, and that is what needs the attention.
+  const done=d.phase==='COMPLETION';
   return '<p class="tasklabel">태스크 '+(d.tasks||[]).length+'개</p>'+
     '<div class="tasks">'+(d.tasks||[]).map(t=>{
+    const badge=t.status&&t.status!=='PENDING'&&!(done&&t.status==='DONE');
     let row='<div class="task"><div class="tt"><span class="tn">'+esc(String(t.task_id))+
       '.</span><span>'+esc(t.title)+'</span>'+
-      (t.status&&t.status!=='PENDING'?'<span class="badge">'+esc(t.status)+'</span>':'')+
+      (badge?'<span class="badge">'+esc(t.status)+'</span>':'')+
       '<button class="tcbtn" type="button" aria-expanded="false" '+
-      'onclick="toggleComment(this)">의견</button></div>';
+      'onclick="toggleComment(this)">'+(done?'다시 작업':'의견')+'</button></div>';
     if(t.previous_title)row+='<div class="was">'+esc(t.previous_title)+'</div>';
     if(t.revision_note)row+='<div class="note">\\u21BB 요청하신 내용: '+
       esc(t.revision_note)+'</div>';
+    // The claim the human is judging. Without it a completion report is a task list
+    // that says nothing about whether the work happened.
+    if(done){
+      const ev=(t.result_log||'').trim();
+      row+=ev?'<div class="ev">\\u2192 '+esc(ev)+'</div>'
+             :'<div class="ev none">(증거 기록 없음)</div>';
+    }
     row+='<textarea class="tc" data-req="'+esc(d.id)+'" data-tid="'+esc(String(t.task_id))+
-      '" placeholder="이 태스크에 대한 의견 (선택)" oninput="relabel(\\''+esc(d.id)+
-      '\\')"></textarea>';
+      '" placeholder="'+(done?'이 태스크를 어떻게 다시 해야 하는지 적어주세요'
+                             :'이 태스크에 대한 의견 (선택)')+
+      '" oninput="relabel(\\''+esc(d.id)+'\\')"></textarea>';
     return row+'</div>';
   }).join('')+'</div>';
 }
@@ -512,7 +540,8 @@ function render(list){
     }
     // An entry with no phase was published by an older server process on this same
     // state directory. It has no per-task review, so fall back to the original form.
-    const perTask=d.phase==='PLAN'&&d.tasks&&d.tasks.length;
+    PHASE[d.id]=d.phase;
+    const perTask=(d.phase==='PLAN'||d.phase==='COMPLETION')&&d.tasks&&d.tasks.length;
     // The fallback path keeps the original layout on purpose: `display` already opens
     // with its own title, 목표 and summary, so composing a header above it would repeat
     // all three.
@@ -523,17 +552,20 @@ function render(list){
       '" placeholder="전체 의견 (거절 사유도 여기에)"'+
       (perTask?' oninput="relabel(\\''+esc(d.id)+'\\')"':'')+'></textarea>';
     if(perTask)html+='<label class="scope"><input type="checkbox" id="all-'+esc(d.id)+
-      '" onchange="relabel(\\''+esc(d.id)+'\\')"> 계획 전체를 다시 세우기 '+
-      '(태스크 추가·삭제·순서 변경은 이쪽)</label>';
+      '" onchange="relabel(\\''+esc(d.id)+'\\')"> '+
+      (d.phase==='COMPLETION'?'계획 자체를 다시 세우기 (태스크 추가·삭제·순서 변경은 이쪽)'
+                             :'계획 전체를 다시 세우기 (태스크 추가·삭제·순서 변경은 이쪽)')+
+      '</label>';
     return html+'<div class="row">'+
       '<button class="ok" onclick="decide(\\''+esc(d.id)+'\\',\\'APPROVED\\')">승인</button>'+
       '<button class="rev" id="rev-'+esc(d.id)+'" onclick="decide(\\''+esc(d.id)+
-      '\\',\\'REVISE\\')">수정 요청'+(perTask?' · 계획 전체 재작성':'')+'</button>'+
+      '\\',\\'REVISE\\')">'+(perTask?revLabel(d.phase,[],false):'수정 요청')+'</button>'+
       '<button class="no" onclick="decide(\\''+esc(d.id)+
       '\\',\\'REJECTED\\')">거절</button></div>';
   }).join('<hr style="border:0;border-top:1px solid #ccd0d5;margin:1.75rem 0">')+
-    '<p class="hint">태스크의 [의견] 을 누르면 그 태스크에만 수정 요청을 남길 수 있습니다. '+
-    '나머지 태스크는 그대로 유지됩니다.<br>'+
+    '<p class="hint">태스크의 [의견] · [다시 작업] 을 누르면 그 태스크에만 요청을 남길 수 '+
+    '있습니다. 완료 보고에서는 지목한 태스크만 다시 실행되고, 나머지 태스크의 결과는 '+
+    '그대로 유지됩니다.<br>'+
     '결정하기 전까지 해당 에이전트는 아무것도 실행하지 못합니다. '+
     '요청은 응답하실 때까지 사라지지 않으니 천천히 검토하셔도 됩니다.</p>';
 }
