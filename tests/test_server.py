@@ -1036,13 +1036,42 @@ class TestPersistence(HandlerTestCase):
         self.assertEqual(plan["approval"]["user_comment"], "이메일은 빼줘")
         self.assertEqual(plan["tasks"][0]["title"], "첫 번째 작업")
 
-    def test_result_log_is_capped_in_responses(self):
+    def test_result_log_is_never_truncated_in_responses(self):
+        """It used to be cut at 200 chars. The approval page is built from this same
+        dict, so that asked a human to certify evidence ending in '...'."""
+        evidence = "민원 접수 화면을 만들었습니다. " * 40  # ~800 chars
         self.approve_flow(["a"])
         self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
         res = self.h.dispatch(
-            "update_task_progress", {"task_id": 1, "status": "DONE", "result_log": "x" * 500}
+            "update_task_progress",
+            {"task_id": 1, "status": "DONE", "result_log": evidence},
         )
-        self.assertLessEqual(len(res["tasks"][0]["result_log"]), 205)
+        self.assertEqual(res["tasks"][0]["result_log"], evidence.strip())
+        self.assertNotIn("...", res["tasks"][0]["result_log"])
+
+    def test_the_page_receives_the_same_untruncated_evidence(self):
+        """What reaches the human must be what the store holds - the whole point."""
+        evidence = "스키마를 정의했습니다. " * 40
+        ui = FakeApprovalUI(decision=None)
+        h = PlanningHandlers(
+            Store(self.state_dir),
+            Config(state_dir=self.state_dir, blocking_approval=True, approval_timeout=1),
+            approval_ui=ui,
+        )
+        h.dispatch("plan_and_think", {"goal": "g", "thought": "t", "step_number": 1,
+                                      "total_steps": 1, "need_more_thinking": False,
+                                      "task_list": ["작업"]})
+        h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
+        ui.decision = "APPROVED"
+        h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
+        h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        h.dispatch("update_task_progress", {"task_id": 1, "status": "DONE",
+                                            "result_log": evidence})
+        ui.decision = None  # capture the completion report instead of answering it
+        h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "끝"})
+        published = ui.opened[-1]
+        self.assertEqual(published["phase"], "COMPLETION")
+        self.assertEqual(published["tasks"][0]["result_log"], evidence.strip())
 
     def test_plan_pruning_keeps_the_active_plan(self):
         config = Config(state_dir=self.state_dir, max_plans=3, blocking_approval=False)

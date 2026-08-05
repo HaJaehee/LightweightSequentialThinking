@@ -1,6 +1,6 @@
 # planning-mcp (LightweightSequentialThinking)
 
-**버전: 1.13.0** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
+**버전: 1.13.1** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
 `SERVER_VERSION` (MCP `initialize` 응답의 `serverInfo.version` 으로 보고됨)
 
 AnythingLLM Agent Mode용 경량 **계획·작업 관리 MCP 서버**. 폐쇄망의 성능이 약한 사내 LLM이

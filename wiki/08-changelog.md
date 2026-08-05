@@ -81,6 +81,11 @@ answer to a targeted request is accepted with a note and audited `targeted_revis
 wasteful, not unsafe, and now measurable. See
 [06](06-human-in-the-loop.md#per-task-review-19x).
 
+> **Superseded in 1.13.0.** Excluding the completion phase was the right diagnosis and the
+> wrong remedy: rewriting a plan line indeed does not answer a completion report, but *redoing
+> the task* does, and that option did not exist. See [D17](09-defects-and-lessons.md#d17).
+
+
 ### 1.11.0 — fewer calls, same enforcement
 An external review of the 1.10.0 tool surface raised two objections on behalf of small models:
 14+ tool calls for a 5-task plan, and the `task_list` (strings) vs `task_updates` (objects) type
@@ -191,6 +196,15 @@ changed. The hint leads with the human's own words and repeats them wherever the
 over. The whole-plan escape hatch stays for add/delete/reorder and now carries evidence across
 the redraft, matched with `title_key` (the `goal_key` relaxation, applied to titles). Defect
 [D17](09-defects-and-lessons.md#d17).
+
+### 1.13.1 — evidence is never truncated
+Found by driving the whole lifecycle through a real stdio MCP server with a browser on the
+approval page. `Task.brief` cut `result_log` at 200 characters "to protect context" — but the
+approval page is built from that same dict, so the completion gate was asking a human to certify
+work whose evidence ended in `...` while the full text sat in `plan_state.json`. The cap is gone
+from both surfaces. `previous_result_log` had the same split (text report only), so the page rows
+now show the request, the old output and the new one together. Defect
+[D18](09-defects-and-lessons.md#d18).
 
 ---
 

@@ -103,9 +103,16 @@ Optional: `result_log`, `plan_id`.
 
 Required: `plan_id` (use the constant `"current"` for the active plan; a real id for a specific
 one). Never mutates, never errors. Returns goal, recent thinking steps (superseded ones
-summarized), tasks with capped `result_log`, progress, approval record, `next_action_hint`
-naming the exact next call. If several plans are active and `plan_id="current"`, returns an
-`active_plans` directory instead of guessing.
+summarized), tasks with their **full** `result_log`, progress, approval record,
+`next_action_hint` naming the exact next call. If several plans are active and
+`plan_id="current"`, returns an `active_plans` directory instead of guessing.
+
+**Evidence is never truncated (1.13.1).** `Task.brief` used to cut `result_log` at 200
+characters "to protect context". The approval page is built from that same dict — handlers pass
+`tasks_brief()` straight to `open_request` — so a completion report asked a human to certify
+work whose evidence ended in `...`, while the whole text sat in `plan_state.json`. If evidence
+ever does threaten context, cap it where it is **written** (a maximum beside `min_result_log`),
+never where it is read: a limit at the read point silently disagrees with what the store holds.
 
 ---
 

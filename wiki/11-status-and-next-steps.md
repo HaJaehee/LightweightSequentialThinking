@@ -1,13 +1,13 @@
 # 11 · Status and Next Steps
 
-## Current state (as of version 1.13.0)
+## Current state (as of version 1.13.1)
 
 - **Code:** feature-complete for the design. All four tools, blocking approval, multi-plan,
   shared approval surface, cross-process locking, failure-path hardening, leniency fuzzing,
   per-task plan review (1.10.0), auto-advance (1.11.0), goal revision (1.12.0), an explicit
   next-step message on every DONE including the last (1.12.1), and rework — a completion
   report can be sent back task by task without re-planning or losing evidence (1.13.0).
-- **Tests:** 275 unit + 5 smoke, all passing. `verify_install.py` runs everything.
+- **Tests:** 276 unit + 5 smoke, all passing. `verify_install.py` runs everything.
   Note: `TestApprovalPageSurface` / `TestPerTaskPageSurface` / `TestBlockingApproval` bind
   hardcoded ports 8788-8799. On a machine where something else already holds them, those
   tests fail on `srv.start()` returning False — a test-isolation weakness, not a server

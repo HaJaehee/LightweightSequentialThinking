@@ -1,6 +1,6 @@
 # 09 · Defects and Lessons
 
-The 17 real defects found while hardening the server, each with root cause, symptom, and fix.
+The 18 real defects found while hardening the server, each with root cause, symptom, and fix.
 **This is the highest-value page for predicting where the next bug is.** Every one lived in a
 place that had no test, and several were *silent* — the server reported success while losing
 data or disarming the safety gate. The last two (D16, D17) were found in *use* rather than by
@@ -267,6 +267,34 @@ completion gate entirely. `_mutate_approved` now routes an all-done approval to
 *this output is wrong*), and the state machine only implemented the first. When a control is
 reachable from two states, ask what it means in **each** — a shortcut that is merely wasteful
 before execution becomes destructive after it, because by then there is work to destroy.
+
+<a id="d18"></a>
+## D18 — The human was asked to certify evidence ending in `...` (1.13.1)
+**Symptom:** on the approval page, every task's `result_log` was cut mid-sentence with a
+trailing `...`. The full text was in `plan_state.json` the whole time.
+**Root cause:** `Task.brief` capped `result_log` at 200 characters, documented as "compact form
+sent to the LLM — capped to protect context". That reasoning was sound for the audience it named
+and wrong about who the audience actually is: `handlers._wait_for_human` passes
+`plan.tasks_brief()` straight into `open_request`, so the **approval page is built from the same
+dict**. The completion gate exists so a human can check whether claimed work is real, and it was
+showing them the first sentence of the claim. The two surfaces had also drifted:
+`render_completion_report` (the text the model echoes into chat) used `result_log` directly and
+was never truncated, so the chat transcript was complete while the page a person actually decides
+on was not.
+**Fix:** the cap is gone. Both surfaces render the stored text. `previous_result_log` — added in
+1.13.0 for rework — had the same split and was likewise only in the text report, so the page rows
+now show `↻ 요청하신 내용` / `이전 결과` / the new outcome together, which is what makes a
+reworked task checkable in one glance.
+**If context ever really is the problem:** cap where evidence is **written** (a maximum beside
+`min_result_log`, refused at `update_task_progress` with a corrective hint), never where it is
+read. A read-side limit silently disagrees with what the store holds, and the disagreement lands
+on whoever is furthest from the code.
+**How it was found:** not by a test — by driving the whole lifecycle through a real stdio MCP
+server with a real browser on the approval page and *looking at it*. Every assertion in the suite
+was green; none of them said "a human can read this".
+**Lesson:** a truncation is a lie about your own data, and it is told to whichever audience you
+were not picturing. When one serializer feeds both a model and a person, the person's constraints
+win — they cannot ask a follow-up question.
 
 ## Where the next bug probably is
 

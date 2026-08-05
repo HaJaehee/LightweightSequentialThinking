@@ -154,25 +154,33 @@ class Task:
         self.previous_title = None
         self.previous_result_log = None
 
-    def brief(self, log_limit: int = 200) -> dict[str, Any]:
-        """Compact form sent to the LLM. result_log is capped to protect context."""
+    def brief(self) -> dict[str, Any]:
+        """The task as everything outside the store sees it. Evidence is NEVER truncated.
 
-        def cap(text: str | None) -> str | None:
-            if text and len(text) > log_limit:
-                return text[:log_limit] + "..."
-            return text
+        `result_log` used to be cut at 200 characters "to protect context". That cap
+        reached the human: the approval page is built from this same dict (handlers
+        passes `tasks_brief()` straight to `open_request`), so a completion report asked
+        someone to certify work whose evidence ended in `...`. Judging a claim you can
+        only see the first sentence of is not a check, and the full text was sitting in
+        `plan_state.json` the whole time.
 
+        The model needs it whole for the same reason: on a rework it is handed
+        `previous_result_log` precisely so it can tell what it already produced and what
+        was missing, and a truncated one hides the ending - usually where the gap is.
+
+        If evidence ever does threaten context, cap it where it is *written* (a maximum
+        next to `min_result_log`), not where it is read: a limit at the read point
+        silently disagrees with what the store holds.
+        """
         out: dict[str, Any] = {"task_id": self.task_id, "title": self.title, "status": self.status}
-        log = cap(self.result_log)
-        if log:
-            out["result_log"] = log
+        if self.result_log:
+            out["result_log"] = self.result_log
         if self.revision_note:
             out["revision_note"] = self.revision_note
         if self.previous_title:
             out["previous_title"] = self.previous_title
-        previous_log = cap(self.previous_result_log)
-        if previous_log:
-            out["previous_result_log"] = previous_log
+        if self.previous_result_log:
+            out["previous_result_log"] = self.previous_result_log
         return out
 
 
