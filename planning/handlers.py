@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import threading
+from dataclasses import dataclass
 from typing import Any
 
 import time
@@ -23,7 +25,13 @@ from .approval import (
     ApprovalStore,
     Verdict,
 )
-from .config import NO_PROGRESS_WAIT_CEILING_SEC, Config
+from .config import (
+    APPROVAL_MODE_CHUNKED,
+    APPROVAL_MODE_RETURN,
+    APPROVAL_MODE_TRUST_HEARTBEAT,
+    NO_PROGRESS_WAIT_CEILING_SEC,
+    Config,
+)
 from .leniency import UNMATCHED_TITLES_KEY, normalize
 from .models import (
     Approval,
@@ -42,6 +50,36 @@ from .state_machine import can_start_task, execution_guard
 from .store import State, Store, goal_key, title_key
 
 log = logging.getLogger("planning-mcp.handlers")
+
+# How the wait ended. The three non-decided outcomes need different things said to the
+# model, and a bare `None` cannot tell them apart: "ask me again in a moment" and "stop,
+# the user never answered" are opposite instructions, and sending the wrong one either
+# strands a live request or spins the model forever.
+WAIT_DECIDED = "DECIDED"          # a human answered; the verdict is attached
+WAIT_PENDING = "PENDING"          # this call's slice is up, budget remains - call back
+WAIT_GAVE_UP = "GAVE_UP"          # the whole budget is spent - show the plan and stop
+WAIT_UNAVAILABLE = "UNAVAILABLE"  # the request could never be published
+
+# How often the waiter tells the page it is still on the other end. Cheap enough to be
+# invisible next to the 0.2s claim poll, frequent enough that the page's liveness chip
+# flips within a few seconds of a call actually ending.
+AGENT_HEARTBEAT_SEC = 10.0
+
+
+@dataclass
+class WaitOutcome:
+    """Why `_wait_for_human` returned, and how much of the human's budget is left.
+
+    A dataclass rather than a tuple for the same reason `Verdict` is one: this grew from
+    a bare `Verdict | None`, and the next field added to a tuple would be silently
+    dropped by every existing call site.
+    """
+
+    verdict: Verdict | None = None
+    reason: str = WAIT_GAVE_UP
+    waited: float = 0.0
+    remaining: float = 0.0
+
 
 # Phrases that assert completion without evidencing it. Length alone cannot separate
 # these from a genuinely terse but informative log - Korean packs a real sentence into
@@ -104,6 +142,7 @@ class PlanningHandlers:
         raw_args: Any,
         progress_token: Any = None,
         notifier: Any = None,
+        cancel_event: Any = None,
     ) -> dict[str, Any]:
         notes: list[str] = []
         try:
@@ -123,7 +162,11 @@ class PlanningHandlers:
                     return self._plan_and_think(clean, notes)
                 if tool_name == "request_user_approval":
                     return self._request_user_approval(
-                        clean, notes, progress_token=progress_token, notifier=notifier
+                        clean,
+                        notes,
+                        progress_token=progress_token,
+                        notifier=notifier,
+                        cancel_event=cancel_event,
                     )
                 if tool_name == "update_task_progress":
                     return self._update_task_progress(clean, notes)
@@ -160,6 +203,24 @@ class PlanningHandlers:
             + [f"{t.task_id}|{t.title}|{t.status}|{(t.result_log or '')}" for t in plan.tasks]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _decision_is_the_models_own(self, plan: Plan | None) -> bool:
+        """Would accepting a decision right now mean trusting the model's word for it?
+
+        True exactly while the human is still being asked about this plan version. The
+        approval store is the authority, not the plan record: the request lives there,
+        it is shared across server processes, and it is withdrawn the instant a real
+        decision lands.
+        """
+        if plan is None or self.approval_ui is None:
+            return False
+        if self.config.autoapprove:
+            return False  # testing escape hatch only; server.py logs a loud warning
+        try:
+            return self.approval_ui.has_pending(plan.plan_id, self._fingerprint(plan))
+        except Exception:  # noqa: BLE001 - an unreadable queue must not block a decision
+            log.exception("Could not read the approval queue; allowing the decision")
+            return False
 
     def _withdraw_approval_request(self, plan: Plan) -> None:
         """Take a plan's request off the page once it has been settled."""
@@ -954,6 +1015,7 @@ class PlanningHandlers:
         notes: list[str],
         progress_token: Any = None,
         notifier: Any = None,
+        cancel_event: Any = None,
     ) -> dict[str, Any]:
         state = self.store.load()
         plan = self._resolve_plan(state, args.get("plan_id"))
@@ -981,8 +1043,40 @@ class PlanningHandlers:
 
         if decision is Decision.ASK_USER:
             return self._ask_user(
-                state, plan, args, notes, progress_token=progress_token, notifier=notifier
+                state,
+                plan,
+                args,
+                notes,
+                progress_token=progress_token,
+                notifier=notifier,
+                cancel_event=cancel_event,
             )
+
+        # Everything below applies a decision. Only a human may make one, and while a
+        # request for this exact plan version is still on the page, no human has.
+        #
+        # `requested_at` alone (checked in _approve) cannot tell the difference: it is
+        # set precisely BECAUSE we are waiting, so it is at its most permissive at the
+        # moment the model is most likely to guess. Under a chunked wait the model is
+        # asked to call this tool over and over, which makes picking APPROVED instead of
+        # ASK_USER a one-token slip away from unlocking execution nobody authorized.
+        #
+        # A decision the human really did make is not blocked here: _apply_late_decision
+        # runs first in dispatch() and every _mutate_* withdraws the request, so by the
+        # time this check sees the queue the entry is already gone.
+        if self._decision_is_the_models_own(plan):
+            self.store.audit(
+                "self_approval_refused", plan_id=plan.plan_id, decision=decision.value
+            )
+            return error(
+                plan,
+                ErrorCode.APPROVAL_PENDING,
+                f"'{decision.value}' did not come from the user - they have not "
+                "answered the request that is still open on the approval page.",
+                notes=notes,
+                approval_url=self.approval_ui.url if self.approval_ui else None,
+            )
+
         if decision is Decision.APPROVED:
             return self._approve(state, plan, args, notes)
         if decision is Decision.REVISE:
@@ -997,6 +1091,7 @@ class PlanningHandlers:
         notes: list[str],
         progress_token: Any = None,
         notifier: Any = None,
+        cancel_event: Any = None,
     ) -> dict[str, Any]:
         if plan.status in (PlanStatus.APPROVED, PlanStatus.IN_EXECUTION):
             task = plan.current_task()
@@ -1062,9 +1157,11 @@ class PlanningHandlers:
             fingerprint = self._fingerprint(plan)
             waited_plan_id = plan.plan_id
             phase = PHASE_COMPLETION if completion_phase else PHASE_PLAN
-            decided = self._wait_for_human(
-                plan, display, progress_token, notifier, notes, phase, plan_summary
+            outcome = self._wait_for_human(
+                plan, display, progress_token, notifier, notes, phase, plan_summary,
+                cancel_event=cancel_event,
             )
+            decided = outcome.verdict
             if decided is not None:
                 # The transaction was released while waiting, so another session may
                 # have moved things on. Re-read THIS plan by id - resolving "the active
@@ -1097,9 +1194,28 @@ class PlanningHandlers:
                     return self._reject(state, plan, forwarded, notes)
                 if decided.decision == Decision.REVISE.value:
                     return self._revise(state, plan, forwarded, notes, verdict=decided)
+
+            if outcome.reason == WAIT_PENDING:
+                # The slice ended, not the question. Everything the model might mistake
+                # for a verdict is deliberately withheld: no tasks, no display_to_user,
+                # no message. A weak model that reads an ok:true payload full of plan
+                # detail as "approved, proceed" is the failure this whole gate exists to
+                # prevent, so the only thing on offer here is an instruction to wait.
+                return error(
+                    plan,
+                    ErrorCode.APPROVAL_PENDING,
+                    "Still waiting for the user to decide on the approval page.",
+                    notes=notes,
+                    approval_url=approval_url,
+                    waited_seconds=int(outcome.waited),
+                    remaining_seconds=int(outcome.remaining),
+                )
+
             notes.append(
                 "No human decision arrived before the wait expired. The plan is still "
-                "LOCKED. Show the plan to the user and stop; do not execute anything."
+                "LOCKED. Show the plan to the user and stop; do not execute anything. "
+                "The request is still open on the approval page - if the user decides "
+                "later, it will be applied on the next tool call."
             )
 
         return build(
@@ -1119,15 +1235,21 @@ class PlanningHandlers:
         notes: list[str],
         phase: str = PHASE_PLAN,
         summary: str = "",
-    ) -> Verdict | None:
-        """Block this tool call until a human decides. Returns None on timeout.
+        cancel_event: Any = None,
+    ) -> WaitOutcome:
+        """Hold this tool call while a human decides.
 
-        This is what actually stops the agent: AnythingLLM's loop waits synchronously
-        for the tool result, so while we do not return, the model cannot emit another
-        tool call - no matter what the system prompt failed to make it do.
+        This is what actually stops the agent: the client's loop waits synchronously for
+        the tool result, so while we do not return, the model cannot emit another tool
+        call - no matter what the system prompt failed to make it do.
+
+        What it must NOT do is outlive the client's patience. A call killed at 60s takes
+        the conversation with it (the client discards the result), so in the default
+        chunked mode the wait is deliberately given up while the client is still
+        listening, and the model is told to come straight back. The request itself stays
+        on the page throughout: it belongs to the human, not to any one tool call.
         """
         can_heartbeat = progress_token is not None and notifier is not None
-        timeout = self.effective_timeout(can_heartbeat)
 
         request_id = self.approval_ui.open_request(
             plan.plan_id, plan.goal, display, plan.tasks_brief(),
@@ -1145,10 +1267,18 @@ class PlanningHandlers:
                 "WARNING: the approval UI could not start, so this plan was NOT hard-paused. "
                 "Do not execute anything. Show the plan to the user and stop."
             )
-            return None
+            return WaitOutcome(reason=WAIT_UNAVAILABLE)
+
+        # Measured from when the request first appeared, not from now: a chunked wait is
+        # many calls (and, after a restart, many processes) against one budget.
+        already_waited = self.approval_ui.request_age(request_id)
+        timeout = self.effective_timeout(can_heartbeat, already_waited)
+        budget_left = max(0.0, self.config.approval_timeout - already_waited)
 
         stop = threading.Event()
         if can_heartbeat:
+            # Still sent, because it costs nothing and genuinely helps the clients that
+            # honour it. It is no longer what the wait's safety depends on.
             threading.Thread(
                 target=self._heartbeat,
                 args=(notifier, progress_token, stop),
@@ -1157,54 +1287,130 @@ class PlanningHandlers:
             ).start()
 
         log.warning(
-            "Blocking for human approval of %s at %s (timeout %ss, heartbeat %s)",
+            "Waiting for human approval of %s at %s (mode %s, this call %ss, "
+            "%ss of budget left, heartbeat %s)",
             plan.plan_id,
             self.approval_ui.url,
+            self.config.approval_mode,
             timeout,
+            int(budget_left),
             "on" if can_heartbeat else "off - no progressToken from client",
         )
         decided: Verdict | None = None
+        cancelled = False
+        started = time.monotonic()
         try:
             # Let every other session through while this one waits on a person.
             with self.store.paused():
-                deadline = time.monotonic() + timeout
-                while time.monotonic() < deadline:
+                deadline = started + timeout
+                next_touch = 0.0
+                while True:
                     # Polling, not an Event: the decision may be recorded by a DIFFERENT
                     # server process (whichever one owns the page), so it has to be read
                     # from shared state.
+                    #
+                    # Claimed before the deadline is examined, so a decision that is
+                    # already waiting is always collected - even when this call's slice
+                    # is zero seconds, as it is in `return` mode and on the last scrap
+                    # of a spent budget.
                     decided = self.approval_ui.claim(request_id)
                     if decided is not None:
                         break
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancelled = True
+                        break
+                    now = time.monotonic()
+                    if now >= deadline:
+                        break
+                    if now >= next_touch:
+                        # Tells the page an agent is genuinely still on the other end.
+                        self.approval_ui.touch_agent(request_id)
+                        next_touch = now + AGENT_HEARTBEAT_SEC
                     time.sleep(0.2)
         finally:
             stop.set()
 
-        if decided is None:
-            # Deliberately leave the request published. Clearing it here is what made
-            # the buttons vanish after 55s, before the human had a chance to answer;
-            # the next tool call collects whatever they click later.
-            self.store.audit("approval_wait_timeout", plan_id=plan.plan_id, timeout=timeout)
-            return None
+        waited = time.monotonic() - started
+        total_waited = already_waited + waited
+        remaining = max(0.0, self.config.approval_timeout - total_waited)
+
+        if decided is not None:
+            self.store.audit(
+                "approval_decided_out_of_band",
+                plan_id=plan.plan_id,
+                decision=decided.decision,
+                comment=decided.comment,
+                scope=decided.scope,
+                task_comments=decided.task_comments or None,
+            )
+            return WaitOutcome(decided, WAIT_DECIDED, total_waited, remaining)
+
+        # Deliberately leave the request published in every case below. Clearing it here
+        # is what once made the buttons vanish after 55s, before the human had a chance
+        # to answer; whatever they click later is collected by _apply_late_decision.
+        if cancelled:
+            # The client stopped listening, so this response is going nowhere - but the
+            # number is worth keeping. It is the only direct measurement of what this
+            # client actually allows, and the next call shrinks itself to fit.
+            self.store.audit(
+                "client_cancelled_call", plan_id=plan.plan_id, after_sec=round(waited, 2)
+            )
+            self.store.record_call_cap(waited)
+            log.warning(
+                "Client abandoned the approval call after %.1fs; future waits will stay "
+                "under that. The request is still open at %s.",
+                waited,
+                self.approval_ui.url,
+            )
+
+        if remaining <= 0 or self.config.approval_mode != APPROVAL_MODE_CHUNKED:
+            self.store.audit(
+                "approval_wait_timeout",
+                plan_id=plan.plan_id,
+                timeout=timeout,
+                total_waited=round(total_waited, 2),
+            )
+            return WaitOutcome(None, WAIT_GAVE_UP, total_waited, 0.0)
+
         self.store.audit(
-            "approval_decided_out_of_band",
+            "approval_chunk_expired",
             plan_id=plan.plan_id,
-            decision=decided.decision,
-            comment=decided.comment,
-            scope=decided.scope,
-            task_comments=decided.task_comments or None,
+            chunk=timeout,
+            total_waited=round(total_waited, 2),
+            remaining=round(remaining, 2),
         )
-        return decided
+        return WaitOutcome(None, WAIT_PENDING, total_waited, remaining)
 
-    def effective_timeout(self, can_heartbeat: bool) -> int:
-        """How long we may hold the tool call open.
+    def effective_timeout(self, can_heartbeat: bool, already_waited: float = 0.0) -> int:
+        """How long we may hold THIS tool call open.
 
-        Without a progressToken we cannot legally send progress notifications, so the
-        wait has to finish inside the client's 60s request timeout. With one, the
-        heartbeat keeps resetting that timer and the configured timeout applies.
+        The distinction that matters is between the total wait (approval_timeout, which
+        belongs to the human) and one call's share of it (which belongs to whatever
+        limit the client enforces). Only the second is capped here.
+
+        `trust_heartbeat` keeps the pre-1.14 bet that progress notifications extend the
+        client's timer. `chunked` makes no assumption about the client at all - which is
+        the only safe default, since the option that controls it is the client's to set
+        and impossible for a server to observe.
         """
-        if can_heartbeat:
-            return self.config.approval_timeout
-        return min(self.config.approval_timeout, NO_PROGRESS_WAIT_CEILING_SEC)
+        # Rounded up, not truncated. Truncating turns any budget with a fractional
+        # remainder into zero, which skips the wait entirely - and a gate that silently
+        # stops waiting is indistinguishable from no gate.
+        remaining = max(0, math.ceil(self.config.approval_timeout - already_waited))
+        mode = self.config.approval_mode
+        if mode == APPROVAL_MODE_RETURN:
+            return 0
+        if mode == APPROVAL_MODE_TRUST_HEARTBEAT:
+            if can_heartbeat:
+                return remaining
+            return min(remaining, NO_PROGRESS_WAIT_CEILING_SEC)
+        budget = max(1, self.config.call_budget)
+        observed = self.store.observed_call_cap()
+        if observed is not None:
+            # A client has already been seen giving up sooner than we assumed. Believe
+            # the measurement over the default, and leave a margin under it.
+            budget = min(budget, max(5, int(observed) - 5))
+        return min(remaining, budget)
 
     @staticmethod
     def _heartbeat(notifier: Any, token: Any, stop: threading.Event) -> None:

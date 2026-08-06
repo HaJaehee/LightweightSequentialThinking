@@ -55,6 +55,14 @@ SERVER_SIGNATURE = "planning-mcp-approval"
 PHASE_PLAN = "PLAN"
 PHASE_COMPLETION = "COMPLETION"
 
+# No poll for this long means no tab is open.
+PAGE_IDLE_SEC = 10.0
+
+# How stale `agent_last_seen` may get before the page stops claiming an agent is still
+# waiting. Comfortably above the waiter's own 10s touch interval, so an ordinary pause
+# between touches never flickers the chip.
+AGENT_IDLE_SEC = 25.0
+
 # How much of the plan one REVISE is allowed to change.
 SCOPE_PLAN = "PLAN"    # rewrite the whole breakdown (the original behaviour)
 SCOPE_TASKS = "TASKS"  # rewrite only the tasks the human commented on
@@ -148,6 +156,13 @@ class ApprovalStore:
         Concurrent sessions each get their own entry: one queue slot per plan would make
         two sessions asking at once hide each other. A new request for the SAME plan
         replaces that plan's old entry (the plan was revised), never another plan's.
+
+        Re-asking about an UNCHANGED plan is not a new question, so it reuses the entry
+        that is already on screen. A chunked wait re-publishes every 45 seconds, and
+        minting a fresh id each time would be destructive in three separate ways: the
+        page's signature would change and wipe the card - taking any half-written
+        comment with it - the alarm would re-fire, and `created_at` would reset, so the
+        total wait budget could never actually run out.
         """
         request_id = uuid.uuid4().hex
         entry = {
@@ -172,7 +187,19 @@ class ApprovalStore:
         }
         with exclusive(self.lock_path) as got:
             record = self.read()
-            queue = [r for r in self._requests(record) if r.get("plan_id") != plan_id]
+            queue = self._requests(record)
+            # Checked under the same lock as the write, so two threads asking at once
+            # cannot both decide the entry is missing and mint one each.
+            for candidate in queue:
+                if (
+                    candidate.get("plan_id") == plan_id
+                    and candidate.get("fingerprint") == fingerprint
+                    and candidate.get("decision") is None
+                ):
+                    if not got:
+                        log.warning("Read the approval queue without the write lock")
+                    return str(candidate.get("id"))
+            queue = [r for r in queue if r.get("plan_id") != plan_id]
             queue.append(entry)
             written = self._write({"requests": queue})
         if not got:
@@ -242,6 +269,69 @@ class ApprovalStore:
     def peek(self) -> list[dict[str, Any]]:
         """Everything currently queued, oldest first."""
         return sorted(self._requests(self.read()), key=lambda r: r.get("created_at", 0))
+
+    def pending_entry(self, plan_id: str, fingerprint: str) -> dict[str, Any] | None:
+        """The live, still-undecided request for exactly this plan version, if any.
+
+        The fingerprint is part of the match on purpose: an entry for a plan that has
+        since been rewritten is not a question anyone is still being asked, so it must
+        not hold up the version that replaced it.
+        """
+        for entry in self._requests(self.read()):
+            if (
+                entry.get("plan_id") == plan_id
+                and entry.get("fingerprint") == fingerprint
+                and entry.get("decision") is None
+            ):
+                return entry
+        return None
+
+    def has_pending(self, plan_id: str, fingerprint: str) -> bool:
+        """Is a human still looking at this exact plan version?
+
+        While this is true the only decision that counts is one that came off the page.
+        A decision arriving through the tool call instead is the model answering its own
+        question - see the guard in _request_user_approval.
+        """
+        return self.pending_entry(plan_id, fingerprint) is not None
+
+    def entry(self, request_id: str) -> dict[str, Any] | None:
+        for candidate in self._requests(self.read()):
+            if candidate.get("id") == request_id:
+                return candidate
+        return None
+
+    def request_age(self, request_id: str) -> float:
+        """Seconds since this request first went on screen.
+
+        The total wait budget is measured from here rather than from the start of the
+        current tool call, because a chunked wait spans many calls - and, after a
+        restart, many processes. `publish` reuses the entry precisely so this number
+        keeps counting across both.
+        """
+        entry = self.entry(request_id)
+        if entry is None:
+            return 0.0
+        try:
+            return max(0.0, time.time() - float(entry.get("created_at") or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def touch_agent(self, request_id: str) -> None:
+        """Mark the agent as still waiting on this request.
+
+        The page shows this as a liveness chip. It is deliberately not a countdown: the
+        request outlives any single tool call, so a deadline would be a lie, and the one
+        thing the human actually needs to know is whether deciding right now resumes the
+        conversation by itself or needs a nudge in chat.
+        """
+        with exclusive(self.lock_path):
+            queue = self._requests(self.read())
+            for candidate in queue:
+                if candidate.get("id") == request_id:
+                    candidate["agent_last_seen"] = time.time()
+                    self._write({"requests": queue})
+                    return
 
     @staticmethod
     def _verdict(entry: dict[str, Any]) -> Verdict:
@@ -391,6 +481,17 @@ textarea.tc{display:none;min-height:2.4rem;margin:.4rem 0 0 1.95em;width:calc(10
 .scope{display:flex;align-items:center;gap:.45rem;margin:-.5rem 0 1rem;font-size:.86rem;
        opacity:.75}
 .scope input{margin:0}
+/* Whether an agent is still holding a call open for this request. Not a countdown:
+   the request outlives any one tool call, so the honest thing to show is not how long
+   is left but whether deciding right now resumes the conversation by itself. */
+.chip{display:inline-block;font-size:.78rem;padding:.2rem .55rem;border-radius:999px;
+      margin:0 0 .9rem;line-height:1.5}
+.chip.live{background:#e6f4ea;color:#1a7f37}
+.chip.idle{background:#fdf0e3;color:#8a5a00}
+@media(prefers-color-scheme:dark){
+  .chip.live{background:#16281c;color:#5dbb77}
+  .chip.idle{background:#2a2115;color:#d9a441}
+}
 </style></head><body><div class="card" id="root">
 <div class="idle">현재 승인 요청 메시지가 없습니다.<br>
 <span style="font-size:.85rem">에이전트가 계획을 제출하면 여기에 표시됩니다.</span></div></div>
@@ -417,17 +518,129 @@ function alertOff(){
   if(flash){clearInterval(flash);flash=null;}
   document.title=IDLE_TITLE;
 }
+// ---- drafts --------------------------------------------------------------
+// What the human has typed but not yet submitted lives in localStorage, not in the DOM.
+// The page rebuilds itself whenever the queue changes - a second session asking for
+// approval is enough - and rebuilding used to throw away a half-written comment with no
+// trace. Keeping drafts outside the DOM means they survive that, plus a reload, plus
+// closing the tab. localStorage is shared per origin, so the `storage` event below also
+// keeps two open tabs showing the same text: whichever one the human finally submits
+// from, it carries what they wrote.
+const DRAFT='planning-mcp:draft:';
+function dkey(req,tid){return DRAFT+req+':'+tid;}
+function dget(req,tid){
+  try{const v=localStorage.getItem(dkey(req,tid));return v===null?'':v;}catch(e){return '';}
+}
+function dset(req,tid,value){
+  // Empty strings are stored, never removed: "I deleted what I wrote" is a state that
+  // has to survive a re-render too, or the old text comes back.
+  try{localStorage.setItem(dkey(req,tid),value);}catch(e){}
+}
+function dkeys(){
+  const out=[];
+  try{
+    for(let i=0;i<localStorage.length;i++){
+      const k=localStorage.key(i);
+      if(k&&k.indexOf(DRAFT)===0)out.push(k);
+    }
+  }catch(e){}
+  return out;
+}
+function dclear(req){
+  try{dkeys().forEach(k=>{if(k.indexOf(DRAFT+req+':')===0)localStorage.removeItem(k);});}catch(e){}
+}
+// Drafts for requests that have left the queue would otherwise sit there forever and
+// reappear if an id were ever reused.
+function dprune(ids){
+  try{
+    dkeys().forEach(k=>{
+      const rest=k.slice(DRAFT.length);
+      const cut=rest.indexOf(':');
+      if(cut>0&&ids.indexOf(rest.slice(0,cut))<0)localStorage.removeItem(k);
+    });
+  }catch(e){}
+}
+function taskBoxes(req){
+  return document.querySelectorAll('textarea.tc[data-req="'+req+'"]');
+}
+function restore(list){
+  list.forEach(d=>{
+    if(d.decided)return;
+    const all=document.getElementById('c-'+d.id);
+    if(all)all.value=dget(d.id,'_all');
+    const whole=document.getElementById('all-'+d.id);
+    if(whole)whole.checked=dget(d.id,'_whole')==='1';
+    taskBoxes(d.id).forEach(b=>{
+      b.value=dget(d.id,b.getAttribute('data-tid'));
+      // A restored comment has to be visible, or the human sends a targeted revision
+      // they cannot see. relabel() marks the row; opening it lets them edit it.
+      if(b.value.trim()){
+        const task=b.closest('.task');
+        if(task){
+          task.classList.add('open');
+          const btn=task.querySelector('.tcbtn');
+          if(btn)btn.setAttribute('aria-expanded','true');
+        }
+      }
+    });
+    relabel(d.id);
+  });
+}
+// One delegated listener on a container that outlives every re-render, so no inline
+// handler has to carry an escaped id.
+function onInput(ev){
+  const el=ev.target;
+  if(!el)return;
+  if(el.type==='checkbox'&&el.id.indexOf('all-')===0){
+    const req=el.id.slice(4);
+    dset(req,'_whole',el.checked?'1':'');
+    relabel(req);
+    return;
+  }
+  if(el.tagName!=='TEXTAREA')return;
+  const req=el.getAttribute('data-req');
+  if(req){dset(req,el.getAttribute('data-tid'),el.value);relabel(req);return;}
+  if(el.id.indexOf('c-')===0)dset(el.id.slice(2),'_all',el.value);
+}
+// Another tab wrote a draft. Mirror it here so both windows show the same thing - the
+// property the old full-rebuild had by accident, kept on purpose.
+function onStorage(ev){
+  if(!ev.key||ev.key.indexOf(DRAFT)!==0)return;
+  const rest=ev.key.slice(DRAFT.length);
+  const cut=rest.indexOf(':');
+  if(cut<0)return;
+  const req=rest.slice(0,cut),tid=rest.slice(cut+1),value=ev.newValue||'';
+  if(tid==='_whole'){
+    const box=document.getElementById('all-'+req);
+    if(box)box.checked=value==='1';
+    relabel(req);
+    return;
+  }
+  const el=tid==='_all'
+    ? document.getElementById('c-'+req)
+    : document.querySelector('textarea[data-req="'+req+'"][data-tid="'+tid+'"]');
+  if(!el||el===document.activeElement)return;
+  el.value=value;
+  if(tid!=='_all'&&value.trim()){
+    const task=el.closest('.task');
+    if(task)task.classList.add('open');
+  }
+  relabel(req);
+}
+
 async function poll(){
   if(busy)return;
   try{
     const r=await fetch('/api/pending');const d=await r.json();
     const list=d.requests||[];
-    const sig=list.map(x=>x.id+':'+(x.decided||'')).join('|');
+    dprune(list.map(x=>x.id));
+    const sig=list.map(x=>x.id+':'+(x.decided||'')+':'+(x.agent_waiting?1:0)).join('|');
     if(sig===seen)return;
     seen=sig;
     const undecided=list.filter(x=>!x.decided);
     pendingCount=undecided.length;
     render(list);
+    restore(list);
     if(undecided.length)alertOn();else alertOff();
   }catch(e){}
 }
@@ -526,8 +739,7 @@ function taskRows(d){
     }
     row+='<textarea class="tc" data-req="'+esc(d.id)+'" data-tid="'+esc(String(t.task_id))+
       '" placeholder="'+(done?'이 태스크를 어떻게 다시 해야 하는지 적어주세요'
-                             :'이 태스크에 대한 의견 (선택)')+
-      '" oninput="relabel(\\''+esc(d.id)+'\\')"></textarea>';
+                             :'이 태스크에 대한 의견 (선택)')+'"></textarea>';
     return row+'</div>';
   }).join('')+'</div>';
 }
@@ -555,11 +767,14 @@ function render(list){
     let html=perTask?header(d)+taskRows(d)
       :'<h1>'+(d.phase==='COMPLETION'?'완료 확인':'승인 요청')+' · '+esc(d.plan_id)+
        '</h1><p class="goal">'+esc(d.goal)+'</p><pre>'+esc(d.display)+'</pre>';
+    html+=d.agent_waiting
+      ? '<div class="chip live">에이전트가 대기 중입니다 · 결정하시면 바로 이어집니다</div>'
+      : '<div class="chip idle">에이전트가 대기를 멈췄습니다 · 지금 결정하셔도 반영되지만, '+
+        '채팅에 아무 메시지나 한 번 보내야 이어집니다</div>';
     html+='<textarea id="c-'+esc(d.id)+
-      '" placeholder="전체 의견 (거절 사유도 여기에)"'+
-      (perTask?' oninput="relabel(\\''+esc(d.id)+'\\')"':'')+'></textarea>';
+      '" placeholder="전체 의견 (거절 사유도 여기에)"></textarea>';
     if(perTask)html+='<label class="scope"><input type="checkbox" id="all-'+esc(d.id)+
-      '" onchange="relabel(\\''+esc(d.id)+'\\')"> '+
+      '"> '+
       (d.phase==='COMPLETION'?'계획 자체를 다시 세우기 (태스크 추가·삭제·순서 변경은 이쪽)'
                              :'계획 전체를 다시 세우기 (태스크 추가·삭제·순서 변경은 이쪽)')+
       '</label>';
@@ -587,9 +802,17 @@ async function decide(id,dec){
     await fetch('/api/decide',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({id:id,decision:dec,comment:c,
         task_comments:comments(id),scope:scopeOf(id)})});
+    // Only once the decision is away. Clearing first would lose the text if the POST
+    // failed, and this is the one copy of it.
+    dclear(id);
   }catch(e){}
   busy=false;seen='';poll();
 }
+// Bound to #root rather than to each textarea: #root outlives every re-render, so the
+// listeners survive a rebuild that replaces all of its children.
+document.getElementById('root').addEventListener('input',onInput);
+document.getElementById('root').addEventListener('change',onInput);
+window.addEventListener('storage',onStorage);
 poll();setInterval(poll,1500);
 </script></body></html>"""
 
@@ -634,6 +857,10 @@ class ApprovalServer:
         self._lock = threading.Lock()
         self._opened_once = False
         self._stop = threading.Event()
+        # When the page last asked for work. A live tab makes opening another one pure
+        # harm: the human ends up with several windows holding different half-written
+        # comments, and whichever one they submit from silently discards the rest.
+        self._last_poll_at = 0.0
 
     @property
     def url(self) -> str:
@@ -731,20 +958,50 @@ class ApprovalServer:
     def claim(self, request_id: str) -> Verdict | None:
         return self.store.claim(request_id)
 
+    def has_pending(self, plan_id: str, fingerprint: str) -> bool:
+        return self.store.has_pending(plan_id, fingerprint)
+
+    def request_age(self, request_id: str) -> float:
+        return self.store.request_age(request_id)
+
+    def touch_agent(self, request_id: str) -> None:
+        self.store.touch_agent(request_id)
+
     def take_decision(self, plan_id: str, fingerprint: str) -> Verdict | None:
         return self.store.claim_for_plan(plan_id, fingerprint)
 
     def drop_for_plan(self, plan_id: str) -> None:
         self.store.drop_for_plan(plan_id)
 
+    def page_is_being_watched(self) -> bool:
+        """Has a tab polled us recently enough to count as open?
+
+        The page polls every 1.5s, so a gap of PAGE_IDLE_SEC means every tab is gone
+        (or was never opened). Peers serving the same state directory update their own
+        copy of this, not ours - which is the conservative direction to be wrong in:
+        the worst case is one extra tab, not a request nobody sees.
+        """
+        return (time.time() - self._last_poll_at) < PAGE_IDLE_SEC
+
     def _surface(self) -> None:
         log.warning("HUMAN APPROVAL NEEDED -> %s", self.url)
-        if self.open_browser:
-            self._open_browser_once()
+        if not self.open_browser:
+            return
+        if self.page_is_being_watched():
+            log.info("A tab is already watching %s; not opening another", self.url)
+            return
+        self._open_browser_once()
 
     def _open_browser_once(self) -> None:
         """Best-effort only. Corporate policy, a missing default browser, or a second
-        monitor can all defeat this, which is why the page also polls."""
+        monitor can all defeat this, which is why the page also polls.
+
+        Once really does mean once. This used to open a window on every single approval
+        request, because the `_opened_once` guard it is named for lived only in the
+        caller in `start()`.
+        """
+        if self._opened_once:
+            return
         try:
             if webbrowser.open(self.url):
                 self._opened_once = True
@@ -793,6 +1050,8 @@ class ApprovalServer:
                         {"server": SERVER_SIGNATURE, "state_dir": str(server.store.state_dir)}
                     )
                 elif path == "/api/pending":
+                    server._last_poll_at = time.time()
+                    now = time.time()
                     self._json({"requests": [
                         {
                             "id": e["id"],
@@ -809,6 +1068,14 @@ class ApprovalServer:
                             # page treats a missing phase as "use the original form".
                             "phase": e.get("phase"),
                             "decided": e.get("decision"),
+                            # Whether an agent is still holding a call open for this
+                            # request. Deliberately not a countdown: the request
+                            # outlives any single tool call, so a deadline would be a
+                            # lie. What the human cannot otherwise tell is whether
+                            # deciding right now resumes the conversation on its own.
+                            "agent_waiting": (
+                                now - float(e.get("agent_last_seen") or 0.0)
+                            ) < AGENT_IDLE_SEC,
                         }
                         for e in server.store.peek()
                     ]})

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from typing import Any
 
 log = logging.getLogger("planning-mcp.protocol")
@@ -42,6 +43,12 @@ class McpProtocol:
         # Set by the transport once it owns the output stream. Lets a blocking handler
         # emit progress heartbeats that keep the client's request timer alive.
         self.notifier = notifier
+        # Tool calls currently executing, so `notifications/cancelled` can reach the one
+        # it names. Keyed by str(id): a client is free to send the id as a number and
+        # echo it back as a string, and a missed match means the handler goes on waiting
+        # for a client that stopped listening minutes ago.
+        self._inflight: dict[str, threading.Event] = {}
+        self._inflight_lock = threading.Lock()
 
     # ---- JSON-RPC plumbing ---------------------------------------------
     @staticmethod
@@ -65,7 +72,7 @@ class McpProtocol:
         is_notification = "id" not in msg
 
         try:
-            result = self._route(method, params)
+            result = self._route(method, params, msg_id)
         except Exception as exc:  # noqa: BLE001
             log.exception("Protocol error handling %s", method)
             if is_notification:
@@ -81,8 +88,28 @@ class McpProtocol:
             return None
         return self._result(msg_id, result)
 
+    # ---- cancellation ----------------------------------------------------
+    def _cancel(self, request_id: Any) -> None:
+        """A client has given up on a call it made. Stop working on it.
+
+        This used to be swallowed with the other notifications. The cost was invisible
+        and large: when a client abandons a blocking approval at its own request
+        timeout, the server went on holding the wait - up to the full approval timeout -
+        for a reply nobody would ever read, and learned nothing from the event. The
+        handler now unblocks promptly and records how long the client actually allowed,
+        which is the only reliable way to find out what a given client's limit is.
+        """
+        if request_id is None:
+            return
+        with self._inflight_lock:
+            event = self._inflight.get(str(request_id))
+        if event is None:
+            return  # already finished, or never ours
+        log.warning("Client cancelled request %s", request_id)
+        event.set()
+
     # ---- method routing -------------------------------------------------
-    def _route(self, method: str | None, params: dict[str, Any]) -> Any:
+    def _route(self, method: str | None, params: dict[str, Any], msg_id: Any = None) -> Any:
         if method == "initialize":
             return {
                 "protocolVersion": params.get("protocolVersion") or PROTOCOL_VERSION,
@@ -94,14 +121,17 @@ class McpProtocol:
                     "update_task_progress. Always obey the next_action field in every response."
                 ),
             }
-        if method in ("notifications/initialized", "initialized", "notifications/cancelled"):
+        if method == "notifications/cancelled":
+            self._cancel(params.get("requestId"))
+            return {}
+        if method in ("notifications/initialized", "initialized"):
             return {}
         if method == "ping":
             return {}
         if method == "tools/list":
             return {"tools": self.tools}
         if method == "tools/call":
-            return self._call_tool(params)
+            return self._call_tool(params, msg_id)
         if method == "resources/list":
             return {"resources": []}
         if method == "resources/templates/list":
@@ -112,7 +142,7 @@ class McpProtocol:
             return {}
         return _UNKNOWN_METHOD
 
-    def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _call_tool(self, params: dict[str, Any], msg_id: Any = None) -> dict[str, Any]:
         name = params.get("name")
         arguments = params.get("arguments")
         if isinstance(arguments, str):
@@ -136,15 +166,27 @@ class McpProtocol:
             }
         else:
             # MCP only permits progress notifications for a request that supplied a
-            # token. Its presence decides whether a blocking handler may wait past the
-            # client's 60s request timeout.
+            # token. Since 1.14.0 the wait no longer depends on them - it is chunked to
+            # fit inside the client's limit either way - so the token only decides
+            # whether the heartbeat is sent at all.
             meta = params.get("_meta") or {}
-            payload = self.handlers.dispatch(
-                name,
-                arguments,
-                progress_token=meta.get("progressToken"),
-                notifier=self.notifier,
-            )
+            cancel_event = threading.Event()
+            key = None if msg_id is None else str(msg_id)
+            if key is not None:
+                with self._inflight_lock:
+                    self._inflight[key] = cancel_event
+            try:
+                payload = self.handlers.dispatch(
+                    name,
+                    arguments,
+                    progress_token=meta.get("progressToken"),
+                    notifier=self.notifier,
+                    cancel_event=cancel_event,
+                )
+            finally:
+                if key is not None:
+                    with self._inflight_lock:
+                        self._inflight.pop(key, None)
 
         text = json.dumps(payload, ensure_ascii=False, indent=2)
         return {"content": [{"type": "text", "text": text}], "isError": False}

@@ -31,21 +31,106 @@ model ── request_user_approval(ASK_USER) ──►  server
 
 ## Timeout arithmetic (this determines everything)
 
-The MCP TypeScript SDK that AnythingLLM uses:
-- default per-request timeout **60 s** (`DEFAULT_REQUEST_TIMEOUT_MSEC`),
-- resets it on every progress notification (`resetTimeoutOnProgress` defaults true),
-- no `maxTotalTimeout`.
+Every MCP client caps a single `tools/call`. The TypeScript SDK's
+`DEFAULT_REQUEST_TIMEOUT_MSEC` is **60 s**, and that number is the de facto industry
+default: AnythingLLM inherits it, Claude Desktop hardcodes it with no way to configure it
+([claude-code#22542], [claude-code#43791]), Cursor matches it. Overrunning it does not merely
+fail the call — the client **discards the result and the conversation breaks mid-approval**.
 
-So:
-- **With a `progressToken`** (client supplies one): a 20 s heartbeat resets the timer forever →
-  the wait can last up to `approval_timeout` (default 900 s), effectively unbounded.
-- **Without a token:** the server caps the wait at `NO_PROGRESS_WAIT_CEILING_SEC` (55 s) and
-  returns the ordinary locked response, avoiding a `-32001` client error.
+### The heartbeat bet, and why it was wrong (fixed in 1.14.0)
 
-**Measured fact:** Claude Code does **not** send a progressToken → it hits the 55 s ceiling.
-Whether AnythingLLM sends one must be checked in the field — the server logs which mode it is in
-(`heartbeat on` / `heartbeat off - no progressToken from client`). Both transports (stdio and
-SSE) can send heartbeats; SSE's notifier fans them to open streams.
+Until 1.13 this server bet everything on progress notifications: send
+`notifications/progress` every 20 s, the client resets its timer, and one call could block for
+the full 900 s. That bet failed twice over.
+
+1. `resetTimeoutOnProgress` **defaulted to `false`** in the TypeScript SDK and was only later
+   flipped to `true` ([typescript-sdk#849]). Any client on an older bundled SDK ignores the
+   heartbeat entirely.
+2. It is a **per-request option the client passes**. A server cannot set it, cannot read it,
+   and cannot detect which way it went. The only symptom is the call dying at 60 s with a
+   heartbeat thread still ticking happily.
+
+Betting a safety gate on a flag the other side owns is the bug. The heartbeat is still sent
+when a `progressToken` is present — it costs nothing and helps the clients where it works —
+but nothing depends on it.
+
+### Chunked waiting (the default)
+
+`approval_mode=chunked` splits the wait into slices of `call_budget` (default **45 s**). Each
+slice ends in a normal response that says *not decided yet, call me straight back*, and the
+model does. The total wait is still `approval_timeout` (default 900 s), measured from when the
+request first appeared — **not** from the start of the current call, so it survives both the
+slicing and a server restart.
+
+This is also where the protocol itself is heading: splitting one long call into several
+request/response pairs ([SEP-1391] Long-Running Operations, [SEP-1539] Timeout Coordination,
+[mcp#982]).
+
+| mode | one call lasts | resumes by itself after a click? | when to use |
+|---|---|---|---|
+| `chunked` *(default)* | ≤ `call_budget` (45 s) | yes, within one slice | always, unless measured otherwise |
+| `return` | ~0 s | no — the user must send a chat message | clients that punish repeat tool calls |
+| `trust_heartbeat` | up to 900 s | yes | only where progress resets are *measured* to work |
+
+The slice response is `ok:false` + `error_code: APPROVAL_PENDING`, and it deliberately carries
+**no** `tasks`, `display_to_user`, `message` or `next_task`. A weak model reading an `ok:true`
+payload full of plan detail as "approved, proceed" is precisely the failure this gate exists to
+prevent, so there is nothing in the payload that could be mistaken for a verdict.
+
+### Learning the real limit
+
+`notifications/cancelled` used to be swallowed. Now it unblocks the waiting call and records
+how long the client actually allowed, in `state/client_caps.json` (audited as
+`client_cancelled_call`). Later slices shrink to stay under the tightest value ever observed.
+This is the only reliable way to discover a client's cap, since it is not in `initialize` and
+the documented defaults cannot be trusted.
+
+[claude-code#22542]: https://github.com/anthropics/claude-code/issues/22542
+[claude-code#43791]: https://github.com/anthropics/claude-code/issues/43791
+[typescript-sdk#849]: https://github.com/modelcontextprotocol/typescript-sdk/pull/849
+[SEP-1391]: https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1391
+[SEP-1539]: https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1539
+[mcp#982]: https://github.com/modelcontextprotocol/modelcontextprotocol/issues/982
+
+## Only a human may decide (1.14.0)
+
+`_approve` checked only `plan.approval.requested_at` — a field that is set *because* we are
+waiting, so it was at its most permissive exactly when the model was most likely to guess. A
+model could call `request_user_approval(decision='APPROVED')` and unlock a plan nobody had
+approved. Chunked waiting would have made that far worse, since the model is now asked to call
+this tool repeatedly and `APPROVED` is one token away from `ASK_USER`.
+
+While an undecided request for this plan version is live on the page, a model-sourced
+`APPROVED` / `REJECTED` / `REVISE` is refused with `APPROVAL_PENDING` and audited as
+`self_approval_refused`. Real decisions are never blocked: `_apply_late_decision` runs first in
+`dispatch`, and every `_mutate_*` withdraws the request, so a genuine click has already
+emptied the queue before the guard looks.
+
+## The page never loses what you typed (1.14.0)
+
+The page rebuilds its whole card list whenever the queue changes, and a second session asking
+for approval is enough to trigger it. Two fixes keep a half-written comment safe:
+
+- **`publish` reuses the entry** when plan id *and* fingerprint match an undecided request.
+  A chunked wait re-publishes every 45 s; minting a fresh id each time would change the page
+  signature, wipe the card, re-fire the alarm, and reset `created_at` so the total budget could
+  never expire.
+- **Drafts live in `localStorage`**, keyed `planning-mcp:draft:<request_id>:<task_id>`, not in
+  the DOM. They survive a rebuild, a reload, and closing the tab. A `storage` listener mirrors
+  them into every other open tab, so two windows show the same text — whichever one the human
+  submits from carries what they wrote. Empty strings are stored rather than deleted, so
+  "I erased that" also survives.
+
+There is deliberately **no countdown**. A countdown measures the tool call, but the request
+outlives the call, so the number would be a lie *and* would manufacture urgency the page
+explicitly promises is unnecessary. Instead each card carries a liveness chip driven by
+`agent_last_seen`: *에이전트가 대기 중* (deciding now resumes the conversation by itself) or
+*에이전트가 대기를 멈췄습니다* (the decision still counts, but the user must send one chat
+message to continue).
+
+`_surface` also stopped opening a browser window per request — `_open_browser_once` never
+checked the `_opened_once` flag it is named for. It now honours it, and skips opening entirely
+when a tab has polled `/api/pending` within the last 10 s.
 
 ## The request outlives the tool call (1.5.0)
 

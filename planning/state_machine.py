@@ -22,6 +22,20 @@ def _error_action(plan: Plan | None, code: ErrorCode) -> tuple[str, str]:
             "You cannot start tasks yet - the user has not approved the plan. "
             "Call request_user_approval with decision='ASK_USER'.",
         )
+    if code is ErrorCode.APPROVAL_PENDING:
+        # Two callers share this code, and the instruction is the same for both: a wait
+        # chunk that ended with the request still on screen, and a model that tried to
+        # decide on the user's behalf while it was. Saying "no approval has been given"
+        # first matters more than saying what to call - a weak model that reads this as
+        # a go-ahead is the exact failure the whole gate exists to prevent.
+        return (
+            NextAction.CALL_REQUEST_USER_APPROVAL.value,
+            "The user has NOT decided yet. No approval has been given and nothing is "
+            "unlocked. Do not execute anything, do not answer the user, do not ask them "
+            "anything and do not print the plan again. Call request_user_approval "
+            "immediately with decision='ASK_USER' and the same plan_summary as before. "
+            "Repeat that until this response changes. Output no text meanwhile.",
+        )
     if code is ErrorCode.PLAN_NOT_READY:
         return (
             NextAction.CALL_PLAN_AND_THINK.value,

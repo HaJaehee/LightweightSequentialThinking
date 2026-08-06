@@ -2,8 +2,9 @@
   "_comment": "Configuration reference. Source of truth: planning/config.py. All optional, safe defaults. Env vars are read by Config.from_env.",
   "constants": {
     "SDK_REQUEST_TIMEOUT_SEC": 60,
+    "CALL_BUDGET_SEC": 45,
     "NO_PROGRESS_WAIT_CEILING_SEC": 55,
-    "_note": "MCP TypeScript SDK default request timeout is 60s; without a progressToken the blocking wait is capped at 55s to avoid a -32001 client error."
+    "_note": "Clients cap a single tools/call at ~60s (DEFAULT_REQUEST_TIMEOUT_MSEC; hardcoded in Claude Desktop) and DISCARD the result on overrun, breaking the conversation. Progress heartbeats are not a fix: resetTimeoutOnProgress is a client-passed option that defaulted to false in older SDKs and cannot be set or read by a server. So the wait is chunked into CALL_BUDGET_SEC slices. NO_PROGRESS_WAIT_CEILING_SEC now applies only to the legacy trust_heartbeat mode."
   },
   "settings": [
     {
@@ -52,13 +53,25 @@
       "field": "approval_timeout",
       "env": "PLANNING_MCP_APPROVAL_TIMEOUT",
       "default": 900,
-      "purpose": "Max blocking-wait seconds. Auto-reduced to 55 when the client sends no progressToken."
+      "purpose": "TOTAL seconds the human may take, accumulated across chunked tool calls and measured from when the request first appeared (survives a server restart)."
+    },
+    {
+      "field": "call_budget",
+      "env": "PLANNING_MCP_CALL_BUDGET",
+      "default": 45,
+      "purpose": "Ceiling on ONE tools/call. Must stay under the client's request timeout (~60s) or the client drops the result. Shrinks automatically below any cancellation actually observed (state/client_caps.json)."
+    },
+    {
+      "field": "approval_mode",
+      "env": "PLANNING_MCP_APPROVAL_MODE",
+      "default": "chunked",
+      "purpose": "chunked: slice the wait into call_budget pieces and have the model call straight back (conversation resumes without user input). return: publish and return at once (user must send a chat message after deciding). trust_heartbeat: pre-1.14 single long call, only where progress resets are measured to work."
     },
     {
       "field": "approval_open_browser",
       "env": "PLANNING_MCP_APPROVAL_OPEN_BROWSER",
       "default": true,
-      "purpose": "Auto-open the approval page in a browser on startup and each request (best-effort)."
+      "purpose": "Auto-open the approval page on startup (best-effort). Since 1.14.0 a request never opens a second window: once only, and not at all while a tab has polled within 10s."
     },
     {
       "field": "approval_ttl",

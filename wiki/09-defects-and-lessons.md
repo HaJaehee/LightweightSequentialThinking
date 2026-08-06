@@ -1,12 +1,14 @@
 # 09 · Defects and Lessons
 
-The 19 real defects found while hardening the server, each with root cause, symptom, and fix.
+The 22 real defects found while hardening the server, each with root cause, symptom, and fix.
 **This is the highest-value page for predicting where the next bug is.** Every one lived in a
 place that had no test, and several were *silent* — the server reported success while losing
 data or disarming the safety gate. D16 and D17 were found in *use* rather than by testing, and
 both were the same shape: a state the protocol could reach but had no instruction for. D18 and
 D19 came from *looking at the running system* — one by reading the page a human decides on,
-one by scripting a model that ignores every hint.
+one by scripting a model that ignores every hint. D20–D22 came from *reading the other side's
+source and issue tracker*: an SDK default this code had documented backwards, and two guards
+whose names asserted an invariant the code never checked.
 
 The meta-lesson, stated once: **a green test suite over untested seams means nothing.** The way
 these were found was to write a test asserting a *guarantee* (not the current output) for each
@@ -318,6 +320,79 @@ rejected outcome, and two tasks that legitimately produce the same sentence must
 the perfect forgery. Every piece of context you give a weak model to help it do the work is
 equally a way to *look* like it did the work — so when you add one, ask what the laziest
 possible use of it would be, and close that first.
+
+## D20 — the model could approve its own plan (1.14.0)
+
+**Root cause:** `_approve` guarded on `plan.approval.requested_at`, which answers "was this
+version ever shown to a human?" — not "did a human answer?". That field is set *because* the
+server is waiting, so the guard was at its most permissive at exactly the moment the model was
+most likely to guess.
+**Symptom:** none observed, but the route was fully open: `request_user_approval(decision=
+'APPROVED')` from the model unlocked execution with nobody having clicked anything. Every other
+layer holds (`execution_guard` refuses tasks while `AWAITING_APPROVAL`), which is precisely why
+this was invisible — the model did not need to break the execution gate, it could just open it.
+**Fix:** while an undecided request for this plan id *and* fingerprint is live in the approval
+store, a model-sourced `APPROVED`/`REJECTED`/`REVISE` is refused with `APPROVAL_PENDING` and
+audited as `self_approval_refused`. The store is the authority, not the plan record: the request
+lives there, it is shared across processes, and it is withdrawn the instant a real decision
+lands — so a genuine click is never blocked (`_apply_late_decision` runs first in `dispatch`).
+**Lesson:** "was the question asked?" and "was it answered?" are different questions, and a
+field that tracks the first will always look most permissive while you wait for the second. When
+a guard protects against the model inventing an input, check the channel the *human* uses, not
+a flag the server set on the model's behalf.
+
+## D21 — the heartbeat bet, and the swallowed cancellation (1.14.0)
+
+**Root cause:** the blocking wait extended past the client's 60 s request timeout by sending
+`notifications/progress`, on the documented assumption that `resetTimeoutOnProgress` defaults to
+`true` and no `maxTotalTimeout` is set. That option **defaulted to `false`** in the TypeScript
+SDK and was flipped later ([typescript-sdk#849]) — and it is a per-request option the *client*
+passes, so a server can neither set it nor observe it. Separately, `notifications/cancelled` was
+swallowed with the other notifications, so the server never learned when a client gave up.
+**Symptom:** the tool call dies at 60 s with a heartbeat thread still ticking. The client
+discards the result ("No result received from client-side tool execution"), the conversation
+breaks mid-approval, and whatever the human clicks afterwards only lands if they type another
+chat message. Meanwhile the server held the wait — and its thread — for up to the full 900 s
+for a reply nobody would ever read.
+**Fix:** chunked waiting. One call now lasts at most `call_budget` (45 s) regardless of
+heartbeats, and ends in an `APPROVAL_PENDING` response telling the model to call straight back;
+the human's 900 s budget is measured from the request's `created_at` so it spans slices and
+restarts. `notifications/cancelled` is routed to the waiting call through an in-flight registry
+keyed by `str(request_id)`, unblocks it, and records the observed limit in `client_caps.json`
+so later slices shrink under it. The heartbeat is still sent, but nothing depends on it.
+**Lesson:** never build a safety guarantee on a switch the other side owns — especially one you
+cannot read back. And a notification you "safely ignore" is often a measurement you are
+throwing away: cancellation was the only direct evidence of the one number that mattered.
+
+## D22 — a new browser tab per approval, and a rebuild that ate what you typed (1.14.0)
+
+**Root cause:** two independent bugs that only became painful together. `_surface` called
+`_open_browser_once` on every request, and that function never checked the `_opened_once` flag
+it is named for — the guard lived only in `start()`. Meanwhile the page rebuilds its entire card
+list (`root.innerHTML = ...`) whenever the queue signature changes, and per-task comments lived
+only in the DOM.
+**Symptom:** each approval request opened another window. A human typing a comment in tab 1 got
+a fresh empty tab 2 for the next request; submitting from tab 2 silently discarded what they had
+written. Even in a single tab, a *second session* asking for approval was enough to wipe a
+half-finished comment with no trace. Chunked waiting would have made this fire every 45 s, since
+each slice re-published the request under a new uuid.
+**Fix:** three parts. `publish` reuses an undecided entry when plan id and fingerprint match, so
+a slice never changes the page signature (and `created_at` is preserved, so the total budget can
+actually expire). Drafts moved to `localStorage` keyed by request id, restored on every render,
+mirrored across tabs by a `storage` listener, and cleared only after a decision posts
+successfully. `_surface` skips opening a browser when a tab polled within the last 10 s, and
+`_open_browser_once` honours its flag.
+**Deliberately not fixed with partial rendering,** which was the obvious repair: keeping DOM
+nodes per request would let two tabs drift apart, and the human would submit from whichever tab
+happened to lack their text. Keeping the full rebuild and moving the *state* out of the DOM
+preserves "every window shows the same thing" — and extends it to drafts, which the old code
+never had.
+**Lesson:** when re-rendering destroys user input, the instinct is to re-render less. The better
+question is why the input was somewhere a re-render could reach. Also: a function named
+`_open_browser_once` that opens the browser every time is exactly the kind of bug a reader skims
+past, because the name asserts the invariant the code forgot.
+
+[typescript-sdk#849]: https://github.com/modelcontextprotocol/typescript-sdk/pull/849
 
 ## Where the next bug probably is
 

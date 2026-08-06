@@ -211,8 +211,12 @@ REQUEST_USER_APPROVAL_SCHEMA: dict[str, Any] = {
             "type": "string",
             "enum": [d.value for d in Decision],
             "description": (
-                "ASK_USER = first call, ask the human. APPROVED / REJECTED / REVISE = report what "
-                'the human actually replied. Example: "ASK_USER"'
+                "ASK_USER = ask the human, and the ONLY value you may choose yourself. "
+                "APPROVED / REJECTED / REVISE report what the human ACTUALLY replied - never "
+                "what you expect or would prefer; the server refuses them while their question "
+                "is still open. If a call comes back with error_code APPROVAL_PENDING the human "
+                "has not answered yet: call again immediately with ASK_USER and the same "
+                'plan_summary, and write nothing in between. Example: "ASK_USER"'
             ),
         },
         "plan_summary": {

@@ -219,6 +219,30 @@ written down in [06](06-human-in-the-loop.md#rework-1130), including the row tha
 which does no work but writes a plausible new outcome is **not** detectable — that is what the
 completion report is for. Defect [D19](09-defects-and-lessons.md#d19).
 
+### 1.14.0 — the wait stops betting on the client
+The blocking wait extended past the client's 60 s request timeout by sending progress
+heartbeats, on the strength of a code comment saying `resetTimeoutOnProgress` defaults to true.
+It defaulted to **false** and was flipped later, and it is the *client's* option to pass — so a
+server can neither set it nor read it back. Where it is off, the call is killed at 60 s, the
+client throws the result away, and the conversation breaks mid-approval.
+
+The wait is now **chunked**: one tool call lasts at most `call_budget` (45 s) whatever the
+client does, ends in an `APPROVAL_PENDING` response telling the model to call straight back, and
+the human's 900 s budget accumulates across slices from the request's `created_at`. Same shape
+the protocol is converging on ([SEP-1391], [SEP-1539]). `notifications/cancelled` is no longer
+swallowed: it unblocks the waiting call and records what the client actually allowed, so later
+slices shrink under it. Two guards that had been asserting invariants they never checked were
+closed at the same time — the model could approve its own plan, and `_open_browser_once` opened
+a window every time. Drafts moved out of the DOM into `localStorage` so the page's full rebuild
+(now far more frequent) cannot eat a half-written comment, and mirror across tabs. No countdown
+was added: it would measure the call, not the request. Defects
+[D20](09-defects-and-lessons.md#d20-—-the-model-could-approve-its-own-plan-1140),
+[D21](09-defects-and-lessons.md#d21-—-the-heartbeat-bet-and-the-swallowed-cancellation-1140),
+[D22](09-defects-and-lessons.md#d22-—-a-new-browser-tab-per-approval-and-a-rebuild-that-ate-what-you-typed-1140).
+
+[SEP-1391]: https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1391
+[SEP-1539]: https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1539
+
 ---
 
 ## Git commit ↔ version map

@@ -77,7 +77,10 @@ Optional: `plan_summary` (required for `ASK_USER`), `user_comment`, `plan_id`.
   [D17](09-defects-and-lessons.md#d17).
 - **Approval binds to the exact version shown** (goal + task-title fingerprint). Approving a
   plan version the human never saw → `APPROVAL_NOT_REQUESTED`. An approval left idle past
-  `approval_ttl` → `APPROVAL_EXPIRED`.
+  `approval_ttl` → `APPROVAL_EXPIRED`. A decision sent while the request is still open on the
+  page did not come from the user at all → `APPROVAL_PENDING` (see
+  [06](06-human-in-the-loop.md)); the same code is returned when a chunked wait slice ends
+  undecided, carrying `waited_seconds` and `remaining_seconds`.
 
 ## 3. `update_task_progress` — execution tracking + the enforced gate
 
@@ -129,6 +132,7 @@ Every error maps to a `next_action` that tells the model how to recover. Full li
 | `MISSING_TASK_LIST` | finalized without a task list | `CALL_PLAN_AND_THINK` |
 | `APPROVAL_NOT_REQUESTED` | approving a version never shown | `CALL_REQUEST_USER_APPROVAL` |
 | `APPROVAL_EXPIRED` | approval idle past TTL | `CALL_REQUEST_USER_APPROVAL` |
+| `APPROVAL_PENDING` | the user has not answered yet — either this wait slice ended, or the model tried to decide on their behalf | `CALL_REQUEST_USER_APPROVAL` (with `ASK_USER`, immediately) |
 | `PLAN_AMBIGUOUS` | several plans active, no `plan_id` given | `CALL_GET_CURRENT_PLAN` |
 | `GOAL_NOT_MATCHED` | continuing (step>1) but goal matches no plan (drift) | `CALL_PLAN_AND_THINK` (with the exact goal from `active_plans`) |
 | `TASK_NOT_FOUND` | bad `task_id` | `CALL_UPDATE_TASK_PROGRESS` (with valid ids listed) |

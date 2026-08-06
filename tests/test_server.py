@@ -1062,8 +1062,7 @@ class TestPersistence(HandlerTestCase):
                                       "total_steps": 1, "need_more_thinking": False,
                                       "task_list": ["작업"]})
         h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
-        ui.decision = "APPROVED"
-        h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
+        ui.resolve("APPROVED")  # the human clicks; re-asking would reuse the same entry
         h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
         h.dispatch("update_task_progress", {"task_id": 1, "status": "DONE",
                                             "result_log": evidence})
@@ -1216,20 +1215,50 @@ class FakeApprovalUI:
         self.scope = scope
         self.opened: list[dict] = []
         self.cleared = 0
+        self.agent_touches = 0
         self.live: dict | None = None
 
     def open_request(self, plan_id, goal, display, tasks, fingerprint="", phase="PLAN",
                      summary=""):
         if not self.available:
             return None
+        # Mirrors the real store's reuse rule: re-asking about an unchanged plan is the
+        # same question, so it keeps the entry (and the id) already on screen.
+        live = self.live
+        if (
+            live is not None
+            and live["plan_id"] == plan_id
+            and live["fingerprint"] == fingerprint
+            and not live.get("decision")
+        ):
+            return live["id"]
         record = {
             "id": f"req{len(self.opened)}", "plan_id": plan_id, "fingerprint": fingerprint,
             "decision": self.decision, "comment": self.comment, "phase": phase,
             "tasks": tasks, "display": display, "goal": goal, "summary": summary,
+            "created_at": time.time(),
         }
         self.opened.append(record)
         self.live = record
         return record["id"]
+
+    def has_pending(self, plan_id, fingerprint):
+        r = self.live
+        return bool(
+            r is not None
+            and r["plan_id"] == plan_id
+            and r["fingerprint"] == fingerprint
+            and not r.get("decision")
+        )
+
+    def request_age(self, request_id):
+        r = self.live
+        if r is None or r["id"] != request_id:
+            return 0.0
+        return max(0.0, time.time() - r.get("created_at", time.time()))
+
+    def touch_agent(self, request_id):
+        self.agent_touches += 1
 
     def resolve(self, decision, comment=""):
         """Simulates the human clicking after the fact."""
@@ -1419,20 +1448,44 @@ class TestBlockingApproval(HandlerTestCase):
         self.ask(h, progress_token=None, notifier=notifier)
         self.assertEqual(notifier.sent, [])  # no token -> must not send progress
 
-    def test_wait_is_capped_without_progress_token(self):
-        """No token means the wait must stay under the client's 60s request timeout."""
+    def test_one_call_stays_under_the_client_timeout_with_or_without_a_token(self):
+        """A progressToken must not buy a longer single call.
+
+        This is the 1.14 correction. `resetTimeoutOnProgress` is the client's option to
+        set, it defaulted to false in older TypeScript SDKs, and a server cannot observe
+        which way it went - so betting a 900s call on it is what killed conversations at
+        60s. Chunking makes the bet unnecessary.
+        """
         h = self.blocking(FakeApprovalUI(decision=None), timeout=3600)
-        self.assertLessEqual(
-            h.effective_timeout(can_heartbeat=False),
-            SDK_REQUEST_TIMEOUT_SEC - 1,
-            "wait must be capped below the SDK request timeout",
-        )
-        self.assertEqual(h.effective_timeout(can_heartbeat=True), 3600)
+        for can_heartbeat in (False, True):
+            self.assertLessEqual(
+                h.effective_timeout(can_heartbeat=can_heartbeat),
+                SDK_REQUEST_TIMEOUT_SEC - 1,
+                "one call must finish inside the client's request timeout",
+            )
+
+    def test_chunk_shrinks_as_the_total_budget_runs_down(self):
+        h = self.blocking(FakeApprovalUI(decision=None), timeout=3600)
+        self.assertEqual(h.effective_timeout(can_heartbeat=False), h.config.call_budget)
+        # 10s left of the human's budget: the slice may not overrun it.
+        self.assertEqual(h.effective_timeout(can_heartbeat=False, already_waited=3590), 10)
+        self.assertEqual(h.effective_timeout(can_heartbeat=False, already_waited=3600), 0)
 
     def test_short_configured_timeout_is_respected_either_way(self):
         h = self.blocking(FakeApprovalUI(decision=None), timeout=5)
         self.assertEqual(h.effective_timeout(can_heartbeat=False), 5)
         self.assertEqual(h.effective_timeout(can_heartbeat=True), 5)
+
+    def test_observed_client_cancellation_shrinks_the_next_chunk(self):
+        h = self.blocking(FakeApprovalUI(decision=None), timeout=3600)
+        h.store.record_call_cap(30)  # this client actually gave up at 30s
+        self.assertEqual(h.effective_timeout(can_heartbeat=False), 25)
+
+    def test_trust_heartbeat_mode_keeps_the_old_single_long_call(self):
+        h = self.blocking(FakeApprovalUI(decision=None), timeout=3600)
+        h.config.approval_mode = "trust_heartbeat"
+        self.assertEqual(h.effective_timeout(can_heartbeat=True), 3600)
+        self.assertEqual(h.effective_timeout(can_heartbeat=False), 55)
 
     def test_request_stays_open_after_timeout(self):
         """The page must keep the buttons after the tool call gives up."""
@@ -1525,6 +1578,331 @@ class TestBlockingApproval(HandlerTestCase):
             self.assertEqual(srv.claim(req), Verdict("APPROVED", "ok"))
         finally:
             srv.shutdown()
+
+
+class TestChunkedApproval(HandlerTestCase):
+    """The 1.14 answer to the client-side 60s cap on a single tools/call.
+
+    A call that outlives the client's patience does not merely fail - the client drops
+    the result and the conversation breaks mid-approval. So the wait gives itself up
+    while the client is still listening and tells the model to come straight back.
+    """
+
+    def handlers(self, ui, timeout=900, budget=1, mode="chunked"):
+        cfg = Config(
+            state_dir=self.state_dir,
+            blocking_approval=True,
+            approval_timeout=timeout,
+            call_budget=budget,
+            approval_mode=mode,
+        )
+        return PlanningHandlers(Store(self.state_dir), cfg, approval_ui=ui)
+
+    def draft(self, h):
+        h.dispatch("plan_and_think", {
+            "goal": "분할 대기 검증", "thought": "t", "step_number": 1, "total_steps": 1,
+            "need_more_thinking": False, "task_list": ["작업 1", "작업 2"]})
+
+    def ask(self, h, **kw):
+        return h.dispatch(
+            "request_user_approval",
+            {"decision": "ASK_USER", "plan_summary": "요약"},
+            **kw,
+        )
+
+    # ---- the slice ends, the question does not -----------------------------
+    def test_chunk_expiry_says_pending_not_approved(self):
+        h = self.handlers(FakeApprovalUI(decision=None))
+        self.draft(h)
+        res = self.ask(h)
+        self.assertFalse(res["ok"], "a pending wait must never read as success")
+        self.assertEqual(res["error_code"], "APPROVAL_PENDING")
+        self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
+        self.assertEqual(res["next_action"], "CALL_REQUEST_USER_APPROVAL")
+        self.assertIn("NOT decided", res["next_action_hint"])
+
+    def test_chunk_expiry_withholds_anything_that_reads_as_a_verdict(self):
+        """The payload is the one place a weak model could find a false go-ahead."""
+        h = self.handlers(FakeApprovalUI(decision=None))
+        self.draft(h)
+        res = self.ask(h)
+        self.assertNotIn("tasks", res)
+        self.assertNotIn("display_to_user", res)
+        self.assertNotIn("next_task", res)
+
+    def test_chunk_expiry_reports_the_budget(self):
+        h = self.handlers(FakeApprovalUI(decision=None), timeout=900, budget=1)
+        self.draft(h)
+        res = self.ask(h)
+        self.assertGreaterEqual(res["waited_seconds"], 0)
+        self.assertGreater(res["remaining_seconds"], 0)
+
+    def test_re_asking_reuses_the_same_request(self):
+        """Otherwise the page rebuilds every slice and eats the human's half-typed comment."""
+        ui = FakeApprovalUI(decision=None)
+        h = self.handlers(ui)
+        self.draft(h)
+        self.ask(h)
+        self.ask(h)
+        self.ask(h)
+        self.assertEqual(len(ui.opened), 1, "each slice minted a new request")
+
+    def test_the_agent_is_marked_alive_while_it_waits(self):
+        ui = FakeApprovalUI(decision=None)
+        h = self.handlers(ui)
+        self.draft(h)
+        self.ask(h)
+        self.assertGreater(ui.agent_touches, 0)
+
+    def test_a_click_during_a_later_slice_is_honoured(self):
+        ui = FakeApprovalUI(decision=None)
+        h = self.handlers(ui)
+        self.draft(h)
+        self.assertEqual(self.ask(h)["error_code"], "APPROVAL_PENDING")
+        ui.resolve("APPROVED")
+        res = self.ask(h)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["plan_status"], "APPROVED")
+
+    def test_exhausting_the_whole_budget_stops_instead_of_looping(self):
+        """A model told to retry forever would spin until the context ran out."""
+        h = self.handlers(FakeApprovalUI(decision=None), timeout=1, budget=1)
+        self.draft(h)
+        res = self.ask(h)
+        self.assertTrue(res["ok"])
+        self.assertNotEqual(res.get("error_code"), "APPROVAL_PENDING")
+        self.assertIn("display_to_user", res)
+        self.assertIn("wait expired", " ".join(res["input_notes"]))
+
+    def test_return_mode_does_not_hold_the_call(self):
+        ui = FakeApprovalUI(decision=None)
+        h = self.handlers(ui, timeout=900, mode="return")
+        self.draft(h)
+        started = time.monotonic()
+        res = self.ask(h)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIn("display_to_user", res)
+        self.assertIsNotNone(ui.live, "the request must still reach the page")
+
+    # ---- the client giving up ----------------------------------------------
+    def test_cancellation_unblocks_the_wait_and_is_remembered(self):
+        ui = FakeApprovalUI(decision=None)
+        h = self.handlers(ui, timeout=900, budget=30)
+        self.draft(h)
+        cancel = threading.Event()
+        threading.Timer(0.4, cancel.set).start()
+        started = time.monotonic()
+        self.ask(h, cancel_event=cancel)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5, "a cancelled call must not keep waiting")
+        self.assertIsNotNone(h.store.observed_call_cap())
+        self.assertIsNotNone(ui.live, "the human must still be able to decide")
+        events = [json.loads(l) for l in
+                  (self.state_dir / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(any(e["event"] == "client_cancelled_call" for e in events))
+
+    def test_protocol_routes_a_cancellation_to_the_right_call(self):
+        seen = {}
+
+        class Spy:
+            def dispatch(self, name, args, progress_token=None, notifier=None,
+                         cancel_event=None):
+                seen["event"] = cancel_event
+                # The client gives up while this call is still running.
+                p._cancel(7)
+                seen["set_during_call"] = cancel_event.is_set()
+                return {"ok": True, "plan_status": "NONE", "next_action": "ANSWER_USER",
+                        "next_action_hint": "-"}
+
+        p = McpProtocol(Spy(), TOOL_DEFINITIONS, "x", "1")
+        p.handle_message({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                          "params": {"name": "get_current_plan", "arguments": {}}})
+        self.assertTrue(seen["set_during_call"])
+        # And the registry is emptied, so a late duplicate cancel is a no-op.
+        p._cancel(7)
+
+    def test_a_cancellation_for_an_unknown_id_is_ignored(self):
+        p = McpProtocol(object(), TOOL_DEFINITIONS, "x", "1")
+        self.assertEqual(
+            p.handle_message({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                              "params": {"requestId": 404}}),
+            None,
+        )
+
+    # ---- the model may not answer its own question --------------------------
+    def test_model_cannot_approve_while_the_request_is_open(self):
+        ui = FakeApprovalUI(decision=None)
+        h = self.handlers(ui)
+        self.draft(h)
+        self.ask(h)
+        res = h.dispatch("request_user_approval", {"decision": "APPROVED"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "APPROVAL_PENDING")
+        self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
+        self.assertEqual(
+            h.store.load().plans["plan_20260806_0001"].plan_status, "AWAITING_APPROVAL"
+        )
+
+    def test_model_cannot_reject_or_revise_either(self):
+        """Refused as many times as it tries: the guard is state, not a one-shot latch."""
+        ui = FakeApprovalUI(decision=None)
+        h = self.handlers(ui)
+        self.draft(h)
+        self.ask(h)
+        for decision in ("REJECTED", "REVISE", "APPROVED"):
+            with self.subTest(decision=decision):
+                res = h.dispatch(
+                    "request_user_approval",
+                    {"decision": decision, "user_comment": "내 마음대로"},
+                )
+                self.assertEqual(res["error_code"], "APPROVAL_PENDING")
+                self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
+
+    def test_the_refusal_is_audited(self):
+        ui = FakeApprovalUI(decision=None)
+        h = self.handlers(ui)
+        self.draft(h)
+        self.ask(h)
+        h.dispatch("request_user_approval", {"decision": "APPROVED"})
+        events = [json.loads(l) for l in
+                  (self.state_dir / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(any(e["event"] == "self_approval_refused" for e in events))
+
+    def test_a_real_click_is_never_blocked_by_the_guard(self):
+        """The guard must refuse only the model's own word, never the human's."""
+        ui = FakeApprovalUI(decision=None)
+        h = self.handlers(ui)
+        self.draft(h)
+        self.ask(h)
+        ui.resolve("APPROVED")
+        # Any tool call at all drains the decision first, which withdraws the request.
+        res = h.dispatch("get_current_plan", {"plan_id": "current"})
+        self.assertEqual(res["plan_status"], "APPROVED")
+
+    def test_the_guard_lifts_once_the_plan_has_moved_on(self):
+        """An entry for a superseded plan version must not freeze the new one."""
+        ui = FakeApprovalUI(decision=None)
+        h = self.handlers(ui)
+        self.draft(h)
+        self.ask(h)
+        self.assertTrue(ui.has_pending("plan_20260806_0001", ui.live["fingerprint"]))
+        self.assertFalse(ui.has_pending("plan_20260806_0001", "a-different-version"))
+
+
+class TestBrowserTabSpam(HandlerTestCase):
+    """One request must not equal one new browser window.
+
+    `_surface` called `_open_browser_once` on every request, and that function never
+    checked the `_opened_once` flag it is named for - the guard lived only in `start()`.
+    Every approval opened another tab, so the human ended up with several windows each
+    holding a different half-written comment, and whichever one they submitted from
+    silently discarded the rest.
+    """
+
+    def server(self):
+        srv = ApprovalServer(ApprovalStore(self.state_dir), port=0, open_browser=True)
+        srv._opened = 0
+
+        def fake_open(url):
+            srv._opened += 1
+            return True
+
+        self.addCleanup(mock.patch.stopall)
+        mock.patch("planning.approval.webbrowser.open", fake_open).start()
+        return srv
+
+    def test_only_the_first_request_opens_a_window(self):
+        srv = self.server()
+        for _ in range(4):
+            srv._surface()
+        self.assertEqual(srv._opened, 1)
+
+    def test_a_live_tab_stops_even_the_first_open(self):
+        srv = self.server()
+        srv._last_poll_at = time.time()  # a tab polled just now
+        srv._surface()
+        self.assertEqual(srv._opened, 0)
+        self.assertTrue(srv.page_is_being_watched())
+
+    def test_a_long_gone_tab_does_not_count_as_watching(self):
+        srv = self.server()
+        srv._last_poll_at = time.time() - 3600
+        self.assertFalse(srv.page_is_being_watched())
+        srv._surface()
+        self.assertEqual(srv._opened, 1)
+
+
+class TestPublishReuse(HandlerTestCase):
+    """The store-level rule the chunked wait depends on."""
+
+    def approvals(self):
+        return ApprovalStore(self.state_dir)
+
+    def test_same_plan_and_fingerprint_keeps_the_entry(self):
+        s = self.approvals()
+        first = s.publish("p1", "g", "d", [{"task_id": 1}], "fp1", "PLAN", "s")
+        again = s.publish("p1", "g", "d", [{"task_id": 1}], "fp1", "PLAN", "s")
+        self.assertEqual(first, again)
+        self.assertEqual(len(s.peek()), 1)
+
+    def test_created_at_is_not_reset_so_the_budget_can_run_out(self):
+        s = self.approvals()
+        rid = s.publish("p1", "g", "d", [{"task_id": 1}], "fp1", "PLAN", "s")
+        born = s.entry(rid)["created_at"]
+        time.sleep(0.05)
+        s.publish("p1", "g", "d", [{"task_id": 1}], "fp1", "PLAN", "s")
+        self.assertEqual(s.entry(rid)["created_at"], born)
+
+    def test_a_changed_plan_gets_a_new_entry(self):
+        s = self.approvals()
+        first = s.publish("p1", "g", "d", [{"task_id": 1}], "fp1", "PLAN", "s")
+        second = s.publish("p1", "g", "d2", [{"task_id": 1}], "fp2", "PLAN", "s")
+        self.assertNotEqual(first, second)
+        self.assertEqual(len(s.peek()), 1, "the superseded version must not linger")
+
+    def test_a_decided_entry_is_not_reused(self):
+        s = self.approvals()
+        first = s.publish("p1", "g", "d", [{"task_id": 1}], "fp1", "PLAN", "s")
+        s.record_decision(first, "APPROVED", "")
+        second = s.publish("p1", "g", "d", [{"task_id": 1}], "fp1", "PLAN", "s")
+        self.assertNotEqual(first, second)
+
+    def test_another_plan_is_untouched(self):
+        s = self.approvals()
+        a = s.publish("p1", "g", "d", [{"task_id": 1}], "fpA", "PLAN", "s")
+        b = s.publish("p2", "g", "d", [{"task_id": 1}], "fpB", "PLAN", "s")
+        self.assertEqual({a, b}, {e["id"] for e in s.peek()})
+
+    def test_request_age_grows_and_touch_marks_the_agent(self):
+        s = self.approvals()
+        rid = s.publish("p1", "g", "d", [{"task_id": 1}], "fp1", "PLAN", "s")
+        time.sleep(0.05)
+        self.assertGreater(s.request_age(rid), 0)
+        self.assertEqual(s.request_age("nope"), 0.0)
+        s.touch_agent(rid)
+        self.assertIn("agent_last_seen", s.entry(rid))
+
+
+class TestObservedClientCap(HandlerTestCase):
+    def test_the_tightest_observation_wins_and_survives_a_reload(self):
+        s = Store(self.state_dir)
+        self.assertIsNone(s.observed_call_cap())
+        s.record_call_cap(50)
+        s.record_call_cap(30)
+        s.record_call_cap(55)  # looser; must not overwrite the tighter one
+        self.assertEqual(Store(self.state_dir).observed_call_cap(), 30)
+
+    def test_a_nonsense_value_is_ignored(self):
+        s = Store(self.state_dir)
+        s.record_call_cap(0)
+        s.record_call_cap(-5)
+        self.assertIsNone(s.observed_call_cap())
+
+    def test_a_corrupt_file_reads_as_no_observation(self):
+        s = Store(self.state_dir)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        s.client_caps_path.write_text("{ not json", encoding="utf-8")
+        self.assertIsNone(s.observed_call_cap())
 
 
 # ===========================================================================
@@ -1938,7 +2316,10 @@ class TestApprovalStoreFailureEdges(HandlerTestCase):
                                       "task_list": ["a"]})
         h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
         self.assertIsNotNone(ui.live)
-        h.dispatch("request_user_approval", {"decision": "REJECTED", "user_comment": "no"})
+        # Through the page, which is the only way a rejection can arrive now: while a
+        # request is open, a REJECTED sent by the model is refused as its own invention.
+        ui.resolve("REJECTED", "no")
+        h.dispatch("get_current_plan", {"plan_id": "current"})
         self.assertIsNone(ui.live, "a cancelled plan left a stale approval on the page")
 
     def test_entry_is_dropped_when_its_plan_completes(self):
@@ -1948,7 +2329,7 @@ class TestApprovalStoreFailureEdges(HandlerTestCase):
                                       "total_steps": 1, "need_more_thinking": False,
                                       "task_list": ["a"]})
         h.dispatch("request_user_approval", {"decision": "ASK_USER", "plan_summary": "s"})
-        h.dispatch("request_user_approval", {"decision": "APPROVED"})
+        ui.resolve("APPROVED")
         h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
         h.dispatch("update_task_progress", {"task_id": 1, "status": "DONE"})
         self.assertIsNone(ui.live, "a finished plan left a stale approval on the page")
@@ -2931,6 +3312,53 @@ class TestCompletionPageTemplate(unittest.TestCase):
         self.assertIn("계획 자체를 다시 세우기", _PAGE)
 
 
+class TestDraftSurvivalTemplate(unittest.TestCase):
+    """Half-written comments must outlive a rebuild of the page.
+
+    The page re-renders its whole card list whenever the queue changes - a second
+    session asking for approval is enough - and a chunked wait makes the queue change
+    far more often than it used to. Keeping drafts in the DOM meant losing them, so they
+    live in localStorage instead. Asserted against the template; the click-through,
+    including two tabs and a mid-typing rebuild, was verified in a real browser.
+    """
+
+    def test_drafts_are_stored_outside_the_dom(self):
+        self.assertIn("planning-mcp:draft:", _PAGE)
+        self.assertIn("localStorage.setItem", _PAGE)
+        self.assertIn("function restore(", _PAGE)
+
+    def test_an_emptied_box_stays_empty(self):
+        """Removing the key instead of storing '' would resurrect the deleted text."""
+        self.assertIn("localStorage.setItem(dkey(req,tid),value)", _PAGE)
+
+    def test_every_tab_shows_the_same_draft(self):
+        self.assertIn("window.addEventListener('storage',onStorage)", _PAGE)
+        self.assertIn("function onStorage(", _PAGE)
+
+    def test_listeners_are_bound_to_a_node_that_outlives_a_rebuild(self):
+        self.assertIn("document.getElementById('root').addEventListener('input',onInput)", _PAGE)
+        self.assertNotIn("oninput=", _PAGE)
+
+    def test_drafts_are_cleared_once_submitted_and_pruned_when_stale(self):
+        self.assertIn("dclear(id)", _PAGE)
+        self.assertIn("function dprune(", _PAGE)
+
+    def test_the_liveness_chip_replaces_a_countdown(self):
+        """A countdown would measure the tool call, not the request - and the request
+        outlives the call, so the number would be a lie that also creates false rush."""
+        self.assertIn("d.agent_waiting", _PAGE)
+        self.assertIn("에이전트가 대기 중입니다", _PAGE)
+        self.assertIn("에이전트가 대기를 멈췄습니다", _PAGE)
+        # No per-request timer, and no wording that implies a deadline.
+        for banned in ("남은 시간", "초 남음", "초 후 만료", "deadline"):
+            self.assertNotIn(banned, _PAGE)
+        # The only recurring timers are the 1.5s poll and the 700ms title flash.
+        self.assertEqual(_PAGE.count("setInterval("), 2)
+
+    def test_the_page_still_promises_the_request_will_wait(self):
+        self.assertIn("요청은 응답하실 때까지 사라지지 않으니", _PAGE)
+
+
 class TestPlanStateEdges(HandlerTestCase):
     def test_task_list_of_blanks_is_refused(self):
         res = self.think(need_more_thinking=False, task_list=["", "   ", "\n"])
@@ -3120,8 +3548,9 @@ class TestProtocol(HandlerTestCase):
         seen = {}
 
         class Spy:
-            def dispatch(self, name, args, progress_token=None, notifier=None):
+            def dispatch(self, name, args, progress_token=None, notifier=None, **kw):
                 seen["token"] = progress_token
+                seen["cancel_event"] = kw.get("cancel_event")
                 return {"ok": True, "plan_status": "NONE", "next_action": "ANSWER_USER",
                         "next_action_hint": "-"}
 
@@ -3130,6 +3559,8 @@ class TestProtocol(HandlerTestCase):
                           "params": {"name": "get_current_plan", "arguments": {},
                                      "_meta": {"progressToken": "tok-9"}}})
         self.assertEqual(seen["token"], "tok-9")
+        # Handed down with the token so a blocking wait can notice the client giving up.
+        self.assertIsNotNone(seen["cancel_event"])
 
 
 class TestFileLockEdges(HandlerTestCase):

@@ -397,11 +397,16 @@ stop that needs nothing from the host:
 model ── request_user_approval(ASK_USER) ──►  server
                                                │ persist AWAITING_APPROVAL
                                                │ publish plan to http://127.0.0.1:8765/
-                                               │ ┌─ heartbeat: notifications/progress q20s
-   agent loop BLOCKED here, cannot execute ◄────┤ └─ (resets the client's 60s timer)
+                                               │
+   agent loop BLOCKED here, cannot execute ◄────┤  ≤ call_budget (45s)
+        ◄── ok:false APPROVAL_PENDING ──────────┤  "not decided - call me straight back"
+                                               │
+   model ── request_user_approval(ASK_USER) ───►│  (same args; the request is REUSED,
+                                               │   so the page never even redraws)
+        …repeats while the human thinks, up to approval_timeout (900s) total…
                                                │
         human clicks 승인 / 거절 / 수정요청 ──────┤
-        ◄── APPROVED + next_task ───────────────┘  (same call returns)
+        ◄── APPROVED + next_task ───────────────┘  (the slice in flight returns it)
 ```
 
 Two consequences worth stating plainly:
@@ -412,13 +417,42 @@ Two consequences worth stating plainly:
 - **The two-phase protocol still exists** and the blocking path reuses `_approve` /
   `_reject` / `_revise` verbatim, so both paths share one set of transitions.
 
-**Timeout arithmetic.** The MCP TypeScript SDK that AnythingLLM uses defaults to a 60s
-per-request timeout (`DEFAULT_REQUEST_TIMEOUT_MSEC`), resets it on every progress
-notification (`resetTimeoutOnProgress` defaults to true), and sets no `maxTotalTimeout`.
-So with a `progressToken` the heartbeat makes the wait effectively unbounded; without one
-the server caps the wait at `NO_PROGRESS_WAIT_CEILING_SEC` (55s) and returns the ordinary
-locked response rather than letting the client raise `-32001`. Both paths leave the plan
-`AWAITING_APPROVAL`, so the enforcement gate still blocks execution afterwards.
+**Timeout arithmetic (rewritten in 1.14.0).** Every client caps a single `tools/call` —
+`DEFAULT_REQUEST_TIMEOUT_MSEC` is 60s in the MCP TypeScript SDK and hardcoded in Claude
+Desktop. Overrunning it does not just fail the call: the client discards the result and the
+conversation breaks mid-approval.
+
+Until 1.13 the server extended past that with 20s progress heartbeats, on the belief that
+`resetTimeoutOnProgress` defaults to true. It defaulted to **false** and was flipped later
+(typescript-sdk#849), and it is a per-request option the *client* passes — unsettable and
+unreadable from here. A safety gate cannot rest on a switch the other side owns.
+
+So the wait is **chunked**. One call lasts at most `call_budget` (45s) whatever the client
+does, then returns `ok:false` + `APPROVAL_PENDING` instructing the model to call straight
+back. The human's `approval_timeout` (900s) accumulates across slices, measured from the
+request's `created_at`, so it survives both the slicing and a server restart. The heartbeat
+is still sent when a `progressToken` is present — free upside where it works — but nothing
+depends on it. `PLANNING_MCP_APPROVAL_MODE` selects `chunked` (default), `return` (publish
+and return at once) or `trust_heartbeat` (the pre-1.14 single long call).
+
+The slice response deliberately carries no `tasks`, `display_to_user`, `message` or
+`next_task`: a weak model reading a rich `ok:true` payload as "approved, proceed" is exactly
+what this gate exists to stop. Every path leaves the plan `AWAITING_APPROVAL`, so the
+enforcement gate still blocks execution afterwards.
+
+**`notifications/cancelled` is honoured.** It used to be swallowed, so a client that gave up
+at 60s left the server holding the wait — and its thread — for up to the full 900s. It now
+unblocks the call and records how long the client actually allowed in `client_caps.json`
+(audited `client_cancelled_call`); later slices shrink to stay under the tightest value ever
+observed. That measurement is the only reliable way to learn a client's real cap.
+
+**Only a human may decide (1.14.0).** `_approve` checked `plan.approval.requested_at`, which
+is set *because* the server is waiting — so it was most permissive exactly when the model was
+most likely to guess, and `request_user_approval(decision='APPROVED')` from the model could
+unlock a plan nobody approved. While an undecided request for this plan version is live in the
+approval store, a model-sourced decision is refused with `APPROVAL_PENDING` and audited as
+`self_approval_refused`. Real clicks are unaffected: `_apply_late_decision` runs first in
+`dispatch` and every `_mutate_*` withdraws the request.
 
 Set `PLANNING_MCP_BLOCKING_APPROVAL=false` to fall back to the advisory-only behaviour.
 
@@ -433,8 +467,8 @@ times across the system prompt and the tool description, and why `revision_count
 means the next `plan_and_think` final step lands in `AWAITING_APPROVAL` again. There is no path
 from `REVISE` directly to execution.
 
-**The approval request outlives the tool call (1.5.0).** The wait has a ceiling (55s
-without a `progressToken`), but the human does not. When the call times out the request
+**The approval request outlives the tool call (1.5.0).** A slice has a ceiling; the human
+does not. When the call times out the request
 is *deliberately left on the page* — closing it there is what made the buttons disappear
 before anyone could answer. Whatever the human clicks afterwards is collected on the next
 tool call of any kind (`_apply_late_decision`, audited as `late_decision_applied`) and

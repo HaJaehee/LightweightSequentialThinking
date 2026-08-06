@@ -54,6 +54,7 @@ def title_key(title: str) -> str:
 
 STATE_FILENAME = "plan_state.json"
 AUDIT_FILENAME = "audit.jsonl"
+CLIENT_CAPS_FILENAME = "client_caps.json"
 LOCK_FILENAME = ".lock"
 TXN_LOCK_FILENAME = ".txnlock"
 TXN_LOCK_TIMEOUT = 20.0
@@ -326,6 +327,58 @@ class Store:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError as exc:
             log.warning("Could not append to audit log: %s", exc)
+
+    # ---- observed client limits -----------------------------------------
+    @property
+    def client_caps_path(self) -> Path:
+        return self.state_dir / CLIENT_CAPS_FILENAME
+
+    def observed_call_cap(self) -> float | None:
+        """The shortest tool call this client has ever cancelled, in seconds.
+
+        A client's real per-request timeout is not discoverable by asking - it is not in
+        `initialize`, and the documented defaults are wrong often enough to be useless
+        (see the note in config.py). What IS observable is the moment it gives up. That
+        number, remembered across restarts, is the only honest input to how long the
+        next wait may run.
+        """
+        try:
+            raw = json.loads(self.client_caps_path.read_text(encoding="utf-8"))
+            value = float(raw["cancelled_after_sec"])
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return None
+        return value if value > 0 else None
+
+    def record_call_cap(self, seconds: float) -> None:
+        """Remember a cancellation, keeping the tightest limit seen.
+
+        Best-effort by design: losing this only costs us the adaptive shrink, and the
+        configured budget is already meant to be safe on its own.
+        """
+        if seconds <= 0:
+            return
+        previous = self.observed_call_cap()
+        if previous is not None and previous <= seconds:
+            return
+        payload = json.dumps(
+            {"cancelled_after_sec": round(seconds, 2), "observed_at": now_iso()},
+            ensure_ascii=False,
+            indent=2,
+        )
+        tmp = self.client_caps_path.with_suffix(".json.tmp")
+        try:
+            self._ensure_dir()
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.client_caps_path)
+        except OSError as exc:
+            log.warning("Could not record the observed client timeout: %s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # ---- ids -----------------------------------------------------------
     def next_plan_id(self, state: State) -> str:

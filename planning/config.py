@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SERVER_NAME = "planning-mcp"
-SERVER_VERSION = "1.13.2"
+SERVER_VERSION = "1.14.0"
 
 # The state dir is resolved from this file, NOT from the working directory.
 # AnythingLLM spawns the server with its own CWD, which is why plans "disappear"
@@ -28,6 +28,21 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_choice(name: str, allowed: tuple[str, ...], default: str) -> str:
+    """One of `allowed`, or the default. A typo must not silently disarm the gate."""
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw not in allowed:
+        # stderr, because logging is not configured yet when the config is built.
+        print(
+            f"[WARN] {name}={raw!r} is not one of {', '.join(allowed)}; using {default!r}",
+            file=sys.stderr,
+        )
+        return default
+    return raw
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -35,13 +50,51 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-# The MCP TypeScript SDK (which AnythingLLM uses) defaults to a 60s per-request
-# timeout and exposes no timeout key in AnythingLLM's server config. A blocking
-# approval therefore has to stay under that unless the client supplies a
-# progressToken - progress notifications reset the timer (resetTimeoutOnProgress
-# defaults to true, and no maxTotalTimeout is set), which lets us wait indefinitely.
+# How long a client will let one tools/call run.
+#
+# The MCP TypeScript SDK's DEFAULT_REQUEST_TIMEOUT_MSEC is 60000, and that 60s is the
+# de facto industry default: AnythingLLM inherits it, Claude Desktop hardcodes it with
+# no way to configure it (anthropics/claude-code#22542, #43791), Cursor matches it.
+# Exceeding it does not merely fail the call - the client drops the result and the
+# conversation breaks mid-approval.
 SDK_REQUEST_TIMEOUT_SEC = 60
+
+# This code used to bet the whole gate on progress heartbeats: send
+# notifications/progress every 20s and the client's timer resets, so a wait could run
+# for the full approval_timeout. That bet was wrong twice over.
+#
+#   1. `resetTimeoutOnProgress` originally defaulted to FALSE in the TypeScript SDK and
+#      was only later flipped to true (modelcontextprotocol/typescript-sdk#849). Any
+#      client on an older bundled SDK ignores the heartbeat completely.
+#   2. It is a per-request option the CLIENT passes. A server cannot set it, cannot read
+#      it, and cannot detect which way it went - the only symptom is the call dying at
+#      60s with a heartbeat thread still cheerfully ticking.
+#
+# So the heartbeat is now a bonus for clients where it happens to work, never the thing
+# safety rests on. Every wait is instead cut into chunks that finish comfortably inside
+# the tightest plausible client limit, and the model is told to call straight back. That
+# is also where the protocol is heading - splitting one long call into several
+# request/response pairs (SEP-1391 Long-Running Operations, SEP-1539 Timeout
+# Coordination).
+CALL_BUDGET_SEC = 45
+
+# Retained for `trust_heartbeat` mode, which keeps the old single-call behaviour.
 NO_PROGRESS_WAIT_CEILING_SEC = 55
+
+# How the HITL wait is spent.
+#   chunked         - default. Cut the wait into CALL_BUDGET_SEC slices; each slice ends
+#                     in a normal response telling the model to call again immediately.
+#                     Never trips a client timeout, and the conversation resumes on its
+#                     own within one slice of the human clicking.
+#   return          - publish the request and return at once. No tool calls are spent
+#                     waiting, but the human must send a chat message after deciding
+#                     before anything continues.
+#   trust_heartbeat - the pre-1.14 behaviour: one long blocking call relying on progress
+#                     notifications. Only for clients measured to honour them.
+APPROVAL_MODE_CHUNKED = "chunked"
+APPROVAL_MODE_RETURN = "return"
+APPROVAL_MODE_TRUST_HEARTBEAT = "trust_heartbeat"
+APPROVAL_MODES = (APPROVAL_MODE_CHUNKED, APPROVAL_MODE_RETURN, APPROVAL_MODE_TRUST_HEARTBEAT)
 
 
 @dataclass
@@ -52,6 +105,10 @@ class Config:
     max_tasks: int = 12
     autoapprove: bool = False
     blocking_approval: bool = True
+    approval_mode: str = APPROVAL_MODE_CHUNKED
+    # Ceiling on a SINGLE tools/call. The total wait is approval_timeout, spent across
+    # as many calls as it takes.
+    call_budget: int = CALL_BUDGET_SEC
     approval_port: int = 8765
     approval_timeout: int = 900
     approval_open_browser: bool = True
@@ -79,6 +136,10 @@ class Config:
             max_tasks=_env_int("PLANNING_MCP_MAX_TASKS", 12),
             autoapprove=_env_bool("PLANNING_MCP_AUTOAPPROVE", False),
             blocking_approval=_env_bool("PLANNING_MCP_BLOCKING_APPROVAL", True),
+            approval_mode=_env_choice(
+                "PLANNING_MCP_APPROVAL_MODE", APPROVAL_MODES, APPROVAL_MODE_CHUNKED
+            ),
+            call_budget=_env_int("PLANNING_MCP_CALL_BUDGET", CALL_BUDGET_SEC),
             approval_port=_env_int("PLANNING_MCP_APPROVAL_PORT", 8765),
             approval_timeout=_env_int("PLANNING_MCP_APPROVAL_TIMEOUT", 900),
             approval_open_browser=_env_bool("PLANNING_MCP_APPROVAL_OPEN_BROWSER", True),

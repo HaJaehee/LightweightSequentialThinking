@@ -9,8 +9,9 @@ request_user_approval(ASK_USER), and verifies that:
      which is what keeps the client's 60s request timer from expiring;
   3. clicking Approve on the localhost page makes the SAME call return APPROVED
      with execution unlocked;
-  4. without a progressToken the wait is capped below the SDK timeout instead of
-     hanging until the client errors.
+  4. every call returns inside the client's 60s limit whether or not a progressToken
+     was supplied - since 1.14.0 the wait is chunked, so the heartbeat is a bonus
+     rather than the thing safety depends on.
 
     python tests/smoke_blocking_approval.py
 """
@@ -29,7 +30,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "server.py"
-PORT = 8793
+# One port per scenario. The page refuses SO_REUSEADDR on purpose (two instances must
+# never both think they own the URL), so a port released by the previous scenario sits in
+# TIME_WAIT and the next bind fails.
+BASE_PORT = 8770
+PORT = BASE_PORT
+
+
+def use_port(offset: int) -> None:
+    global PORT
+    PORT = BASE_PORT + offset
 
 _failures: list[str] = []
 
@@ -41,7 +51,7 @@ def check(label: str, cond: bool, detail: str = "") -> None:
 
 
 class Server:
-    def __init__(self, state_dir: str, timeout: int = 900):
+    def __init__(self, state_dir: str, timeout: int = 900, budget: int = 45):
         env = dict(
             os.environ,
             PYTHONUTF8="1",
@@ -49,6 +59,7 @@ class Server:
             PLANNING_MCP_APPROVAL_PORT=str(PORT),
             PLANNING_MCP_APPROVAL_OPEN_BROWSER="false",
             PLANNING_MCP_APPROVAL_TIMEOUT=str(timeout),
+            PLANNING_MCP_CALL_BUDGET=str(budget),
         )
         self.p = subprocess.Popen(
             [sys.executable, "-u", str(SERVER), "--state-dir", state_dir, "--log-level", "ERROR"],
@@ -148,6 +159,7 @@ def draft(s: Server) -> None:
 
 
 def main() -> int:
+    use_port(0)
     print("\n== 1) 사람이 결정할 때까지 도구가 반환하지 않는가 (= 루프 정지) ==")
     with tempfile.TemporaryDirectory() as tmp:
         s = Server(tmp)
@@ -194,9 +206,11 @@ def main() -> int:
         finally:
             s.close()
 
-    print("\n== 4) progressToken 이 없으면 60초 전에 안전하게 만료되는가 ==")
+    print("\n== 4) progressToken 이 없어도 60초 전에 안전하게 반환되는가 ==")
+    use_port(1)
     with tempfile.TemporaryDirectory() as tmp:
-        s = Server(tmp, timeout=3600)
+        # 1.14.0: 하트비트 여부와 무관하게 한 호출은 call_budget 안에 끝난다.
+        s = Server(tmp, timeout=3600, budget=5)
         try:
             draft(s)
             started = time.monotonic()
@@ -214,14 +228,21 @@ def main() -> int:
             if payload:
                 check("계획은 여전히 잠김", payload["plan_status"] == "AWAITING_APPROVAL",
                       payload["plan_status"])
-                check("정지 지시 유지", payload["next_action"] == "STOP_AND_WAIT_FOR_USER")
+                # 승인으로 오독될 여지를 없애기 위해 ok:false 로 내려간다.
+                check("승인으로 읽히지 않음", payload["ok"] is False)
+                check("APPROVAL_PENDING", payload.get("error_code") == "APPROVAL_PENDING")
+                check("즉시 재호출을 지시",
+                      payload["next_action"] == "CALL_REQUEST_USER_APPROVAL")
+                check("남은 예산을 알려줌", payload.get("remaining_seconds", 0) > 0)
             check("하트비트를 보내지 않음", len(s.progress_notes()) == 0)
         finally:
             s.close()
 
-    print("\n== 5) 타임아웃 후에도 승인 창이 살아있고, 늦은 클릭이 반영되는가 ==")
+    print("\n== 5) 전체 예산 소진 후에도 승인 창이 살아있고, 늦은 클릭이 반영되는가 ==")
+    use_port(2)
     with tempfile.TemporaryDirectory() as tmp:
-        s = Server(tmp, timeout=3600)   # progressToken 없음 -> 55초로 축소
+        # 전체 대기 예산을 한 조각으로 다 써버려서 "계획을 보여주고 멈춰라" 경로를 탄다.
+        s = Server(tmp, timeout=5, budget=5)
         try:
             draft(s)
             started = time.monotonic()
@@ -233,7 +254,10 @@ def main() -> int:
                 if payload:
                     break
                 time.sleep(0.2)
-            check("타임아웃으로 반환", payload is not None and payload["plan_status"] == "AWAITING_APPROVAL")
+            check("예산 소진으로 반환",
+                  payload is not None and payload["plan_status"] == "AWAITING_APPROVAL")
+            check("사람에게 보여줄 계획을 함께 반환",
+                  bool(payload and payload.get("display_to_user")))
 
             queue = http_json("/api/pending")["requests"]
             pending = queue[0] if queue else {}
@@ -257,6 +281,7 @@ def main() -> int:
             s.close()
 
     print("\n== 6) 승인 대기가 다른 세션을 막지 않는가 ==")
+    use_port(3)
     with tempfile.TemporaryDirectory() as tmp:
         s = Server(tmp, timeout=900)
         try:

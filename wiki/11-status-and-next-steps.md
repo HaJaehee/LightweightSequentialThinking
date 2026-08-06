@@ -56,10 +56,19 @@
    source-only variant **last**, so the repo is left with a manifest that matches it. A real fix
    would write the archive manifest without touching the repo copy.
 2. **Push decision** — see above.
-3. **AnythingLLM progressToken behaviour is unconfirmed.** Claude Code sends none (55 s
-   ceiling). If AnythingLLM also sends none, blocking approvals have a 55 s window per call;
-   check the stderr `heartbeat on/off` line in the field. If it's a problem, the mitigation is a
-   client that supplies a progressToken, not a server change.
+3. **~~AnythingLLM progressToken behaviour is unconfirmed.~~ Resolved in 1.14.0 — by removing
+   the dependency rather than by answering the question.** The old note said the mitigation was
+   "a client that supplies a progressToken, not a server change". That was wrong on both halves:
+   `resetTimeoutOnProgress` defaulted to *false* in older TypeScript SDKs and is the client's
+   option to pass regardless, so a token guarantees nothing and no server can check. The wait is
+   now chunked into 45 s slices that no client kills. Whether AnythingLLM sends a token is now
+   merely an optimisation, and `audit.jsonl` answers it directly: a `client_cancelled_call`
+   entry records the client's real limit the first time it gives up.
+4. **The chunked loop's cost on a weak model is unmeasured in the field.** Each 45 s slice is
+   one extra tool call, so a 5-minute deliberation costs ~7. The refusal path is safe — a model
+   that goes off-script gets `ok:false` and cannot change any state (see D20) — but if the
+   corporate LLM will not reliably re-call, set `PLANNING_MCP_APPROVAL_MODE=return` and the
+   human sends one chat message after deciding instead.
 
 ## Where to look for the next bug
 

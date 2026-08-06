@@ -45,8 +45,14 @@ These spawn `server.py` exactly as AnythingLLM does and speak JSON-RPC over the 
 catch things unit tests cannot (threading, real ports, cross-process locks):
 
 - **smoke_stdio** — full lifecycle + sloppy-input recovery + Korean round-trip + restart persistence.
-- **smoke_blocking_approval** — 6 checks: tool blocks, heartbeat with token, click→APPROVED,
-  safe timeout without token, request survives timeout, blocking doesn't stall other sessions.
+- **smoke_blocking_approval** — 6 scenarios: tool blocks, heartbeat with token, click→APPROVED,
+  every call returns inside the client's 60 s limit, the request survives a spent budget and a
+  late click still lands, blocking doesn't stall other sessions.
+- **smoke_chunked_approval** — the 1.14.0 wait, in three scenarios: a slice ends inside the
+  client's limit as `ok:false` + `APPROVAL_PENDING` carrying nothing that reads as a verdict;
+  re-asking reuses the same request so the page never redraws; a click during a later slice
+  unlocks execution; a model-sent decision is refused while the request is open;
+  `notifications/cancelled` unblocks the call and is recorded as the client's real cap.
 - **smoke_shared_approval** — 2 processes, one page, request from the non-owner shows on the
   page, decision reaches the asker, owner death → automatic port takeover.
 - **smoke_multi_plan** — 2 processes, separate plans, both approvals on one page, each unblocks

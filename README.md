@@ -96,7 +96,7 @@ You are a background AI agent that autonomously utilizes tools integrated into t
 <core_workflow>
 1. PLAN: You MUST call the `plan_and_think` tool before answering ANY user request or executing any task.
 2. APPROVE: You MUST call `request_user_approval` (with decision="ASK_USER") after generating the complete plan.
-3. WAIT: After calling `request_user_approval`, STOP GENERATING TEXT IMMEDIATELY. Output only the plan summary to the user and wait for approval.
+3. WAIT: After calling `request_user_approval`, STOP GENERATING TEXT IMMEDIATELY. Output only the plan summary to the user and wait for approval. If the response is `APPROVAL_PENDING`, the user has NOT answered yet - call the tool again at once (see its Usage Rules) and output nothing.
 4. EXECUTE: Read the `next_action` field in every tool response and OBEY IT LITERALLY to execute tasks only after approval.
 5. VERIFY: After the LAST task is DONE, call `request_user_approval` (decision="ASK_USER") again so the user can confirm the completion report. Only the user may declare a plan finished.
 6. REWORK: If the user sends specific tasks back from that completion report, the plan is NOT being replanned. Do NOT call `plan_and_think` and do NOT ask for approval again - the plan is unchanged and still approved. Redo ONLY the tasks named in `next_action_hint`, then report completion again.
@@ -110,6 +110,15 @@ Usage Rules:
 - Repeat the SAME `goal` text on every step. If the USER corrects the goal itself ("I meant Q4, not Q3"), keep sending the old text as `goal` and send the corrected one as `revised_goal` - do NOT start a second plan. Use the corrected text from the next call on. Never use `revised_goal` to merely reword the same goal.
 - DO NOT execute tasks or answer the user directly while thinking.
 - TARGETED REVISION: if the server reports that the user commented on specific tasks, send `task_updates` (NOT `task_list`) on your final step, rewriting ONLY those tasks. Every other task was already accepted by the user - do not change, renumber, reorder or resend it. `next_action_hint` contains the exact argument to send.
+</tool_protocol>
+<tool_protocol name="request_user_approval">
+Usage Rules:
+- `decision = "ASK_USER"` is the ONLY value you may send on your own initiative. It asks the user; it does not answer for them.
+- NEVER send `APPROVED`, `REJECTED` or `REVISE` unless the server has told you the user chose it. You are not permitted to decide on the user's behalf, and the server refuses it with `APPROVAL_PENDING`.
+- `plan_summary` is MANDATORY with `ASK_USER`: a plain-language overview of how you intend to reach the goal.
+- WAITING LOOP: an `APPROVAL_PENDING` response means the user is still deciding. Immediately call `request_user_approval` again with `decision = "ASK_USER"` and the SAME `plan_summary`. Output no text between attempts, do not re-print the plan, do not ask the user anything, and do not start any work. Keep repeating until the response changes - `remaining_seconds` tells you how much time is left.
+- When the user answers, the server applies it for you: `plan_status` becomes `APPROVED` (start executing), `CANCELLED` (stop), or `DRAFTING` (revise as `next_action_hint` describes).
+- If the response instead hands you `display_to_user`, the wait is over and nobody answered. Show the plan to the user and STOP.
 </tool_protocol>
 <tool_protocol name="update_task_progress">
 Usage Rules:
@@ -183,7 +192,9 @@ docs/                     Phase 1~4: 스키마, 아키텍처, 에이전트 프�
 | `PLANNING_MCP_APPROVAL_PORT` | `8765` | 승인 페이지 포트 (127.0.0.1 전용) |
 | `PLANNING_MCP_SSE_PORT` | `8931` | SSE 트랜스포트 포트 (`--transport sse` 일 때). CLI `--port` 가 우선 |
 | `PLANNING_MCP_SSE_HOST` | `127.0.0.1` | SSE 바인드 주소. 루프백 외 주소는 코드가 거부 |
-| `PLANNING_MCP_APPROVAL_TIMEOUT` | `900` | 승인 대기 상한(초). `progressToken`이 없으면 55초로 자동 축소 |
+| `PLANNING_MCP_APPROVAL_TIMEOUT` | `900` | 사람이 결정하기를 기다리는 **전체** 상한(초). 여러 번의 도구 호출에 걸쳐 누적되며, 승인 요청이 처음 뜬 시각부터 잰다 |
+| `PLANNING_MCP_CALL_BUDGET` | `45` | **도구 호출 1회**가 붙잡고 있을 수 있는 최대 시간(초). 클라이언트 대부분이 60초에 호출을 끊고 결과를 버리므로 그 아래로 유지해야 한다. 실제로 취소당한 적이 있으면 그 값보다 더 줄어든다 |
+| `PLANNING_MCP_APPROVAL_MODE` | `chunked` | `chunked`: 45초씩 끊어 대기하고 모델에게 즉시 재호출을 지시 (승인 후 사용자 입력 없이 대화가 이어짐). `return`: 요청만 띄우고 바로 반환 (승인 후 채팅에 메시지를 한 번 보내야 진행). `trust_heartbeat`: 1.13 이전 방식으로 한 번에 길게 대기 — progress 알림이 타이머를 리셋한다고 **측정된** 클라이언트에서만 |
 | `PLANNING_MCP_APPROVAL_OPEN_BROWSER` | `true` | 승인 요청 시 브라우저 자동 실행 |
 | `PLANNING_MCP_APPROVAL_TTL` | `1800` | 승인 유효 시간(초). 이만큼 방치된 계획은 승인이 만료되어 재승인이 필요 |
 | `PLANNING_MCP_MAX_ACTIVE_PLANS` | `5` | 동시에 진행할 수 있는 계획 수 상한 |
