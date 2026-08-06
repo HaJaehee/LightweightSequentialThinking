@@ -128,9 +128,26 @@ explicitly promises is unnecessary. Instead each card carries a liveness chip dr
 *에이전트가 대기를 멈췄습니다* (the decision still counts, but the user must send one chat
 message to continue).
 
-`_surface` also stopped opening a browser window per request — `_open_browser_once` never
-checked the `_opened_once` flag it is named for. It now honours it, and skips opening entirely
-when a tab has polled `/api/pending` within the last 10 s.
+`_surface` also stopped opening a browser window per request. Two rules decide it, and
+**both expire** (1.14.1) — an earlier attempt latched "opened once" permanently, which meant
+closing the tab closed the door for the rest of the session:
+
+- a tab has polled `/api/pending` within `PAGE_IDLE_SEC` (10 s) — someone is already looking;
+- we launched a browser within `OPEN_GRACE_SEC` (10 s) — one is still starting up, which is
+  what keeps the chunked wait's repeat calls from stacking windows. This one **doubles** on
+  each launch that no tab ever answers, up to `OPEN_GRACE_MAX_SEC` (10 min), because
+  `webbrowser.open` returning `True` is not proof a window appeared.
+
+Otherwise it opens. So closing the window and leaving the agent waiting gets you a fresh one
+on the next 45 s chunk, not silence.
+
+**Liveness is shared, not per-process** (1.14.2). Only one instance owns the page; the rest are
+peers, and the human's tab polls the owner alone. But the instance that decides to open a
+browser is whichever one is *holding an approval request* — routinely a peer. So a poll is
+written to `page_seen` in the state directory (throttled to `PAGE_SEEN_WRITE_SEC`, 2 s) and
+`page_is_being_watched` reads the max of that and its own counter. Reading only the local
+counter, a peer concludes "nobody is watching" every time, and a 45 s chunked wait becomes a
+new window every 45 seconds at a human who already has the page open.
 
 ## The request outlives the tool call (1.5.0)
 

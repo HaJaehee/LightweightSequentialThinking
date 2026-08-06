@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # otherwise drown the test output. The tests assert on responses and the audit log instead.
 logging.disable(logging.CRITICAL)
 
+from planning import approval  # noqa: E402
 from planning.approval import _PAGE, ApprovalServer, ApprovalStore, Verdict  # noqa: E402
 from planning.config import SDK_REQUEST_TIMEOUT_SEC, Config  # noqa: E402
 from planning.filelock import exclusive  # noqa: E402
@@ -1419,6 +1420,33 @@ class TestBlockingApproval(HandlerTestCase):
             owner.shutdown()
             peer.shutdown()
 
+    def test_a_real_poll_to_the_owner_is_visible_to_the_peer(self):
+        """D24 end to end: the HTTP handler must publish liveness, not just remember it.
+
+        This is the shape that broke in production - the human's tab talks to the owner,
+        the approval request is held by the peer, and it is the peer that decides whether
+        to launch a browser.
+        """
+        store_dir = self.state_dir / "shared-liveness"
+        owner = ApprovalServer(ApprovalStore(store_dir), port=8796, open_browser=False)
+        peer = ApprovalServer(ApprovalStore(store_dir), port=8796, open_browser=False)
+        try:
+            self.assertTrue(owner.start())
+            self.assertTrue(peer.start())
+            self.assertFalse(peer.page_is_being_watched(), "no tab has polled yet")
+
+            with urllib.request.urlopen(owner.url + "api/pending", timeout=5) as r:
+                r.read()
+
+            self.assertEqual(peer._last_poll_at, 0.0, "the peer was never polled itself")
+            self.assertTrue(
+                peer.page_is_being_watched(),
+                "a peer that cannot see the owner's tab opens a window every slice",
+            )
+        finally:
+            owner.shutdown()
+            peer.shutdown()
+
     def test_foreign_occupant_is_detected(self):
         """A non-planning-mcp listener on the port must be reported, not adopted."""
         blocker = socket.socket()
@@ -1790,13 +1818,22 @@ class TestChunkedApproval(HandlerTestCase):
 
 
 class TestBrowserTabSpam(HandlerTestCase):
-    """One request must not equal one new browser window.
+    """One request must not equal one new browser window - and closing the window must
+    not mean no window ever again.
 
     `_surface` called `_open_browser_once` on every request, and that function never
     checked the `_opened_once` flag it is named for - the guard lived only in `start()`.
     Every approval opened another tab, so the human ended up with several windows each
     holding a different half-written comment, and whichever one they submitted from
     silently discarded the rest.
+
+    Fixing that by honouring `_opened_once` overshot (D23): the latch was permanent, so
+    once the human closed the approval tab no later request could ever open one. They
+    were left waiting on a window that would never come back. Suppression now comes from
+    liveness plus a short launch grace, both of which expire.
+
+    Which put the whole weight on liveness being *right*, and it was process-local (D24).
+    See TestPageLivenessIsShared.
     """
 
     def server(self):
@@ -1830,6 +1867,169 @@ class TestBrowserTabSpam(HandlerTestCase):
         self.assertFalse(srv.page_is_being_watched())
         srv._surface()
         self.assertEqual(srv._opened, 1)
+
+    def test_closing_the_tab_lets_the_next_request_open_one(self):
+        """D23. The human closes the approval window, then a later request arrives."""
+        srv = self.server()
+        srv._surface()  # first request opens a tab
+        srv.note_poll()  # it loads and starts polling; they are looking at it
+        srv._surface()
+        self.assertEqual(srv._opened, 1, "no second tab while one is being watched")
+
+        # They close the tab: the last poll recedes past the idle window.
+        gone = time.time() - (approval.PAGE_IDLE_SEC + 1)
+        srv._last_poll_at = gone
+        srv.store.mark_page_seen(gone)
+        srv._last_open_at = gone
+        srv._surface()
+        self.assertEqual(srv._opened, 2, "a closed tab must be reopened, not shrugged off")
+
+    def test_the_launch_grace_survives_a_chunked_wait_repeat(self):
+        """The tab has been asked for but has not polled yet - do not launch another."""
+        srv = self.server()
+        srv._surface()
+        for _ in range(5):
+            srv._surface()  # repeat calls land before the browser has finished starting
+        self.assertEqual(srv._opened, 1)
+
+    def test_suppression_is_never_permanent(self):
+        srv = self.server()
+        for _ in range(3):
+            srv._surface()
+            # Each window really did appear and poll, then the human closed it again.
+            gone = time.time() - (approval.PAGE_IDLE_SEC + 1)
+            srv._last_open_at = gone
+            srv._last_poll_at = gone
+            srv.store.mark_page_seen(gone)
+        self.assertEqual(srv._opened, 3)
+
+
+class TestPageLivenessIsShared(HandlerTestCase):
+    """D24. Whether a tab is open is a fact about the machine, not about one process.
+
+    Only one planning-mcp process owns the approval page; every other instance on the
+    same state directory is a peer, and the polls go to the owner. The process that
+    decides to open a browser is whichever one is holding an approval request - routinely
+    a peer, whose own `_last_poll_at` is zero forever. Reading only that counter, a peer
+    concludes "nobody is watching" every time, and the 45s chunked wait becomes a new
+    window every 45 seconds in front of a human who already has the page open.
+    """
+
+    def pair(self):
+        """An owner and a peer, sharing one state directory - the real deployment."""
+        owner = ApprovalServer(ApprovalStore(self.state_dir), port=0, open_browser=True)
+        peer = ApprovalServer(ApprovalStore(self.state_dir), port=0, open_browser=True)
+        peer._opened = 0
+
+        def fake_open(url):
+            peer._opened += 1
+            return True
+
+        self.addCleanup(mock.patch.stopall)
+        mock.patch("planning.approval.webbrowser.open", fake_open).start()
+        return owner, peer
+
+    def test_a_peer_sees_the_tab_the_owner_is_serving(self):
+        owner, peer = self.pair()
+        owner.note_poll()  # the human's tab polls the owner, not the peer
+        self.assertEqual(peer._last_poll_at, 0.0, "the peer is not the one being polled")
+        self.assertTrue(peer.page_is_being_watched())
+        peer._surface()
+        self.assertEqual(peer._opened, 0)
+
+    def test_the_chunked_wait_does_not_open_a_window_per_slice(self):
+        owner, peer = self.pair()
+        for _ in range(6):  # six 45s slices of one wait
+            owner.note_poll()  # the tab is open the whole time
+            peer._last_open_at -= approval.OPEN_GRACE_SEC + 1  # slices are far apart
+            peer._surface()
+        self.assertEqual(peer._opened, 0, "one window per slice is the D24 bug")
+
+    def test_a_peer_still_opens_one_when_no_tab_answers(self):
+        owner, peer = self.pair()
+        owner.note_poll()
+        peer.store.mark_page_seen(time.time() - (approval.PAGE_IDLE_SEC + 1))
+        peer._last_poll_at = 0.0
+        self.assertFalse(peer.page_is_being_watched())
+        peer._surface()
+        self.assertEqual(peer._opened, 1)
+
+    def test_a_poll_is_written_where_another_process_can_read_it(self):
+        owner, peer = self.pair()
+        owner.note_poll()
+        self.assertGreater(peer.store.page_last_seen(), 0.0)
+
+    def test_writes_are_throttled_but_never_stale_enough_to_matter(self):
+        owner, _ = self.pair()
+        owner.note_poll()
+        first = owner.store.page_last_seen()
+        owner.note_poll()  # immediately again - throttled, not written
+        self.assertEqual(owner.store.page_last_seen(), first)
+        # The throttle window is far shorter than the idle window it feeds.
+        self.assertLess(approval.PAGE_SEEN_WRITE_SEC, approval.PAGE_IDLE_SEC)
+
+    def test_a_missing_or_corrupt_record_reads_as_no_tab(self):
+        _, peer = self.pair()
+        self.assertEqual(peer.store.page_last_seen(), 0.0)
+        peer.store.page_seen_path.write_text("not a number", encoding="ascii")
+        self.assertEqual(peer.store.page_last_seen(), 0.0)
+        self.assertFalse(peer.page_is_being_watched())
+
+
+class TestBrowserThatCannotOpen(HandlerTestCase):
+    """`webbrowser.open` returning True is not proof a window appeared.
+
+    Policy can swallow it and the handler can be missing. With a fixed grace, every slice
+    of the wait relaunches a browser that never shows up.
+    """
+
+    def server(self):
+        srv = ApprovalServer(ApprovalStore(self.state_dir), port=0, open_browser=True)
+        srv._opened = 0
+
+        def fake_open(url):
+            srv._opened += 1
+            return True  # claims success, no tab ever polls
+
+        self.addCleanup(mock.patch.stopall)
+        mock.patch("planning.approval.webbrowser.open", fake_open).start()
+        return srv
+
+    def test_launches_back_off_instead_of_repeating_every_slice(self):
+        srv = self.server()
+        for _ in range(8):
+            srv._last_open_at -= approval.OPEN_GRACE_SEC + 1  # one slice later
+            srv._surface()
+        self.assertLess(srv._opened, 8, "a browser that never opens must not be spammed")
+        self.assertGreater(srv._opened, 0)
+
+    def test_the_backoff_is_capped(self):
+        srv = self.server()
+        srv._opens_without_contact = 99
+        srv._last_open_at = time.time() - (approval.OPEN_GRACE_MAX_SEC + 1)
+        srv._surface()
+        self.assertEqual(srv._opened, 1)
+
+    def test_one_real_poll_makes_it_responsive_again(self):
+        srv = self.server()
+        for _ in range(8):
+            srv._last_open_at -= approval.OPEN_GRACE_SEC + 1
+            srv._surface()
+        backed_off = srv._opened
+
+        # The human opens the page by hand: contact re-established, then closes it.
+        srv.store.mark_page_seen(time.time())
+        srv._last_poll_at = 0.0
+        srv._surface()  # a tab is watching - nothing to do
+        self.assertEqual(srv._opened, backed_off)
+
+        # ...then closes it. The poll answered the launch, so it is the newer of the two.
+        seen = time.time() - (approval.PAGE_IDLE_SEC + 1)
+        srv.store.mark_page_seen(seen)
+        srv._last_poll_at = seen
+        srv._last_open_at = seen - 1
+        srv._surface()
+        self.assertEqual(srv._opened, backed_off + 1, "grace must be back to its floor")
 
 
 class TestPublishReuse(HandlerTestCase):

@@ -240,6 +240,23 @@ was added: it would measure the call, not the request. Defects
 [D21](09-defects-and-lessons.md#d21-—-the-heartbeat-bet-and-the-swallowed-cancellation-1140),
 [D22](09-defects-and-lessons.md#d22-—-a-new-browser-tab-per-approval-and-a-rebuild-that-ate-what-you-typed-1140).
 
+### 1.14.1 — a closed approval window comes back
+Found in live testing of 1.14.0, not by the suite. The tab-spam guard added in 1.14.0 was a
+permanent latch, so closing the approval window meant no request could ever open one again: the
+agent went on slicing its 45 s waits against a page that was not on screen, and the human waited
+for a window that was never coming. Suppression is now time-based (`OPEN_GRACE_SEC`, 10 s) on
+top of the liveness check that was already correct — both expire, so the state is always
+recoverable. Defect [D23](09-defects-and-lessons.md#d23-—-close-the-approval-window-and-it-never-comes-back-1141).
+
+### 1.14.2 — page liveness is shared, like everything else
+The 1.14.1 fix leaned entirely on "is a tab watching?", and that was answered from a
+process-local counter only the page's *owner* ever updates. The instance that opens browsers is
+whichever one holds the request — usually a peer, which therefore always concluded nobody was
+watching. Result: a new window every 45 s, one per slice, at a human already looking at the
+page. Liveness now goes through `page_seen` in the state directory. The launch grace also backs
+off when a launch never produces a poll. Defect
+[D24](09-defects-and-lessons.md#d24-—-a-new-window-every-45-seconds-at-a-human-already-looking-at-the-page-1142).
+
 [SEP-1391]: https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1391
 [SEP-1539]: https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1539
 

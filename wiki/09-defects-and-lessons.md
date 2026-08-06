@@ -381,7 +381,7 @@ a slice never changes the page signature (and `created_at` is preserved, so the 
 actually expire). Drafts moved to `localStorage` keyed by request id, restored on every render,
 mirrored across tabs by a `storage` listener, and cleared only after a decision posts
 successfully. `_surface` skips opening a browser when a tab polled within the last 10 s, and
-`_open_browser_once` honours its flag.
+`_open_browser_once` honours its flag. (That last clause was itself the next bug — see D23.)
 **Deliberately not fixed with partial rendering,** which was the obvious repair: keeping DOM
 nodes per request would let two tabs drift apart, and the human would submit from whichever tab
 happened to lack their text. Keeping the full rebuild and moving the *state* out of the DOM
@@ -391,6 +391,58 @@ never had.
 question is why the input was somewhere a re-render could reach. Also: a function named
 `_open_browser_once` that opens the browser every time is exactly the kind of bug a reader skims
 past, because the name asserts the invariant the code forgot.
+
+## D23 — close the approval window and it never comes back (1.14.1)
+
+**Root cause:** the D22 fix overshot. `_opened_once` is a **permanent** latch: the first
+successful `webbrowser.open` sets it, and `_open_browser_once` returns early forever after.
+`_surface` already had the correct guard — `page_is_being_watched()`, which expires — so the
+latch added nothing except an unrecoverable state.
+**Symptom:** found in live testing, not by the suite. Suppressing a duplicate tab worked; the
+inverse did not. Close the approval window and every later request surfaces nothing at all —
+the log line still says `HUMAN APPROVAL NEEDED`, the agent keeps slicing its 45 s waits, and the
+human sits in front of a browser with no page, waiting on a window that will never open. It
+ends when the 900 s budget expires. Chunked waiting makes it worse than it looks: the retries
+that would have reopened the tab are exactly the calls the latch silences.
+**Fix:** replace the boolean with `_last_open_at` and suppress for `OPEN_GRACE_SEC` (10 s)
+instead of forever. That grace covers the only real gap — a browser that has been launched but
+has not polled yet — and then lets go. Both suppression rules now expire, so any state the
+server ends up in is one it can leave. `start()` calls the same guarded function rather than
+reproducing the check.
+**Lesson:** the two tests written for D22 both asserted *suppression* (`_opened == 1`), and
+both passed against a latch that could never release. A test that a thing does not happen is
+only half a test; the missing half is that it happens again once the reason expires. When a fix
+for "too often" lands, ask what now makes it happen *at all* — and prefer a timestamp to a
+boolean whenever the condition being tracked is one the world can undo.
+
+## D24 — a new window every 45 seconds, at a human already looking at the page (1.14.2)
+
+**Root cause:** the D23 fix put the whole weight on `page_is_being_watched()`, and that
+function was process-local. `_last_poll_at` is set by the HTTP handler, so only the instance
+that *owns* the page ever updates it; every other planning-mcp instance on the same state
+directory is a peer whose counter stays at zero forever. And the instance that decides whether
+to open a browser is whichever one is **holding the approval request** — routinely a peer. The
+old code carried a comment admitting this and calling it safe: *"the worst case is one extra
+tab, not a request nobody sees."* That was only true because the permanent latch capped it at
+one. Remove the latch and the same blind spot fires on every slice.
+**Symptom:** found in live testing, immediately. Two planning-mcp processes were running
+(confirmed: PID 22412 held `127.0.0.1:8765` with the browser connected to it; the peer served
+the tool calls). A new browser window every 45 seconds — one per slice of the chunked wait —
+in front of a human who had the page open the whole time. Strictly worse than D23.
+**Fix:** liveness moved to the state directory like everything else that is shared. The
+handler writes `page_seen` (throttled to 2 s, unlocked and non-atomic — a lost write costs one
+stale reading in a direction that is already bounded), and `page_is_being_watched` takes the
+max of that and the local counter, so a fresh poll still counts before it is written out. The
+launch grace also backs off exponentially when a launch never produces a poll, since
+`webbrowser.open` returning `True` does not mean a window appeared.
+**Lesson:** three fixes in a row to the same six lines, each correct about the bug in front of
+it and blind to the state it left behind. The through-line is that *this server is
+multi-process by design* — plans, decisions and locks were all shared through the state
+directory, and page liveness was the one fact still kept in a local attribute. A comment
+explaining why a known-wrong value is tolerable is a load-bearing assumption; when the code it
+was written against changes, that comment is where the next bug is. Tests would not have caught
+this either: every browser test used a single `ApprovalServer`, so the peer — the whole
+deployment topology — was never in the picture.
 
 [typescript-sdk#849]: https://github.com/modelcontextprotocol/typescript-sdk/pull/849
 

@@ -47,6 +47,7 @@ log = logging.getLogger("planning-mcp.approval")
 DECISIONS = ("APPROVED", "REJECTED", "REVISE")
 APPROVAL_FILENAME = "approval.json"
 APPROVAL_LOCK_FILENAME = ".approvallock"
+PAGE_SEEN_FILENAME = "page_seen"
 SERVER_SIGNATURE = "planning-mcp-approval"
 
 # Which question the human is being asked. A PLAN request is a task list they may
@@ -57,6 +58,18 @@ PHASE_COMPLETION = "COMPLETION"
 
 # No poll for this long means no tab is open.
 PAGE_IDLE_SEC = 10.0
+# How often the process serving the page records that a tab polled it. The record is
+# shared through the state directory because the process that opens browsers is often not
+# the process that owns the page - see `page_is_being_watched`.
+PAGE_SEEN_WRITE_SEC = 2.0
+# How long a browser we just launched is given to load the page and poll once before we
+# are willing to launch another. Covers the window where no tab is polling yet but one is
+# on its way, which is the only reason to suppress an open that `PAGE_IDLE_SEC` misses.
+OPEN_GRACE_SEC = 10.0
+# If a launch never results in a tab polling us, the next wait doubles, up to this. A
+# browser that cannot open (corporate policy, no default handler) otherwise gets launched
+# again on every slice of the chunked wait, forever, with nothing to show for it.
+OPEN_GRACE_MAX_SEC = 600.0
 
 # How stale `agent_last_seen` may get before the page stops claiming an agent is still
 # waiting. Comfortably above the waiter's own 10s touch interval, so an ordinary pause
@@ -106,6 +119,28 @@ class ApprovalStore:
     @property
     def lock_path(self) -> Path:
         return self.state_dir / APPROVAL_LOCK_FILENAME
+
+    @property
+    def page_seen_path(self) -> Path:
+        return self.state_dir / PAGE_SEEN_FILENAME
+
+    # ---- page liveness -------------------------------------------------
+    # Whether a tab is open is a property of the *machine*, not of one process, so it
+    # lives in the state directory with everything else that is shared. No lock and no
+    # atomic replace: a torn or lost write costs one stale liveness reading, and the
+    # cost of getting it wrong is bounded in both directions (one extra tab, or one
+    # slice's delay before reopening).
+    def mark_page_seen(self, now: float | None = None) -> None:
+        try:
+            self.page_seen_path.write_text(repr(now or time.time()), encoding="ascii")
+        except OSError:
+            pass
+
+    def page_last_seen(self) -> float:
+        try:
+            return float(self.page_seen_path.read_text(encoding="ascii"))
+        except (OSError, ValueError):
+            return 0.0
 
     # ---- io -----------------------------------------------------------
     def read(self) -> dict[str, Any]:
@@ -855,12 +890,19 @@ class ApprovalServer:
         self.takeover_interval = takeover_interval
         self._httpd: _ExclusiveHTTPServer | None = None
         self._lock = threading.Lock()
-        self._opened_once = False
+        # When we last launched a browser - NOT whether we ever did. A permanent latch
+        # here meant closing the tab closed the door: the human never saw another
+        # request. See `_open_browser`.
+        self._last_open_at = 0.0
+        # Consecutive launches after which no tab ever polled. Backs the grace off so a
+        # browser that cannot open is not relaunched on every slice forever.
+        self._opens_without_contact = 0
         self._stop = threading.Event()
         # When the page last asked for work. A live tab makes opening another one pure
         # harm: the human ends up with several windows holding different half-written
         # comments, and whichever one they submit from silently discards the rest.
         self._last_poll_at = 0.0
+        self._last_poll_written_at = 0.0
 
     @property
     def url(self) -> str:
@@ -874,8 +916,10 @@ class ApprovalServer:
     def start(self) -> bool:
         """Take the page if it is free, otherwise confirm a peer already serves it."""
         if self._try_bind():
-            if self.open_browser and not self._opened_once:
-                self._open_browser_once()
+            # Same liveness question as `_surface`: a tab left open across our restart is
+            # still watching, and a second window would only split the human's attention.
+            if self.open_browser and not self.page_is_being_watched():
+                self._open_browser()
             self._start_takeover_watch()
             return True
 
@@ -973,15 +1017,35 @@ class ApprovalServer:
     def drop_for_plan(self, plan_id: str) -> None:
         self.store.drop_for_plan(plan_id)
 
-    def page_is_being_watched(self) -> bool:
-        """Has a tab polled us recently enough to count as open?
+    def note_poll(self) -> None:
+        """A tab just asked us for work. Publish that where peers can see it.
 
-        The page polls every 1.5s, so a gap of PAGE_IDLE_SEC means every tab is gone
-        (or was never opened). Peers serving the same state directory update their own
-        copy of this, not ours - which is the conservative direction to be wrong in:
-        the worst case is one extra tab, not a request nobody sees.
+        Throttled: the page polls every 1.5s and only `PAGE_IDLE_SEC` resolution matters,
+        so there is no reason to touch the disk on every request.
         """
-        return (time.time() - self._last_poll_at) < PAGE_IDLE_SEC
+        now = time.time()
+        self._last_poll_at = now
+        if (now - self._last_poll_written_at) >= PAGE_SEEN_WRITE_SEC:
+            self._last_poll_written_at = now
+            self.store.mark_page_seen(now)
+
+    def page_is_being_watched(self) -> bool:
+        """Has a tab polled *anyone* recently enough to count as open?
+
+        The page polls every 1.5s, so a gap of PAGE_IDLE_SEC means every tab is gone (or
+        was never opened).
+
+        The answer has to come from the state directory, not from this process. Only one
+        process owns the page; every other planning-mcp instance on the same state dir is
+        a peer whose own `_last_poll_at` stays at zero forever, because the polls go to
+        the owner. The process that decides to open a browser is whichever one is holding
+        an approval request - routinely a peer. Reading only our own counter, a peer
+        concludes "no tab is open" every single time, which is how a 45s chunked wait
+        turned into a new window every 45 seconds (D24). Our in-process value is still
+        consulted so a fresh poll counts immediately, before it has been written out.
+        """
+        seen = max(self._last_poll_at, self.store.page_last_seen())
+        return (time.time() - seen) < PAGE_IDLE_SEC
 
     def _surface(self) -> None:
         log.warning("HUMAN APPROVAL NEEDED -> %s", self.url)
@@ -990,27 +1054,46 @@ class ApprovalServer:
         if self.page_is_being_watched():
             log.info("A tab is already watching %s; not opening another", self.url)
             return
-        self._open_browser_once()
+        self._open_browser()
 
-    def _open_browser_once(self) -> None:
+    def _open_browser(self) -> None:
         """Best-effort only. Corporate policy, a missing default browser, or a second
         monitor can all defeat this, which is why the page also polls.
 
-        Once really does mean once. This used to open a window on every single approval
-        request, because the `_opened_once` guard it is named for lived only in the
-        caller in `start()`.
+        Opening is suppressed by *liveness*, never permanently. The predecessor of this
+        function latched a `_opened_once` flag the first time it succeeded and refused
+        forever after, so closing the approval tab meant no request ever surfaced a
+        window again - the human waited on a page that was never going to appear. The
+        duplicate-tab problem that latch was fighting is already handled by
+        `page_is_being_watched`; all this needs to add is a grace period so the chunked
+        wait's repeat calls do not launch a second browser while the first is still
+        starting up.
+
+        That grace doubles each time a launch fails to produce a tab, because "opened
+        successfully" is a lie a browser can tell: policy can swallow the window, or the
+        handler can be missing. Without the backoff, every slice of the wait relaunches
+        it and nothing ever appears. A single poll from anywhere clears the count.
         """
-        if self._opened_once:
+        now = time.time()
+        contacted = self.store.page_last_seen() >= self._last_open_at
+        if self._last_open_at and not contacted:
+            grace = min(
+                OPEN_GRACE_SEC * (2 ** self._opens_without_contact), OPEN_GRACE_MAX_SEC
+            )
+        else:
+            self._opens_without_contact = 0
+            grace = OPEN_GRACE_SEC
+        if (now - self._last_open_at) < grace:
             return
+        self._opens_without_contact += 1
+        self._last_open_at = now
         try:
             if webbrowser.open(self.url):
-                self._opened_once = True
                 return
         except Exception as exc:  # noqa: BLE001
             log.debug("webbrowser.open failed: %s", exc)
         try:
             os.startfile(self.url)  # type: ignore[attr-defined]
-            self._opened_once = True
             return
         except Exception:  # noqa: BLE001
             pass
@@ -1050,7 +1133,7 @@ class ApprovalServer:
                         {"server": SERVER_SIGNATURE, "state_dir": str(server.store.state_dir)}
                     )
                 elif path == "/api/pending":
-                    server._last_poll_at = time.time()
+                    server.note_poll()
                     now = time.time()
                     self._json({"requests": [
                         {
