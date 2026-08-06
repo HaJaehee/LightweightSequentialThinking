@@ -597,7 +597,6 @@ class PlanningHandlers:
 
         if plan is not None and plan.status in (PlanStatus.APPROVED, PlanStatus.IN_EXECUTION):
             self.store.audit("plan_and_think_redirected", plan_id=plan.plan_id)
-            task = plan.current_task()
             if goal_was_revised:
                 # The approval on file was given for the OLD goal. Recording the
                 # correction must not quietly widen what the human agreed to.
@@ -1094,7 +1093,6 @@ class PlanningHandlers:
         cancel_event: Any = None,
     ) -> dict[str, Any]:
         if plan.status in (PlanStatus.APPROVED, PlanStatus.IN_EXECUTION):
-            task = plan.current_task()
             return build(
                 plan,
                 message="This plan was already approved by the user. Continue executing it.",
@@ -1428,7 +1426,6 @@ class PlanningHandlers:
         self, state: State, plan: Plan, args: dict[str, Any], notes: list[str]
     ) -> dict[str, Any]:
         if plan.status in (PlanStatus.APPROVED, PlanStatus.IN_EXECUTION):
-            task = plan.current_task()
             return build(
                 plan,
                 message="Already approved. Continue executing.",
@@ -1478,7 +1475,6 @@ class PlanningHandlers:
                 progress=plan.progress(),
             )
 
-        task = plan.current_task()
         return build(
             plan,
             message=(
@@ -1592,7 +1588,6 @@ class PlanningHandlers:
         )
         which = ", ".join(str(t) for t in reopened)
         kept = [t.task_id for t in plan.tasks if t.status == TaskStatus.DONE.value]
-        task = plan.current_task()
         return build(
             plan,
             message=(

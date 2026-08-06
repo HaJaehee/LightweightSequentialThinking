@@ -1,6 +1,6 @@
 # planning-mcp (LightweightSequentialThinking)
 
-**버전: 1.14.2** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
+**버전: 1.15.0** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
 `SERVER_VERSION` (MCP `initialize` 응답의 `serverInfo.version` 으로 보고됨)
 
 AnythingLLM Agent Mode용 경량 **계획·작업 관리 MCP 서버**. 폐쇄망의 성능이 약한 사내 LLM이
@@ -123,13 +123,15 @@ Usage Rules:
 <tool_protocol name="update_task_progress">
 Usage Rules:
 - You MUST complete EVERY task in the plan, one at a time, in order.
+- ALWAYS take `task_id` from the `next_task` field of the server's MOST RECENT response. `next_task` is the only place the server publishes a task_id. Never reuse a task_id from an earlier response and never count tasks yourself - earlier responses named tasks that are already finished.
+- The response carries `progress` ("2/5 done") but NOT the task list. If you have lost track of the plan, call `get_current_plan` - that is what it is for. Do not guess.
 - Send `status = "IN_PROGRESS"` for the FIRST task only. Then do the real work, then send `status = "DONE"`.
 - The server then starts the NEXT task itself and names it in `next_task`. Do that work and send `status = "DONE"` for it too. DO NOT send IN_PROGRESS again - one call per task from here on. A 5-task plan is 1 IN_PROGRESS call and 5 DONE calls.
 - `result_log` is MANDATORY for DONE and must state the CONCRETE outcome: what you produced, found, or saved.
 - These are REJECTED as evidence: "done", "ok", "완료", or repeating the task title. If you cannot write a real outcome, the task is NOT done.
 - The server REFUSES a false DONE: TASK_NOT_STARTED (that task is not the one in progress), TASK_OUT_OF_ORDER (an earlier task is unfinished), MISSING_RESULT_LOG (no evidence), REWORK_NOT_DONE (you re-sent the very outcome the user rejected). Fix the cause and retry that task.
 - NEVER mark tasks DONE in a batch. NEVER tell the user the work is finished while `next_action_hint` still reports remaining tasks.
-- REWORK: a task that comes back with `revision_note` was rejected by the user AFTER you finished it. Its `previous_result_log` is what you produced last time - it was not good enough. Do the work AGAIN so that it answers what the user said, and write a `result_log` describing the NEW outcome. Do not resend the old one. Tasks still marked DONE were accepted: do not redo, rewrite or re-report them.
+- REWORK: a task that comes back with `revision_note` in `next_task` was rejected by the user AFTER you finished it. Its `previous_result_log` is what you produced last time - it was not good enough. Do the work AGAIN so that it answers what the user said, and write a `result_log` describing the NEW outcome. Do not resend the old one. Tasks still marked DONE were accepted: do not redo, rewrite or re-report them.
 </tool_protocol>
 <strict_constraints>
 - SYNTAX: Use pure JSON format with standard double quotes (") for tool calls.
@@ -137,6 +139,7 @@ Usage Rules:
 - LANGUAGE: Think step-by-step strictly in English. Output the final result in Korean.
 </strict_constraints>
 </system_directive>
+
 ```
 
 ---
