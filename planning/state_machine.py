@@ -44,7 +44,7 @@ def _error_action(plan: Plan | None, code: ErrorCode) -> tuple[str, str]:
         )
     if code is ErrorCode.PLAN_BLOCKED:
         failed = plan.first_failed_task() if plan else None
-        which = f"Task {failed.task_id} ('{failed.title}') failed. " if failed else ""
+        which = f"The task '{failed.title}' failed. " if failed else ""
         return (
             NextAction.CALL_PLAN_AND_THINK.value,
             f"{which}You may NOT continue to another task. Call plan_and_think to re-plan "
@@ -62,12 +62,11 @@ def _error_action(plan: Plan | None, code: ErrorCode) -> tuple[str, str]:
             "There is no active plan. Start one by calling plan_and_think with step_number=1.",
         )
     if code is ErrorCode.TASK_NOT_FOUND:
-        valid = ", ".join(str(t.task_id) for t in plan.tasks) if plan and plan.tasks else "none"
-        nxt = plan.current_task() if plan else None
-        target = f" The task to work on now is task_id={nxt.task_id}." if nxt else ""
         return (
             NextAction.CALL_UPDATE_TASK_PROGRESS.value,
-            f"That task_id does not exist. Valid task_id values are: {valid}.{target}",
+            "That task_id does not exist in this plan. Do not guess task numbers. The "
+            "next_task field of this response holds the only task_id you may send now - "
+            "call update_task_progress with exactly that value.",
         )
     if code is ErrorCode.MISSING_TASK_LIST:
         return (
@@ -117,21 +116,22 @@ def _error_action(plan: Plan | None, code: ErrorCode) -> tuple[str, str]:
             "step_number=1.",
         )
     if code is ErrorCode.TASK_NOT_STARTED:
-        task = plan.current_task() if plan else None
-        which = f"task_id={task.task_id}" if task else "that task"
         return (
             NextAction.CALL_UPDATE_TASK_PROGRESS.value,
             "You cannot mark a task DONE that you never started. Call "
-            f"update_task_progress with {which} and status='IN_PROGRESS' first, then "
-            "actually do the work, and only then report DONE.",
+            "update_task_progress with the task_id from next_task below and "
+            "status='IN_PROGRESS' first, then actually do the work, and only then "
+            "report DONE.",
         )
     if code is ErrorCode.TASK_OUT_OF_ORDER:
         task = plan.current_task() if plan else None
-        which = f"task_id={task.task_id} ('{task.title}')" if task else "the earliest one"
+        which = f" It is '{task.title}'." if task else ""
         return (
             NextAction.CALL_UPDATE_TASK_PROGRESS.value,
             "An earlier task is still unfinished, so this one cannot be complete. Work "
-            f"through the tasks in order: start {which} with status='IN_PROGRESS'.",
+            "through the tasks in order: next_task below names the one to start now."
+            f"{which} Call update_task_progress with its task_id and "
+            "status='IN_PROGRESS'.",
         )
     if code is ErrorCode.MISSING_RESULT_LOG:
         return (
@@ -144,15 +144,14 @@ def _error_action(plan: Plan | None, code: ErrorCode) -> tuple[str, str]:
     if code is ErrorCode.REWORK_NOT_DONE:
         task = plan.current_task() if plan else None
         asked = f' They said: "{task.revision_note}".' if task and task.revision_note else ""
-        which = f"task_id={task.task_id}" if task else "that task"
         return (
             NextAction.CALL_UPDATE_TASK_PROGRESS.value,
             "You reported the same result_log this task already had - the one the user "
             f"rejected.{asked} Redoing the work means the outcome CHANGES. Do the work "
-            f"again so it answers what they said, then call update_task_progress with "
-            f"{which}, status='DONE' and a result_log describing the NEW outcome. If you "
-            "believe the original was already correct, say so to the user instead of "
-            "reporting it as redone.",
+            "again so it answers what they said, then call update_task_progress with the "
+            "task_id from next_task below, status='DONE' and a result_log describing the "
+            "NEW outcome. If you believe the original was already correct, say so to the "
+            "user instead of reporting it as redone.",
         )
     if code is ErrorCode.COMPLETION_PENDING:
         return (
@@ -276,51 +275,53 @@ def _status_action(plan: Plan | None) -> tuple[str, str]:
         # Spelling out the outstanding work in every single response is the counter to a
         # model that quietly stops after one or two tasks and declares the plan finished.
         left = plan.remaining_tasks()
+        # The count stays; the id list does not. Naming the outstanding ids here put a
+        # second set of task numbers in the same sentence as the instruction, which is
+        # the ambiguity next_task exists to remove. The pressure this line applies -
+        # "you are not finished" - is carried entirely by the count.
         outstanding = (
-            f" {len(left)} of {len(plan.tasks)} tasks are still unfinished "
-            f"({', '.join(str(t.task_id) for t in left)}). Do NOT tell the user the work "
-            "is finished until every task is DONE."
+            f" {len(left)} of {len(plan.tasks)} tasks are still unfinished. Do NOT tell "
+            "the user the work is finished until every task is DONE."
         )
         # A task the human reopened from the completion report. The plan is not what is
         # wrong, so the generic "next task" hint would send a weak model off to re-plan
         # or to redo everything; what it needs is the sentence the human actually wrote,
         # and an explicit instruction to leave the accepted work alone.
         if task.revision_note:
-            kept = [t.task_id for t in plan.tasks if t.status == TaskStatus.DONE.value]
             keep = (
-                " Task(s) " + ", ".join(str(k) for k in kept) + " were accepted by the "
-                "user and keep the results you already produced - do NOT redo, rewrite "
-                "or re-report them."
-                if kept
+                " The other tasks were accepted by the user and keep the results you "
+                "already produced - do NOT redo, rewrite or re-report them."
+                if any(t.status == TaskStatus.DONE.value for t in plan.tasks)
                 else ""
             )
             step = (
-                f"It is already IN_PROGRESS: do the work now and call "
-                f"update_task_progress with task_id={task.task_id}, status='DONE' and a "
-                "result_log describing the NEW outcome."
+                "It is already IN_PROGRESS: do the work now and call "
+                "update_task_progress with the task_id from next_task below, "
+                "status='DONE' and a result_log describing the NEW outcome."
                 if task.status == TaskStatus.IN_PROGRESS.value
-                else f"Call update_task_progress with task_id={task.task_id} and "
-                "status='IN_PROGRESS'."
+                else "Call update_task_progress with the task_id from next_task below "
+                "and status='IN_PROGRESS'."
             )
             return (
                 NextAction.CALL_UPDATE_TASK_PROGRESS.value,
-                f"The user reviewed the finished work and sent task {task.task_id} "
-                f"('{task.title}') back to be done AGAIN: \"{task.revision_note}\". "
-                f"Do not re-plan and do not ask for approval - the plan is unchanged and "
-                f"still approved. Redo ONLY this task so that it answers what they said. "
-                f"{step}{keep}{outstanding}",
+                f"The user reviewed the finished work and sent one task back to be done "
+                f"AGAIN: \"{task.revision_note}\". That task is '{task.title}', named in "
+                f"next_task below. Do not re-plan and do not ask for approval - the plan "
+                f"is unchanged and still approved. Redo ONLY that task so that it answers "
+                f"what they said. {step}{keep}{outstanding}",
             )
         if task.status == TaskStatus.IN_PROGRESS.value:
             return (
                 NextAction.CALL_UPDATE_TASK_PROGRESS.value,
-                f"Task {task.task_id} ('{task.title}') is in progress. When it is finished, call "
-                f"update_task_progress with task_id={task.task_id}, status='DONE' and a "
-                "result_log describing what you actually did." + outstanding,
+                f"The task in next_task below ('{task.title}') is in progress. When it is "
+                "finished, call update_task_progress with its task_id, status='DONE' and "
+                "a result_log describing what you actually did." + outstanding,
             )
         return (
             NextAction.CALL_UPDATE_TASK_PROGRESS.value,
-            f"Next task is task_id={task.task_id} '{task.title}'. Call update_task_progress "
-            f"with task_id={task.task_id} and status='IN_PROGRESS'." + outstanding,
+            f"Next task is '{task.title}' - next_task below holds its task_id. Call "
+            "update_task_progress with that task_id and status='IN_PROGRESS'."
+            + outstanding,
         )
 
     if status is PlanStatus.AWAITING_COMPLETION:

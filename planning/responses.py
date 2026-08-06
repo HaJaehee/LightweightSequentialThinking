@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .models import ErrorCode, Plan, PlanStatus
+from .models import ErrorCode, NextAction, Plan, PlanStatus
 from .state_machine import resolve_next_action
 
 
@@ -36,6 +36,19 @@ def build(
     if message:
         payload["message"] = message
     payload.update({k: v for k, v in extra.items() if v is not None})
+    # Every hint that used to say "call with task_id=3" now says "use the task_id in
+    # next_task". That is only safe if the field is guaranteed to be there whenever the
+    # instruction points at it - a dangling reference is worse than the literal was. So
+    # the referent is attached here, in the one place every response passes through,
+    # rather than trusted to each of the fifteen call sites.
+    if (
+        action == NextAction.CALL_UPDATE_TASK_PROGRESS.value
+        and plan is not None
+        and "next_task" not in payload
+    ):
+        nxt = plan.next_task_brief()
+        if nxt is not None:
+            payload["next_task"] = nxt
     if notes:
         # Surfaced so the model can learn the correct shape, but never as an error.
         payload["input_notes"] = notes

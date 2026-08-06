@@ -438,6 +438,34 @@ class Plan:
     def tasks_brief(self) -> list[dict[str, Any]]:
         return [t.brief() for t in self.tasks]
 
+    def next_task_brief(self) -> dict[str, Any] | None:
+        """The one task the model may act on now - the ONLY place an id is published.
+
+        Execution responses used to carry the whole task list, so every turn left a
+        fresh copy of it in the conversation and every hint spelled out a literal
+        `task_id=N`. After five tasks the history held five such sentences, four of
+        them naming the wrong task, and they read as instructions rather than as data.
+        Publishing exactly one id, in one field, means a stale copy can only ever be
+        stale data - there is nothing in it to execute.
+
+        The rework fields ride along because the guard that refuses a resubmitted
+        outcome (D19) is only fair if the model can see what it produced last time.
+        They are the one part of the old echo that carries its weight here.
+        """
+        task = self.current_task()
+        if task is None:
+            return None
+        out: dict[str, Any] = {
+            "task_id": task.task_id,
+            "title": task.title,
+            "status": task.status,
+        }
+        if task.revision_note:
+            out["revision_note"] = task.revision_note
+        if task.previous_result_log:
+            out["previous_result_log"] = task.previous_result_log
+        return out
+
     # ---- targeted revision ---------------------------------------------
     def revision_targets(self) -> dict[int, str]:
         """{task_id: the human's comment} for a pending targeted revision, else {}.

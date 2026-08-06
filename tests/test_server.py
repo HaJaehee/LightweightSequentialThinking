@@ -310,7 +310,10 @@ class TestGuardRails(HandlerTestCase):
         res = self.h.dispatch("update_task_progress", {"task_id": 99, "status": "IN_PROGRESS"})
         self.assertFalse(res["ok"])
         self.assertEqual(res["error_code"], "TASK_NOT_FOUND")
-        self.assertIn("1", res["next_action_hint"])
+        # The hint no longer spells an id out; it points at the one field that carries
+        # one, so the recovery route has to actually be there.
+        self.assertIn("next_task", res["next_action_hint"])
+        self.assertEqual(res["next_task"]["task_id"], 1)
 
     def test_get_current_plan_with_no_plan(self):
         res = self.h.dispatch("get_current_plan", {"plan_id": "current"})
@@ -436,7 +439,8 @@ class TestStateMachine(HandlerTestCase):
         )
         self.assertEqual(res["plan_status"], "BLOCKED")
         self.assertEqual(res["next_action"], "CALL_PLAN_AND_THINK")
-        self.assertEqual(res["failed_task"]["task_id"], 2)
+        self.assertEqual(res["failed_task"]["title"], "b")
+        self.assertEqual(res["failed_task"]["result_log"], "file not found")
 
         res = self.h.dispatch("update_task_progress", {"task_id": 3, "status": "IN_PROGRESS"})
         self.assertFalse(res["ok"])
@@ -560,7 +564,7 @@ class TestStateMachine(HandlerTestCase):
                               {"task_id": 1, "status": "IN_PROGRESS", "plan_id": b["plan_id"]})
         self.assertTrue(res["ok"])
         self.assertEqual(res["plan_id"], b["plan_id"])
-        self.assertEqual(res["tasks"][0]["title"], "b작업")
+        self.assertEqual(res["next_task"]["title"], "b작업")
         # A is untouched.
         a_now = self.h.dispatch("get_current_plan", {"plan_id": a["plan_id"]})
         self.assertEqual(a_now["tasks"][0]["status"], "PENDING")
@@ -1014,7 +1018,7 @@ class TestPersistence(HandlerTestCase):
         fresh = PlanningHandlers(Store(self.state_dir), self.config)
         res = fresh.dispatch("get_current_plan", {"plan_id": "current"})
         self.assertEqual(res["progress"], "1/2 done")
-        self.assertEqual(res["next_task"] if "next_task" in res else res["tasks"][1]["task_id"], 2)
+        self.assertEqual(res["next_task"]["task_id"], 2)
 
     def test_corrupt_state_file_is_quarantined(self):
         self.think()
@@ -1043,10 +1047,14 @@ class TestPersistence(HandlerTestCase):
         evidence = "민원 접수 화면을 만들었습니다. " * 40  # ~800 chars
         self.approve_flow(["a"])
         self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
-        res = self.h.dispatch(
+        self.h.dispatch(
             "update_task_progress",
             {"task_id": 1, "status": "DONE", "result_log": evidence},
         )
+        # update_task_progress stopped echoing the task list, so the surface that still
+        # publishes evidence to the model is the recovery tool. The rule is unchanged:
+        # wherever evidence is published it is published whole.
+        res = self.h.dispatch("get_current_plan", {"plan_id": "current"})
         self.assertEqual(res["tasks"][0]["result_log"], evidence.strip())
         self.assertNotIn("...", res["tasks"][0]["result_log"])
 
@@ -2999,16 +3007,19 @@ class TestCompletionRework(TargetedRevisionFixture):
         _, res = self.sent_back({"2": "표가 3개 빠졌어요"})
         hint = res["next_action_hint"]
         self.assertIn("표가 3개 빠졌어요", hint)
-        self.assertIn("task_id=2", hint)
-        self.assertIn("Redo ONLY this task", hint)
+        self.assertIn("Redo ONLY that task", hint)
+        # Which task it is now travels in the field, not in the sentence - so the
+        # sentence must not name one and the field must.
+        self.assertNotIn("task_id=2", hint)
+        self.assertEqual(res["next_task"]["task_id"], 2)
+        self.assertEqual(res["next_task"]["revision_note"], "표가 3개 빠졌어요")
 
     def test_the_hint_forbids_re_planning_and_protects_accepted_work(self):
         _, res = self.sent_back({"2": "표가 3개 빠졌어요"})
         hint = res["next_action_hint"]
         self.assertIn("Do not re-plan", hint)
         self.assertIn("do NOT redo", hint)
-        for kept in ("1", "3"):
-            self.assertIn(kept, hint.split("were accepted")[0])
+        self.assertIn("The other tasks were accepted", hint)
 
     def test_the_request_survives_into_the_in_progress_hint(self):
         h, _ = self.sent_back({"2": "표가 3개 빠졌어요"})
@@ -3034,8 +3045,8 @@ class TestCompletionRework(TargetedRevisionFixture):
             {"2": "표가 빠졌어요", "5": "요약이 너무 짧아요"}, tasks=self.FIVE
         )
 
-    def statuses(self, res):
-        return {t["task_id"]: t["status"] for t in res["tasks"]}
+    def statuses(self, h):
+        return {t.task_id: t.status for t in self.plan(h).tasks}
 
     def finish(self, h, task_id, log, start=True):
         if start:
@@ -3054,7 +3065,7 @@ class TestCompletionRework(TargetedRevisionFixture):
         res = self.finish(h, 2, "표 3개를 모두 넣어 out2.txt 재저장")
         self.assertEqual(res["next_task"]["task_id"], 5)
         self.assertEqual(
-            self.statuses(res),
+            self.statuses(h),
             {1: "DONE", 2: "DONE", 3: "DONE", 4: "DONE", 5: "IN_PROGRESS"},
         )
 
@@ -4031,6 +4042,154 @@ class TestUnmatchedTaskUpdates(TargetedRevisionFixture):
         self.assertFalse(res["ok"])
         self.assertEqual(res["error_code"], "MISSING_TASK_LIST")
         self.assertEqual([t.title for t in self.plan(h).tasks], self.TASKS)
+
+
+class TestLeanExecutionResponse(HandlerTestCase):
+    """update_task_progress publishes one task id, in one field, and no task list.
+
+    The old shape re-sent the whole plan on every execution call, so a five-task run
+    left six copies of the task list in the conversation - five of them describing a
+    state that no longer existed. Worse, each carried a sentence of the form "call
+    update_task_progress with task_id=N", which is an instruction, not data: a model
+    reading back through its own history found four wrong ones and one right one, with
+    nothing to distinguish them.
+    """
+
+    TASKS = ["Find the file", "Read it", "Write the summary"]
+
+    def execution_responses(self):
+        """Every response the model gets while executing a plan end to end."""
+        self.approve_flow(self.TASKS)
+        out = []
+        for task_id in range(1, len(self.TASKS) + 1):
+            out.append(self.h.dispatch(
+                "update_task_progress", {"task_id": task_id, "status": "IN_PROGRESS"}))
+            out.append(self.h.dispatch("update_task_progress", {
+                "task_id": task_id, "status": "DONE",
+                "result_log": f"saved output of task {task_id} to /tmp/out{task_id}.txt"}))
+        return out
+
+    def test_no_execution_response_carries_the_task_list(self):
+        for res in self.execution_responses():
+            self.assertNotIn("tasks", res)
+
+    def test_progress_replaces_it(self):
+        """The count is what the list was actually being read for."""
+        self.approve_flow(self.TASKS)
+        res = self.do_task(1)
+        self.assertEqual(res["progress"], "1/3 done")
+        self.assertIn("2 of 3 tasks are still unfinished", res["next_action_hint"])
+
+    def test_next_task_is_the_only_id_anywhere_in_the_response(self):
+        """The guarantee that makes a stale copy inert: nothing else names a task."""
+        for res in self.execution_responses():
+            published = dict(res)
+            published.pop("next_task", None)
+            blob = json.dumps(published, ensure_ascii=False)
+            for task_id in range(1, len(self.TASKS) + 1):
+                self.assertNotIn(f"task_id={task_id}", blob)
+
+    def test_the_hint_never_dangles(self):
+        """Every hint that says 'use next_task' must ship a next_task to use."""
+        for res in self.execution_responses():
+            if "next_task" in res["next_action_hint"]:
+                self.assertIn("next_task", res, res["next_action_hint"])
+
+    def test_next_task_is_present_whenever_the_next_action_is_an_update(self):
+        for res in self.execution_responses():
+            if res["next_action"] == "CALL_UPDATE_TASK_PROGRESS":
+                self.assertIn("next_task", res)
+                self.assertIn("task_id", res["next_task"])
+
+    def test_next_task_names_the_task_the_server_will_actually_accept(self):
+        """A model that copies next_task.task_id must never be refused for it."""
+        self.approve_flow(self.TASKS)
+        res = self.h.dispatch(
+            "update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        for _ in range(len(self.TASKS)):
+            task_id = res["next_task"]["task_id"]
+            res = self.h.dispatch("update_task_progress", {
+                "task_id": task_id, "status": "DONE",
+                "result_log": f"produced output {task_id} and stored it at /tmp/o{task_id}"})
+            self.assertTrue(res["ok"], res.get("message"))
+        self.assertEqual(res["plan_status"], "AWAITING_COMPLETION")
+
+    def test_the_recovery_tool_still_returns_the_whole_plan(self):
+        """Dropping the echo is only safe because resync stayed one call away."""
+        self.approve_flow(self.TASKS)
+        self.do_task(1)
+        res = self.h.dispatch("get_current_plan", {"plan_id": "current"})
+        self.assertEqual(len(res["tasks"]), 3)
+        self.assertEqual(res["next_task"]["task_id"], 2)
+
+    def test_a_refusal_also_stays_lean_and_still_points_somewhere(self):
+        self.approve_flow(self.TASKS)
+        self.h.dispatch("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
+        res = self.h.dispatch(
+            "update_task_progress", {"task_id": 1, "status": "DONE", "result_log": "ok"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "MISSING_RESULT_LOG")
+        self.assertNotIn("tasks", res)
+        self.assertEqual(res["next_task"]["task_id"], 1)
+
+    def test_it_is_materially_smaller(self):
+        """The reason for the change, asserted rather than assumed."""
+        self.approve_flow(self.TASKS)
+        res = self.do_task(1, log="찾은 파일을 /tmp/out1.txt 에 저장했습니다. " * 8)
+        # Measured on the wire: protocol.py serializes with indent=2 and sends that.
+        lean = len(json.dumps(res, ensure_ascii=False, indent=2).encode())
+        fat = len(json.dumps(
+            {**res, "tasks": self.store.load().active_plan.tasks_brief()},
+            ensure_ascii=False, indent=2).encode())
+        # The echoed list was the majority of the payload, and it grew with every task
+        # while this half stayed flat.
+        self.assertLess(lean * 100, fat * 55)
+
+
+class TestLeanResponseKeepsTheReworkGuard(TargetedRevisionFixture):
+    """D19 depends on the model seeing what it produced last time.
+
+    That evidence used to arrive inside the echoed task list. With the list gone it
+    rides in next_task instead - the one part of the old echo that earns its place,
+    because a model asked to redo work without it will resubmit the rejected outcome
+    and be refused for a reason it cannot see.
+    """
+
+    def sent_back_one(self):
+        """Run a plan to the completion report, then have the human reopen task 2."""
+        ui = FakeApprovalUI("APPROVED")
+        h, _ = self.reported(ui)
+        ui.decision, ui.comment = "REVISE", ""
+        ui.scope, ui.task_comments = "TASKS", {"2": "표가 3개 빠졌어요"}
+        res = h.dispatch(
+            "request_user_approval", {"decision": "ASK_USER", "plan_summary": "완료 보고"}
+        )
+        return h, res
+
+    def test_next_task_carries_the_users_request(self):
+        _, res = self.sent_back_one()
+        self.assertEqual(res["next_task"]["revision_note"], "표가 3개 빠졌어요")
+
+    def test_next_task_carries_what_was_produced_before(self):
+        _, res = self.sent_back_one()
+        self.assertIn("/tmp/out2.txt", res["next_task"]["previous_result_log"])
+
+    def test_it_survives_into_the_next_execution_response(self):
+        """The model reads the freshest response, not the one three turns back."""
+        h, _ = self.sent_back_one()
+        res = h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
+        self.assertEqual(res["next_task"]["revision_note"], "표가 3개 빠졌어요")
+        self.assertIn("/tmp/out2.txt", res["next_task"]["previous_result_log"])
+
+    def test_resubmitting_the_old_outcome_is_still_refused(self):
+        h, _ = self.sent_back_one()
+        h.dispatch("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
+        old = self.plan(h).get_task(2).previous_result_log
+        res = h.dispatch("update_task_progress", {
+            "task_id": 2, "status": "DONE", "result_log": old})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "REWORK_NOT_DONE")
+        self.assertEqual(res["next_task"]["task_id"], 2)
 
 
 if __name__ == "__main__":

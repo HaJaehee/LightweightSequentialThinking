@@ -617,7 +617,7 @@ class PlanningHandlers:
                 qualify=len(state.active_plans()) > 1,
                 tasks=plan.tasks_brief(),
                 progress=plan.progress(),
-                next_task={"task_id": task.task_id, "title": task.title} if task else None,
+                next_task=plan.next_task_brief(),
             )
 
         if plan is None and len(state.active_plans()) >= self.config.max_active_plans:
@@ -1100,7 +1100,7 @@ class PlanningHandlers:
                 message="This plan was already approved by the user. Continue executing it.",
                 notes=notes,
                 tasks=plan.tasks_brief(),
-                next_task={"task_id": task.task_id, "title": task.title} if task else None,
+                next_task=plan.next_task_brief(),
             )
         if plan.status is PlanStatus.CANCELLED:
             return error(plan, ErrorCode.PLAN_CANCELLED, "This plan was cancelled.", notes=notes)
@@ -1434,7 +1434,7 @@ class PlanningHandlers:
                 message="Already approved. Continue executing.",
                 notes=notes,
                 tasks=plan.tasks_brief(),
-                next_task={"task_id": task.task_id, "title": task.title} if task else None,
+                next_task=plan.next_task_brief(),
             )
         completion_phase = plan.status is PlanStatus.AWAITING_COMPLETION
         if plan.status is not PlanStatus.AWAITING_APPROVAL and not completion_phase:
@@ -1493,7 +1493,7 @@ class PlanningHandlers:
             qualify=len(state.active_plans()) > 1,
             tasks=plan.tasks_brief(),
             progress=plan.progress(),
-            next_task={"task_id": task.task_id, "title": task.title} if task else None,
+            next_task=plan.next_task_brief(),
         )
 
     def _revise(
@@ -1609,7 +1609,7 @@ class PlanningHandlers:
             tasks_unchanged=kept or None,
             tasks=plan.tasks_brief(),
             progress=plan.progress(),
-            next_task={"task_id": task.task_id, "title": task.title} if task else None,
+            next_task=plan.next_task_brief(),
         )
 
     def _reject(
@@ -1641,7 +1641,6 @@ class PlanningHandlers:
                 ErrorCode.APPROVAL_EXPIRED,
                 "The approval for this plan expired while it sat idle.",
                 notes=notes,
-                tasks=plan.tasks_brief(),
             )
 
         guard = execution_guard(plan, autoapprove=self.config.autoapprove)
@@ -1668,7 +1667,6 @@ class PlanningHandlers:
                 ErrorCode.INVALID_STATUS,
                 f"'{raw_status}' is not a valid task status.",
                 notes=notes,
-                tasks=plan.tasks_brief(),
             )
 
         task_id = args.get("task_id")
@@ -1679,7 +1677,6 @@ class PlanningHandlers:
                 ErrorCode.TASK_NOT_FOUND,
                 f"No task with task_id={task_id} in this plan.",
                 notes=notes,
-                tasks=plan.tasks_brief(),
             )
 
         if status is TaskStatus.IN_PROGRESS:
@@ -1694,14 +1691,11 @@ class PlanningHandlers:
         self, state: State, plan: Plan, task: Task, notes: list[str]
     ) -> dict[str, Any]:
         if task.status == TaskStatus.DONE.value:
-            nxt = plan.current_task()
             return build(
                 plan,
-                message=f"Task {task.task_id} is already DONE.",
+                message="That task is already DONE. next_task names the one to work on now.",
                 notes=notes,
-                tasks=plan.tasks_brief(),
                 progress=plan.progress(),
-                next_task={"task_id": nxt.task_id, "title": nxt.title} if nxt else None,
             )
         if task.status == TaskStatus.IN_PROGRESS.value:
             # Already running - usually because the server started it (auto-advance) and
@@ -1709,35 +1703,27 @@ class PlanningHandlers:
             # backdate nothing useful and lose the real start time.
             return build(
                 plan,
-                task_id=task.task_id,
-                task_status=task.status,
                 progress=plan.progress(),
-                tasks=plan.tasks_brief(),
                 notes=notes,
                 qualify=len(state.active_plans()) > 1,
                 message=(
-                    f"Task {task.task_id} was already IN_PROGRESS. Do the work now, then "
-                    "report it DONE with a result_log."
+                    "That task was already IN_PROGRESS. Do the work now, then report it "
+                    "DONE with a result_log."
                 ),
             )
         if not can_start_task(plan, task.task_id):
             # Redirect rather than reject: rejecting strands the model.
-            correct = plan.current_task()
             self.store.audit(
                 "out_of_order_start", plan_id=plan.plan_id, attempted=task.task_id
             )
             return build(
                 plan,
                 message=(
-                    f"Task {task.task_id} cannot start yet because earlier tasks are not "
-                    "finished."
+                    "That task cannot start yet because earlier tasks are not finished. "
+                    "Start the one in next_task instead."
                 ),
                 notes=notes,
-                tasks=plan.tasks_brief(),
                 progress=plan.progress(),
-                next_task={"task_id": correct.task_id, "title": correct.title}
-                if correct
-                else None,
             )
 
         task.status = TaskStatus.IN_PROGRESS.value
@@ -1747,13 +1733,10 @@ class PlanningHandlers:
         self.store.audit("task_started", plan_id=plan.plan_id, task_id=task.task_id)
         return build(
             plan,
-            task_id=task.task_id,
-            task_status=task.status,
             progress=plan.progress(),
-            tasks=plan.tasks_brief(),
             notes=notes,
             qualify=len(state.active_plans()) > 1,
-            message=f"Task {task.task_id} marked IN_PROGRESS. Do the work now.",
+            message="Marked IN_PROGRESS - it is the task in next_task. Do the work now.",
         )
 
     def _finish_task(
@@ -1765,15 +1748,12 @@ class PlanningHandlers:
         # evidence-free. Starting the wrong task is still forgiven (a redirect); saying
         # the wrong task is finished is not.
         if task.status == TaskStatus.DONE.value:
-            nxt = plan.current_task()
             return build(
                 plan,
-                message=f"Task {task.task_id} is already DONE.",
+                message="That task is already DONE. next_task names the one to work on now.",
                 notes=notes,
                 qualify=len(state.active_plans()) > 1,
-                tasks=plan.tasks_brief(),
                 progress=plan.progress(),
-                next_task={"task_id": nxt.task_id, "title": nxt.title} if nxt else None,
             )
 
         if task.status != TaskStatus.IN_PROGRESS.value:
@@ -1784,10 +1764,9 @@ class PlanningHandlers:
             return error(
                 plan,
                 ErrorCode.TASK_NOT_STARTED,
-                f"Task {task.task_id} was never marked IN_PROGRESS.",
+                "That task was never marked IN_PROGRESS.",
                 notes=notes,
                 qualify=len(state.active_plans()) > 1,
-                tasks=plan.tasks_brief(),
                 progress=plan.progress(),
             )
 
@@ -1800,10 +1779,9 @@ class PlanningHandlers:
             return error(
                 plan,
                 ErrorCode.TASK_OUT_OF_ORDER,
-                f"Tasks {[t.task_id for t in earlier]} are not finished yet.",
+                f"{len(earlier)} earlier task(s) are not finished yet.",
                 notes=notes,
                 qualify=len(state.active_plans()) > 1,
-                tasks=plan.tasks_brief(),
                 progress=plan.progress(),
             )
 
@@ -1821,11 +1799,10 @@ class PlanningHandlers:
                 return error(
                     plan,
                     ErrorCode.REWORK_NOT_DONE,
-                    f"DONE refused: this is the same result_log task {task.task_id} "
-                    "already had, and the user rejected that outcome.",
+                    "DONE refused: this is the same result_log that task already had, "
+                    "and the user rejected that outcome.",
                     notes=notes,
                     qualify=len(state.active_plans()) > 1,
-                    tasks=plan.tasks_brief(),
                     progress=plan.progress(),
                 )
         reason = missing_evidence_reason(evidence, task.title, self.config.min_result_log)
@@ -1840,7 +1817,6 @@ class PlanningHandlers:
                 f"DONE refused: {reason}.",
                 notes=notes,
                 qualify=len(state.active_plans()) > 1,
-                tasks=plan.tasks_brief(),
                 progress=plan.progress(),
             )
 
@@ -1875,18 +1851,18 @@ class PlanningHandlers:
         nxt = plan.current_task()
         if advanced is not None:
             message = (
-                f"Task {task.task_id} is DONE. Task {advanced.task_id} "
-                f"('{advanced.title}') has been started for you - do that work NOW, then "
-                "report it DONE with its own result_log. Do not send IN_PROGRESS again."
+                f"That task is DONE. The next one ('{advanced.title}') has been started "
+                "for you and is in next_task - do that work NOW, then report it DONE "
+                "with its own result_log. Do not send IN_PROGRESS again."
                 + self._rework_suffix(advanced)
             )
         elif nxt is not None:
             # Nothing was auto-started (auto_advance off, or the next task is not
             # startable yet) but work remains - never let this read as "finished".
             message = (
-                f"Task {task.task_id} is DONE. The plan is NOT finished: next is "
-                f"task_id={nxt.task_id} ('{nxt.title}'). Call update_task_progress with "
-                f"task_id={nxt.task_id} and status='IN_PROGRESS'."
+                f"That task is DONE. The plan is NOT finished: next is '{nxt.title}', "
+                "in next_task. Call update_task_progress with its task_id and "
+                "status='IN_PROGRESS'."
                 + self._rework_suffix(nxt)
             )
         elif plan.status is PlanStatus.AWAITING_COMPLETION:
@@ -1894,26 +1870,22 @@ class PlanningHandlers:
             # A silent message here left the model guessing at the last, most
             # error-prone step.
             message = (
-                f"Task {task.task_id} is DONE and every task in this plan is finished. "
+                "That task is DONE and every task in this plan is finished. "
                 "Report completion NOW: call request_user_approval with "
                 "decision='ASK_USER' and a plan_summary that states, task by task, what "
                 "you actually produced. Do not declare success yourself."
             )
         else:
             message = (
-                f"Task {task.task_id} is DONE and every task in this plan is finished. "
+                "That task is DONE and every task in this plan is finished. "
                 "Report completion NOW: write the final answer to the user, summarizing "
                 "the result_log of each task."
             )
         return build(
             plan,
-            task_id=task.task_id,
-            task_status=task.status,
             progress=plan.progress(),
-            tasks=plan.tasks_brief(),
             notes=notes,
             qualify=len(state.active_plans()) > 1,
-            next_task={"task_id": nxt.task_id, "title": nxt.title} if nxt else None,
             message=message,
         )
 
@@ -1929,8 +1901,8 @@ class PlanningHandlers:
         if task is None or not task.revision_note:
             return ""
         return (
-            f' The user sent task {task.task_id} back to be done again: '
-            f'"{task.revision_note}". Answer that, do not repeat what you did before.'
+            f' The user sent that task back to be done again: "{task.revision_note}". '
+            "Answer that, do not repeat what you did before."
         )
 
     def _auto_advance(self, plan: Plan) -> Task | None:
@@ -1971,17 +1943,10 @@ class PlanningHandlers:
         )
         return build(
             plan,
-            task_id=task.task_id,
-            task_status=task.status,
             progress=plan.progress(),
-            tasks=plan.tasks_brief(),
             notes=notes,
-            failed_task={
-                "task_id": task.task_id,
-                "title": task.title,
-                "result_log": task.result_log,
-            },
-            message=f"Task {task.task_id} failed. Forward progress is halted.",
+            failed_task={"title": task.title, "result_log": task.result_log},
+            message=f"The task '{task.title}' failed. Forward progress is halted.",
         )
 
     def _reset_task(
@@ -1996,12 +1961,9 @@ class PlanningHandlers:
         self.store.audit("task_reset", plan_id=plan.plan_id, task_id=task.task_id)
         return build(
             plan,
-            task_id=task.task_id,
-            task_status=task.status,
             progress=plan.progress(),
-            tasks=plan.tasks_brief(),
             notes=notes,
-            message=f"Task {task.task_id} reset to PENDING.",
+            message=f"The task '{task.title}' was reset to PENDING.",
         )
 
     # ------------------------------------------------------------------

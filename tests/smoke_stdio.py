@@ -134,8 +134,12 @@ def main() -> int:
             c.call("update_task_progress", {"task_id": 1, "status": "IN_PROGRESS"})
             r = c.call("update_task_progress", {"task_id": 1, "status": "완료",
                                                 "result_log": "q3.xlsx 를 찾음"})
-            check("Korean status alias works", r["task_status"] == "DONE", r["task_status"])
-            check("progress tracked", r["progress"] == "1/3 done", r["progress"])
+            # The response no longer echoes the task it just changed; progress and the
+            # handover to the next task are what say the DONE landed.
+            check("Korean status alias works", r["ok"] and r["progress"] == "1/3 done",
+                  str(r.get("error_code") or r["progress"]))
+            check("hands over to task 2", r["next_task"]["task_id"] == 2,
+                  str(r.get("next_task")))
 
             c.call("update_task_progress", {"task_id": 2, "status": "IN_PROGRESS"})
             r = c.call("update_task_progress", {"task_id": 2, "status": "FAILED",

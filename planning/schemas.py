@@ -45,6 +45,11 @@ NEVER guess the user's answer. NEVER call APPROVED unless the user actually said
 UPDATE_TASK_PROGRESS_DESCRIPTION = """STEP 3 - EXECUTION TRACKING.
 Handle exactly ONE task per call.
 
+ALWAYS take task_id from the next_task field of the most recent server response.
+next_task is the ONLY place the server publishes a task_id. Never reuse a task_id
+from an earlier response and never count tasks yourself - earlier responses named
+tasks that are already finished.
+
   1. Start the FIRST task: status = "IN_PROGRESS". Then do the work.
   2. Report it: status = "DONE" + a result_log saying what you actually produced.
   3. The server then starts the NEXT task for you and names it in next_task.
@@ -52,6 +57,8 @@ Handle exactly ONE task per call.
      You do NOT send "IN_PROGRESS" again - just keep reporting DONE, one call per
      task, until the server tells you no tasks remain.
 Use status = "FAILED" instead of "DONE" if the task did not work.
+The response carries progress ("2/5 done") but not the task list. If you have lost
+track of the plan, call get_current_plan - that is what it is for.
 
 DONE IS ENFORCED. The server REFUSES a DONE for a task that:
   - is not the task currently in progress,
@@ -66,6 +73,10 @@ next_action the server gives you back."""
 # Used when PLANNING_MCP_AUTO_ADVANCE=false. The server then starts nothing on its own,
 # so the description must ask for both calls or every DONE is refused.
 UPDATE_TASK_PROGRESS_DESCRIPTION_MANUAL = """STEP 3 - EXECUTION TRACKING.
+ALWAYS take task_id from the next_task field of the most recent server response.
+next_task is the ONLY place the server publishes a task_id. Never reuse one from an
+earlier response.
+
 Call this tool TWICE for every task:
   1. BEFORE you start the task  -> status = "IN_PROGRESS"
   2. AFTER you finish the task  -> status = "DONE"  (or "FAILED" if it did not work)
@@ -247,8 +258,8 @@ UPDATE_TASK_PROGRESS_SCHEMA: dict[str, Any] = {
             "type": "integer",
             "minimum": 1,
             "description": (
-                "The number of the task you are working on, taken from the tasks list the server "
-                "gave you. One task per call. Example: 1"
+                "Copy this from next_task.task_id in the server's most recent response. That "
+                "is the only task you may act on. One task per call. Example: 1"
             ),
         },
         "status": {
