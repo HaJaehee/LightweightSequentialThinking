@@ -1,6 +1,6 @@
 # planning-mcp (LightweightSequentialThinking)
 
-**버전: 1.15.0** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
+**버전: 1.15.1** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
 `SERVER_VERSION` (MCP `initialize` 응답의 `serverInfo.version` 으로 보고됨)
 
 AnythingLLM Agent Mode용 경량 **계획·작업 관리 MCP 서버**. 폐쇄망의 성능이 약한 사내 LLM이
@@ -133,6 +133,13 @@ Usage Rules:
 - NEVER mark tasks DONE in a batch. NEVER tell the user the work is finished while `next_action_hint` still reports remaining tasks.
 - REWORK: a task that comes back with `revision_note` in `next_task` was rejected by the user AFTER you finished it. Its `previous_result_log` is what you produced last time - it was not good enough. Do the work AGAIN so that it answers what the user said, and write a `result_log` describing the NEW outcome. Do not resend the old one. Tasks still marked DONE were accepted: do not redo, rewrite or re-report them.
 </tool_protocol>
+<tool_protocol name="get_current_plan">
+Usage Rules:
+- Call it whenever you are unsure what the plan is or which task you were on. It changes nothing and is always safe.
+- SEND YOUR OWN `plan_id`: every server response carries a `plan_id` field - send that exact value. Other conversations may be running their own plans at the same time, and your `plan_id` is the only thing that identifies yours.
+- Send `"current"` ONLY if you do not know your `plan_id` yet. It is a guess: if several plans are in flight the server cannot tell which is yours and answers with an `active_plans` list instead.
+- If you get that list back, do NOT start a new plan. Call again with your own `plan_id` from the list.
+</tool_protocol>
 <strict_constraints>
 - SYNTAX: Use pure JSON format with standard double quotes (") for tool calls.
 - RESPONSE: Always follow the returned `next_action` field.
@@ -151,7 +158,7 @@ Usage Rules:
 | `plan_and_think` | 필수 진입점. 호출당 사고 1스텝, 마지막 호출에 `task_list` 제출. 태스크별 수정 요청에는 `task_updates`, 사용자가 목표 자체를 정정하면 `revised_goal` |
 | `request_user_approval` | HITL 게이트. `ASK_USER` → 정지 → `APPROVED` / `REJECTED` / `REVISE` |
 | `update_task_progress` | 첫 작업만 `IN_PROGRESS`, 이후는 작업당 `DONE`/`FAILED` 1회 (다음 작업은 서버가 시작). 미승인 시 거부 |
-| `get_current_plan` | 컨텍스트 절단 후 복구. 언제 호출해도 안전 |
+| `get_current_plan` | 컨텍스트 절단 후 복구. 언제 호출해도 안전. 자기 `plan_id`를 보내면 항상 자기 플랜을 받음 |
 
 전체 스키마와 응답 계약: [docs/phase1-tool-schema-blueprint.md](docs/phase1-tool-schema-blueprint.md)
 

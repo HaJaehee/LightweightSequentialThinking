@@ -1969,19 +1969,50 @@ class PlanningHandlers:
         requested = (args.get("plan_id") or "current").strip()
 
         plan = self._resolve_plan(state, requested)
+        # Both "which plan did you mean?" answers below stay ok=true - recovery must never
+        # fail - but they carry PLAN_AMBIGUOUS so next_action comes out of the one state
+        # machine and says CALL_GET_CURRENT_PLAN. Without the code they defaulted to
+        # CALL_PLAN_AND_THINK ("there is no active plan, start one"), which contradicted
+        # the message and is how a model asking for its own plan ended up forking a new one.
         if plan is self._AMBIGUOUS:
-            # Recovery must never fail; hand back the directory so the model can pick.
+            return build(
+                None,
+                error_code=ErrorCode.PLAN_AMBIGUOUS,
+                notes=notes,
+                message=(
+                    f"{len(state.active_plans())} plans are active, so 'current' cannot say "
+                    "which one is yours. Call again with the plan_id your conversation has "
+                    "been receiving in every response - it is one of the plans listed here."
+                ),
+                active_plans=self._plan_directory(state),
+            )
+
+        if plan is None and requested.lower() not in ("current", "active", "latest", ""):
+            # An id that names nothing is NOT the same as "no plan exists". Saying the
+            # latter invites the model to throw its plan away and start over, when the id
+            # is far more likely stale or mistyped - so show it what it can actually ask for.
+            notes.append(f"No plan with id '{requested}'.")
+            directory = self._plan_directory(state)
+            if directory:
+                return build(
+                    None,
+                    error_code=ErrorCode.PLAN_AMBIGUOUS,
+                    notes=notes,
+                    message=(
+                        f"There is no plan with id '{requested}'. Do NOT start a new plan - "
+                        "call again with one of the plan_ids listed here."
+                    ),
+                    active_plans=directory,
+                )
             return build(
                 None,
                 notes=notes,
                 message=(
-                    f"{len(state.active_plans())} plans are active. Call again with the "
-                    "plan_id of the one this conversation is working on."
+                    f"There is no plan with id '{requested}', and no plan is active."
+                    if state.plans
+                    else "No plan has been created yet."
                 ),
-                active_plans=self._plan_directory(state),
             )
-        if plan is None and requested.lower() not in ("current", "active", "latest", ""):
-            notes.append(f"No plan with id '{requested}'.")
 
         if plan is None:
             return build(None, notes=notes, message="No plan has been created yet.")

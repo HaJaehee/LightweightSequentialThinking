@@ -95,7 +95,7 @@
               "REJECTED",
               "REVISE"
             ],
-            "description": "ASK_USER = first call, ask the human. APPROVED / REJECTED / REVISE = report what the human actually replied. Example: \"ASK_USER\""
+            "description": "ASK_USER = ask the human, and the ONLY value you may choose yourself. APPROVED / REJECTED / REVISE report what the human ACTUALLY replied - never what you expect or would prefer; the server refuses them while their question is still open. If a call comes back with error_code APPROVAL_PENDING the human has not answered yet: call again immediately with ASK_USER and the same plan_summary, and write nothing in between. Example: \"ASK_USER\""
           },
           "plan_summary": {
             "type": "string",
@@ -117,14 +117,14 @@
     },
     {
       "name": "update_task_progress",
-      "description": "STEP 3 - EXECUTION TRACKING.\nHandle exactly ONE task per call.\n\n  1. Start the FIRST task: status = \"IN_PROGRESS\". Then do the work.\n  2. Report it: status = \"DONE\" + a result_log saying what you actually produced.\n  3. The server then starts the NEXT task for you and names it in next_task.\n     Do that work, then report it \"DONE\" the same way.\n     You do NOT send \"IN_PROGRESS\" again - just keep reporting DONE, one call per\n     task, until the server tells you no tasks remain.\nUse status = \"FAILED\" instead of \"DONE\" if the task did not work.\n\nDONE IS ENFORCED. The server REFUSES a DONE for a task that:\n  - is not the task currently in progress,\n  - skips ahead while an earlier task is unfinished,\n  - has no result_log describing the real outcome.\nNever mark a task DONE before you actually did it. You must work through EVERY task in\norder, one at a time. You are not finished until the server tells you so - keep going\nwhile it says tasks remain.\nIf a task fails, set status = \"FAILED\" and explain in result_log - then follow the\nnext_action the server gives you back.",
+      "description": "STEP 3 - EXECUTION TRACKING.\nHandle exactly ONE task per call.\n\nALWAYS take task_id from the next_task field of the most recent server response.\nnext_task is the ONLY place the server publishes a task_id. Never reuse a task_id\nfrom an earlier response and never count tasks yourself - earlier responses named\ntasks that are already finished.\n\n  1. Start the FIRST task: status = \"IN_PROGRESS\". Then do the work.\n  2. Report it: status = \"DONE\" + a result_log saying what you actually produced.\n  3. The server then starts the NEXT task for you and names it in next_task.\n     Do that work, then report it \"DONE\" the same way.\n     You do NOT send \"IN_PROGRESS\" again - just keep reporting DONE, one call per\n     task, until the server tells you no tasks remain.\nUse status = \"FAILED\" instead of \"DONE\" if the task did not work.\nThe response carries progress (\"2/5 done\") but not the task list. If you have lost\ntrack of the plan, call get_current_plan - that is what it is for.\n\nDONE IS ENFORCED. The server REFUSES a DONE for a task that:\n  - is not the task currently in progress,\n  - skips ahead while an earlier task is unfinished,\n  - has no result_log describing the real outcome.\nNever mark a task DONE before you actually did it. You must work through EVERY task in\norder, one at a time. You are not finished until the server tells you so - keep going\nwhile it says tasks remain.\nIf a task fails, set status = \"FAILED\" and explain in result_log - then follow the\nnext_action the server gives you back.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "task_id": {
             "type": "integer",
             "minimum": 1,
-            "description": "The number of the task you are working on, taken from the tasks list the server gave you. One task per call. Example: 1"
+            "description": "Copy this from next_task.task_id in the server's most recent response. That is the only task you may act on. One task per call. Example: 1"
           },
           "status": {
             "type": "string",
@@ -153,14 +153,14 @@
     },
     {
       "name": "get_current_plan",
-      "description": "RECOVERY TOOL.\nCall this when you are unsure what the plan is, which task you were on, or after a long\nconversation. It returns the full current plan and tells you exactly what to do next.\nIt changes nothing - it is always safe to call.",
+      "description": "RECOVERY TOOL.\nCall this when you are unsure what the plan is, which task you were on, or after a long\nconversation. It returns YOUR plan and tells you exactly what to do next.\nIt changes nothing - it is always safe to call.\n\nSEND YOUR OWN plan_id. Every response you have received carries a \"plan_id\" field -\nsend that exact value here and you will always get back your own plan, even if other\nconversations are running plans at the same time.\nOnly send \"current\" if you genuinely do not know your plan_id (for example this is your\nfirst call). \"current\" is a guess: when several plans are in flight the server cannot\ntell which one is yours, so it answers with the list of plans and you have to call\nagain with the right plan_id.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "plan_id": {
             "type": "string",
             "default": "current",
-            "description": "Use the exact text \"current\" to get the active plan. Only use a real plan_id if you want an older plan. Example: \"current\""
+            "description": "The plan you want. Send the plan_id YOUR conversation has been receiving in every response - that is how you get your own plan back. Example: \"plan_20260724_0002\". It also reads a plan that is already finished or cancelled. Send the exact text \"current\" ONLY if you do not know your plan_id yet; the server then guesses, and with several plans in flight it cannot guess and returns the list of plans instead."
           }
         },
         "required": [

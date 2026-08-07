@@ -93,8 +93,16 @@ next_action the server gives you back."""
 
 GET_CURRENT_PLAN_DESCRIPTION = """RECOVERY TOOL.
 Call this when you are unsure what the plan is, which task you were on, or after a long
-conversation. It returns the full current plan and tells you exactly what to do next.
-It changes nothing - it is always safe to call."""
+conversation. It returns YOUR plan and tells you exactly what to do next.
+It changes nothing - it is always safe to call.
+
+SEND YOUR OWN plan_id. Every response you have received carries a "plan_id" field -
+send that exact value here and you will always get back your own plan, even if other
+conversations are running plans at the same time.
+Only send "current" if you genuinely do not know your plan_id (for example this is your
+first call). "current" is a guess: when several plans are in flight the server cannot
+tell which one is yours, so it answers with the list of plans and you have to call
+again with the right plan_id."""
 
 
 # Shared by the tools that act on an existing plan. Optional on purpose: with one plan
@@ -292,8 +300,12 @@ GET_CURRENT_PLAN_SCHEMA: dict[str, Any] = {
             "type": "string",
             "default": "current",
             "description": (
-                'Use the exact text "current" to get the active plan. Only use a real plan_id if '
-                'you want an older plan. Example: "current"'
+                "The plan you want. Send the plan_id YOUR conversation has been receiving in "
+                'every response - that is how you get your own plan back. Example: '
+                '"plan_20260724_0002". It also reads a plan that is already finished or '
+                'cancelled. Send the exact text "current" ONLY if you do not know your '
+                "plan_id yet; the server then guesses, and with several plans in flight it "
+                "cannot guess and returns the list of plans instead."
             ),
         },
     },

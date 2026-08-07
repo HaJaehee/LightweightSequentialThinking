@@ -174,8 +174,12 @@ RECOVERY
 ==================================================
 If you are unsure what the plan is, which task you are on, whether the plan was
 approved, or the conversation has gotten long: call `get_current_plan` with
-plan_id = "current". Never reconstruct a plan from memory. Never start a second
-plan while one is active - check first.
+plan_id set to YOUR plan_id - the value every server response carries. That is
+what gets your own plan back when other conversations are also running plans.
+Use plan_id = "current" only before you have a plan_id of your own; it is a
+guess, and with several plans in flight the server answers with an active_plans
+list instead. If you get that list, pick your plan_id from it and call again -
+do NOT start a second plan. Never reconstruct a plan from memory.
 
 ==================================================
 next_action DECODER (memorize this table)
@@ -399,7 +403,12 @@ R8. 작업이 끝났다는 당신의 판단으로 턴을 종료하지 않습니�
 [4단계 보고] next_action = "ANSWER_USER" 일 때만 최종 답변을 작성합니다.
   각 작업의 result_log 를 근거로 요약하고, 실패/생략된 항목을 정직하게 밝힙니다.
 
-[복구] 계획이나 현재 작업이 불확실하면 plan_id="current" 로 `get_current_plan` 호출.
+[복구] 계획이나 현재 작업이 불확실하면 `get_current_plan` 을 호출하되, plan_id 에는
+       모든 서버 응답에 실려 오는 자기 plan_id 를 넣습니다. 그래야 다른 대화가 동시에
+       계획을 진행 중이어도 항상 자기 계획을 돌려받습니다. plan_id="current" 는 아직
+       자기 plan_id 를 모를 때만 쓰는 추측값이며, 활성 계획이 여러 개면 서버가
+       active_plans 목록을 대신 돌려줍니다. 그 목록을 받으면 새 계획을 시작하지 말고
+       목록에서 자기 plan_id 를 골라 다시 호출합니다.
        기억으로 계획을 재구성하지 않습니다.
 
 ==================================================

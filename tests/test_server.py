@@ -2273,6 +2273,35 @@ class TestMultiPlanEdges(HandlerTestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(res["plan_status"], "CANCELLED")
 
+    def test_each_session_gets_its_own_plan_by_id(self):
+        a_id, b_id = self.two_plans()
+        for pid in (a_id, b_id, a_id):  # interleaved, as concurrent sessions arrive
+            res = self.h.dispatch("get_current_plan", {"plan_id": pid})
+            self.assertTrue(res["ok"], res.get("error_code"))
+            self.assertEqual(res["plan_id"], pid, "a session was handed another's plan")
+            self.assertIn("tasks", res)
+
+    def test_current_never_guesses_between_concurrent_plans(self):
+        a_id, b_id = self.two_plans()
+        res = self.h.dispatch("get_current_plan", {"plan_id": "current"})
+        # It must hand back the directory, not silently pick one of them.
+        self.assertIsNone(res["plan_id"])
+        self.assertEqual({p["plan_id"] for p in res["active_plans"]}, {a_id, b_id})
+
+    def test_ambiguous_read_does_not_tell_the_model_to_start_a_new_plan(self):
+        self.two_plans()
+        res = self.h.dispatch("get_current_plan", {"plan_id": "current"})
+        self.assertEqual(res["next_action"], "CALL_GET_CURRENT_PLAN")
+        self.assertIn("plan_id", res["next_action_hint"])
+
+    def test_unknown_plan_id_offers_the_directory_instead_of_a_fresh_start(self):
+        a_id, b_id = self.two_plans()
+        res = self.h.dispatch("get_current_plan", {"plan_id": "plan_does_not_exist"})
+        # A stale or mistyped id must not read as "no plan exists" - that is what made
+        # the model abandon its plan and fork a new one.
+        self.assertEqual(res["next_action"], "CALL_GET_CURRENT_PLAN")
+        self.assertEqual({p["plan_id"] for p in res["active_plans"]}, {a_id, b_id})
+
     def test_unknown_plan_id_is_reported(self):
         self.two_plans()
         res = self.h.dispatch("get_current_plan", {"plan_id": "plan_does_not_exist"})

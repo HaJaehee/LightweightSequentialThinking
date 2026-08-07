@@ -104,11 +104,21 @@ Optional: `result_log`, `plan_id`.
 
 ## 4. `get_current_plan` — always-safe recovery
 
-Required: `plan_id` (use the constant `"current"` for the active plan; a real id for a specific
-one). Never mutates, never errors. Returns goal, recent thinking steps (superseded ones
-summarized), tasks with their **full** `result_log`, progress, approval record,
-`next_action_hint` naming the exact next call. If several plans are active and
-`plan_id="current"`, returns an `active_plans` directory instead of guessing.
+Required: `plan_id`. Send the id the session has been receiving in every response and the read
+is exact — a session always gets **its own** plan back, including a plan already `COMPLETED` or
+`CANCELLED`. The constant `"current"` is the fallback for a session that does not know its id
+yet, and it is a *guess*: it resolves only while exactly one plan is live. Never mutates, never
+errors. Returns goal, recent thinking steps (superseded ones summarized), tasks with their
+**full** `result_log`, progress, approval record, `next_action_hint` naming the exact next call.
+
+**Not-my-plan answers must not read as "no plan" (1.15.1).** Both `"current"` under concurrency
+and an unknown/stale `plan_id` return an `active_plans` directory rather than guessing. They stay
+`ok: true`, but they carry `PLAN_AMBIGUOUS` so `next_action` resolves through the state machine to
+`CALL_GET_CURRENT_PLAN`. Without the code they fell through to the `plan is None` default,
+`CALL_PLAN_AND_THINK` — *"There is no active plan. Start one."* — which contradicted the message
+beside it and turned "let me re-read my plan" into a forked duplicate plan. The parameter existed
+and worked the whole time; the tool description told the model to send `"current"`, so it never
+used it.
 
 **Evidence is never truncated (1.13.1).** `Task.brief` used to cut `result_log` at 200
 characters "to protect context". The approval page is built from that same dict — handlers pass
