@@ -279,5 +279,5 @@ off when a launch never produces a poll. Defect
 | `7ded398` | store/approval failure paths |
 | `6d3748b` | approval page browser check + leniency safety |
 
-`main` branch, remote `github.com/HaJaehee/LightweightSequentialThinking`. **Not pushed** as of
+`main` branch, remote `github.com/HaJaehee/PlanningHarnessMCP`. **Not pushed** as of
 this writing — see [11](11-status-and-next-steps.md).

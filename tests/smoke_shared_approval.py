@@ -10,7 +10,7 @@
 import json, os, subprocess, sys, tempfile, threading, time, urllib.request
 from pathlib import Path
 
-SERVER = r"D:\LightweightSequentialThinking\server.py"
+SERVER = r"D:\PlanningHarnessMCP\server.py"
 PORT = 8781  # deliberately NOT the default 8765: a live server may hold that
 fails = []
 

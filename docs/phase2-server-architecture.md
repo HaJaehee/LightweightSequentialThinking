@@ -48,7 +48,7 @@ entry point; selected by `--transport sse`. Bind to loopback only — never `0.0
 ### Suggested file layout
 
 ```
-D:/LightweightSequentialThinking/
+D:/PlanningHarnessMCP/
 ├── server.py              # entry point: transport wiring + tool registration
 ├── planning/
 │   ├── schemas.py         # the 4 inputSchema dicts from Phase 1 (verbatim, single source)
@@ -597,7 +597,7 @@ Environment variables, all optional, all with safe defaults:
 
 - Launch with `python -u server.py` or set `PYTHONUNBUFFERED=1`; buffered stdout makes stdio
   transport look like a hung server.
-- Use forward slashes in `anythingllm_mcp_servers.json` (`D:/LightweightSequentialThinking/...`)
+- Use forward slashes in `anythingllm_mcp_servers.json` (`D:/PlanningHarnessMCP/...`)
   — backslashes must be escaped in JSON and are a common silent failure.
 - If `python` is not on PATH inside AnythingLLM's environment, use the absolute interpreter path
   (e.g. `C:/Users/<user>/AppData/Local/Programs/Python/Python312/python.exe`).

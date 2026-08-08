@@ -1,4 +1,4 @@
-# planning-mcp (LightweightSequentialThinking)
+# planning-mcp (PlanningHarnessMCP)
 
 **버전: 1.15.1** · MCP 서버 이름 `planning-mcp` · 단일 출처: `planning/config.py`의
 `SERVER_VERSION` (MCP `initialize` 응답의 `serverInfo.version` 으로 보고됨)

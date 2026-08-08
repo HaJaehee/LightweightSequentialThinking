@@ -1,6 +1,6 @@
 # 폐쇄망 반입·배포 매뉴얼
 
-개인 PC(`D:\LightweightSequentialThinking`)에서 만든 planning-mcp를 사내 폐쇄망 PC로
+개인 PC(`D:\PlanningHarnessMCP`)에서 만든 planning-mcp를 사내 폐쇄망 PC로
 옮겨 AnythingLLM에 붙이기까지의 전 과정.
 
 ---

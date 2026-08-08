@@ -30,7 +30,7 @@ logging.disable(logging.CRITICAL)
 
 from planning import approval  # noqa: E402
 from planning.approval import _PAGE, ApprovalServer, ApprovalStore, Verdict  # noqa: E402
-from planning.config import SDK_REQUEST_TIMEOUT_SEC, Config  # noqa: E402
+from planning.config import CALL_BUDGET_SEC, SDK_REQUEST_TIMEOUT_SEC, Config  # noqa: E402
 from planning.filelock import exclusive  # noqa: E402
 from planning.handlers import PlanningHandlers  # noqa: E402
 from planning.leniency import UNMATCHED_TITLES_KEY, normalize  # noqa: E402
@@ -1775,8 +1775,9 @@ class TestChunkedApproval(HandlerTestCase):
         self.assertFalse(res["ok"])
         self.assertEqual(res["error_code"], "APPROVAL_PENDING")
         self.assertEqual(res["plan_status"], "AWAITING_APPROVAL")
+        plan_id = next(iter(h.store.load().plans.keys()))
         self.assertEqual(
-            h.store.load().plans["plan_20260806_0001"].plan_status, "AWAITING_APPROVAL"
+            h.store.load().plans[plan_id].plan_status, "AWAITING_APPROVAL"
         )
 
     def test_model_cannot_reject_or_revise_either(self):
@@ -1821,8 +1822,9 @@ class TestChunkedApproval(HandlerTestCase):
         h = self.handlers(ui)
         self.draft(h)
         self.ask(h)
-        self.assertTrue(ui.has_pending("plan_20260806_0001", ui.live["fingerprint"]))
-        self.assertFalse(ui.has_pending("plan_20260806_0001", "a-different-version"))
+        plan_id = next(iter(h.store.load().plans.keys()))
+        self.assertTrue(ui.has_pending(plan_id, ui.live["fingerprint"]))
+        self.assertFalse(ui.has_pending(plan_id, "a-different-version"))
 
 
 class TestBrowserTabSpam(HandlerTestCase):
@@ -4219,6 +4221,115 @@ class TestLeanResponseKeepsTheReworkGuard(TargetedRevisionFixture):
         self.assertFalse(res["ok"])
         self.assertEqual(res["error_code"], "REWORK_NOT_DONE")
         self.assertEqual(res["next_task"]["task_id"], 2)
+
+
+class TestCallBudgetEnv(HandlerTestCase):
+    """`PLANNING_MCP_CALL_BUDGET` - the per-call ceiling, end to end.
+
+    It is the one knob a deployer has to reach for when a client turns out to be less
+    patient than the 60s default. If it silently fails to take effect, the symptom is
+    not a config warning, it is a conversation dying mid-approval - so this covers
+    parsing, the fallbacks, and that the parsed value actually reaches the wait.
+    """
+
+    def env_config(self, **overrides):
+        """Config.from_env() with a scrubbed environment, so a real PLANNING_MCP_*
+        setting on the developer's machine cannot decide the outcome."""
+        with mock.patch.dict(os.environ, overrides, clear=True):
+            return Config.from_env(state_dir_override=str(self.state_dir))
+
+    def handlers(self, ui=None, **env):
+        cfg = self.env_config(**env)
+        return PlanningHandlers(
+            Store(self.state_dir), cfg, approval_ui=ui or FakeApprovalUI(decision=None)
+        )
+
+    # ---- parsing ----------------------------------------------------------
+    def test_unset_falls_back_to_the_default(self):
+        self.assertEqual(self.env_config().call_budget, CALL_BUDGET_SEC)
+
+    def test_value_from_env_is_used(self):
+        self.assertEqual(self.env_config(PLANNING_MCP_CALL_BUDGET="20").call_budget, 20)
+
+    def test_whitespace_padded_value_is_accepted(self):
+        self.assertEqual(self.env_config(PLANNING_MCP_CALL_BUDGET=" 30 ").call_budget, 30)
+
+    def test_garbage_falls_back_to_the_default(self):
+        """A typo must not disarm the cap - falling back beats crashing at startup."""
+        for junk in ("abc", "30s", "45.5", "", "  "):
+            with self.subTest(raw=junk):
+                self.assertEqual(
+                    self.env_config(PLANNING_MCP_CALL_BUDGET=junk).call_budget,
+                    CALL_BUDGET_SEC,
+                )
+
+    def test_default_stays_under_the_client_request_timeout(self):
+        self.assertLess(CALL_BUDGET_SEC, SDK_REQUEST_TIMEOUT_SEC)
+
+    # ---- it reaches the wait ----------------------------------------------
+    def test_env_budget_becomes_the_slice_length(self):
+        h = self.handlers(PLANNING_MCP_CALL_BUDGET="12", PLANNING_MCP_APPROVAL_TIMEOUT="900")
+        self.assertEqual(h.effective_timeout(can_heartbeat=False), 12)
+        self.assertEqual(h.effective_timeout(can_heartbeat=True), 12,
+                         "a progressToken must not buy a longer single call")
+
+    def test_a_bigger_budget_still_cannot_outlive_the_total_wait(self):
+        h = self.handlers(PLANNING_MCP_CALL_BUDGET="120", PLANNING_MCP_APPROVAL_TIMEOUT="30")
+        self.assertEqual(h.effective_timeout(can_heartbeat=False), 30)
+
+    def test_the_slice_shrinks_with_the_remaining_total(self):
+        h = self.handlers(PLANNING_MCP_CALL_BUDGET="20", PLANNING_MCP_APPROVAL_TIMEOUT="60")
+        self.assertEqual(h.effective_timeout(can_heartbeat=False, already_waited=50), 10)
+        self.assertEqual(h.effective_timeout(can_heartbeat=False, already_waited=60), 0)
+
+    def test_nonsensical_budgets_still_wait_at_least_a_second(self):
+        """0 or negative would otherwise skip the wait, which is indistinguishable
+        from having no gate at all."""
+        for raw in ("0", "-5"):
+            with self.subTest(raw=raw):
+                h = self.handlers(PLANNING_MCP_CALL_BUDGET=raw,
+                                  PLANNING_MCP_APPROVAL_TIMEOUT="900")
+                self.assertEqual(h.effective_timeout(can_heartbeat=False), 1)
+
+    def test_a_measured_client_cap_beats_a_larger_env_budget(self):
+        h = self.handlers(PLANNING_MCP_CALL_BUDGET="45", PLANNING_MCP_APPROVAL_TIMEOUT="900")
+        h.store.record_call_cap(30)  # this client was seen giving up at 30s
+        self.assertEqual(h.effective_timeout(can_heartbeat=False), 25)
+
+    def test_a_smaller_env_budget_beats_the_measured_cap(self):
+        h = self.handlers(PLANNING_MCP_CALL_BUDGET="10", PLANNING_MCP_APPROVAL_TIMEOUT="900")
+        h.store.record_call_cap(30)
+        self.assertEqual(h.effective_timeout(can_heartbeat=False), 10)
+
+    def test_other_modes_ignore_the_budget(self):
+        h = self.handlers(PLANNING_MCP_CALL_BUDGET="12",
+                          PLANNING_MCP_APPROVAL_TIMEOUT="900",
+                          PLANNING_MCP_APPROVAL_MODE="trust_heartbeat")
+        self.assertEqual(h.effective_timeout(can_heartbeat=True), 900)
+        h = self.handlers(PLANNING_MCP_CALL_BUDGET="12",
+                          PLANNING_MCP_APPROVAL_MODE="return")
+        self.assertEqual(h.effective_timeout(can_heartbeat=False), 0)
+
+    # ---- the real wait honours it -----------------------------------------
+    def test_a_real_wait_ends_within_the_env_budget(self):
+        """The end-to-end claim: set the var, and one tools/call actually returns
+        inside it instead of holding the client open."""
+        ui = FakeApprovalUI(decision=None)
+        h = self.handlers(ui, PLANNING_MCP_CALL_BUDGET="1",
+                          PLANNING_MCP_APPROVAL_TIMEOUT="900")
+        h.dispatch("plan_and_think", {
+            "goal": "예산 검증", "thought": "t", "step_number": 1, "total_steps": 1,
+            "need_more_thinking": False, "task_list": ["작업 1"]})
+        started = time.monotonic()
+        res = h.dispatch("request_user_approval",
+                         {"decision": "ASK_USER", "plan_summary": "요약"})
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 10, "the 1s budget did not bound the call")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error_code"], "APPROVAL_PENDING")
+        self.assertLessEqual(res["waited_seconds"], 5)
+        self.assertGreater(res["remaining_seconds"], 0,
+                           "the human's total budget must survive the slice")
 
 
 if __name__ == "__main__":

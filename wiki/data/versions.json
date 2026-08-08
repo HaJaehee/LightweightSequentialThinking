@@ -2,7 +2,7 @@
   "_comment": "Version history. Prose detail in wiki/08-changelog.md; root causes in wiki/09-defects-and-lessons.md. current = 1.14.2.",
   "current": "1.14.2",
   "branch": "develop",
-  "remote": "github.com/HaJaehee/LightweightSequentialThinking",
+  "remote": "github.com/HaJaehee/PlanningHarnessMCP",
   "pushed": false,
   "versions": [
     { "version": "1.0-1.2", "commit": "4ac3562", "theme": "Foundation: 4 tools, atomic persistence, leniency, single response builder, enforced approval gate, APPROVAL_NOT_REQUESTED, air-gap packaging.", "defects_fixed": [] },

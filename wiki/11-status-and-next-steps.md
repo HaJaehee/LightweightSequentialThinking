@@ -13,7 +13,7 @@
   tests fail on `srv.start()` returning False — a test-isolation weakness, not a server
   bug. Worth switching to ephemeral ports; the 1.13.0 page changes are covered
   socket-free by `TestCompletionPageTemplate` for exactly this reason.
-- **Git:** on `develop`. Remote is `github.com/HaJaehee/LightweightSequentialThinking`.
+- **Git:** on `develop`. Remote is `github.com/HaJaehee/PlanningHarnessMCP`.
   **NOT pushed.** Pushing is a user decision — the repo may be public and `docs/` contains
   deployment/security material; confirm before pushing.
 - **Build artifacts (1.12.0, built 2026-07-28) — 1.12.1 and 1.13.0 have not been packaged yet:**
